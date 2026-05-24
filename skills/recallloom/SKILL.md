@@ -22,6 +22,12 @@ The package may still ship optional native wrapper templates for supported hosts
 This installable package is intentionally kept lean.
 Human-facing repository landing pages and marketing docs may exist upstream, but they are not bundled into the installed skill directory.
 
+In the source repository, `README.md` and `README.en.md` are concise public
+front doors, `README.zh-CN.md` is the compatibility entry, `INDEX.md` is the
+full map, and `USAGE.md` is the operator guide.
+Those files describe the same helper contract as this installed package
+entrypoint rather than defining a second logic set.
+
 For package inventory, protocol details, and helper-script behavior, rely on the files that ship inside the package itself:
 
 - `managed-assets.json`
@@ -34,7 +40,7 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.3.5`
+- package version: `0.4.0`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -58,26 +64,22 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 
 RecallLoom package support is separate from project sidecar protocol compatibility.
 
-Helpers perform a lightweight daily package-support check, scoped by installed package path and cached in the user cache.
-Support state is not written into project `.recallloom/`.
-
-If the current package is `readonly_only`, mutating helpers are blocked while diagnostic and read-only helpers remain available.
-If it is `diagnostic_only`, only diagnostic helpers should continue.
-If the advisory cannot be refreshed and no usable cache exists, helpers use `unknown_offline` and do not hard-block solely because the network failed.
-
-When the gate blocks an action, it returns the shared failure contract with `blocked_reason: package_support_blocked` and a `package_support` object.
-See `references/package-support-policy.md` for the advisory schema, action levels, cache behavior, and environment overrides.
+- Helpers MUST perform the package-support check and MUST NOT write support state into project `.recallloom/`.
+- If support is `readonly_only`, mutating helpers MUST block while diagnostic and read-only helpers MAY continue.
+- If support is `diagnostic_only`, only diagnostic helpers SHOULD continue.
+- If support is `unknown_offline`, diagnostic and read-only actions MAY continue, but mutating actions MUST block until support can be verified.
+- Blocked actions MUST return the shared failure contract with `blocked_reason: package_support_blocked` and a `package_support` object. See `references/package-support-policy.md`.
 
 ## Write Protocol Red Lines
 
-- For managed sidecar writes, use the concrete helper scripts. Do not bypass them with blind file replacement, blind patching, or by hand-building sidecar files.
-- Managed sidecar daily-log writes must go through `append_daily_log_entry.py` or the dispatcher `append` command. Do not handwrite `daily-log-entry` markers in managed daily logs during normal operation.
-- For the current package line on protocol `1.0`, daily-log entry counters are file-local: `entry-seq` is the contiguous `1..N` sequence inside one daily log file, and helper-generated canonical `entry-id` is `entry-{entry_seq}`. Do not treat either as a cross-file global counter or globally unique id.
-- Keep `state.json.daily_logs.entry_count` as `entry_count`. Its protocol `1.0` meaning is the number of entry markers in the latest active daily log file, not a global cumulative total, and this package line does not perform an `entry_count` to `latest_file_entry_count` schema migration.
-- If a helper write fails, follow this order: diagnose the failure, fix the cause, retry the helper, then surface or return the helper's blocked failure contract if the helper still cannot complete.
-- Never hand-edit `STORAGE_ROOT/state.json` or `STORAGE_ROOT/config.json` during normal operation. This includes `.recallloom/state.json` and `.recallloom/config.json`.
-- For overwrite-style managed files, use revision-aware helper commits and do not use blind file replacement.
-- The only acceptable manual exception is an explicit damaged-sidecar repair. In that case, repair the daily-log marker and state cursor as one consistency set: `entry-id`, `entry-seq`, `latest_entry_id`, `latest_entry_seq`, and `entry_count` must match the validator canonical interpretation, and `validate_context.py` must be rerun immediately.
+- Managed sidecar writes MUST use helper scripts. Do not bypass them with blind file replacement, blind patching, or hand-built sidecar files.
+- Daily-log writes MUST use `append_daily_log_entry.py` or dispatcher `append`. Do not handwrite `daily-log-entry` markers.
+- Overwrite-style managed files MUST use revision-aware helper commits. Do not handwrite `file-state` markers.
+- `STORAGE_ROOT/state.json` and `STORAGE_ROOT/config.json` MUST NOT be hand-edited during normal operation.
+- Protocol `1.0` daily-log counters are file-local: `entry-seq` is `1..N` within one daily log and canonical `entry-id` is `entry-{entry_seq}`. Do not treat either as globally unique.
+- Keep `state.json.daily_logs.entry_count` as `entry_count`; it means the entry marker count in the latest active daily log, not a global cumulative count.
+- If a helper write fails, diagnose, fix, retry, then surface the helper failure contract if it still cannot complete.
+- Manual repair is allowed only for explicit damaged-sidecar repair; repair marker and state cursor fields as one consistency set, then rerun `validate_context.py`.
 
 ## When To Use It
 
@@ -111,13 +113,7 @@ The correct flow is:
 4. if the user explicitly confirms, or directly says `rl-init`, run the standard initialization action
 5. if the environment cannot provide Python `3.10+`, stop with a blocked runtime result instead of hand-building a sidecar
 
-For this package, the intended initialization action is:
-
-- initialize the sidecar
-- validate the workspace
-- return the next recommended actions
-
-This means `rl-init` should be treated as a stable high-level action name, even in hosts that do not expose it as a native slash command.
+`rl-init` SHOULD mean: initialize the sidecar, validate the workspace, and return next recommended actions. Treat it as a stable high-level action name even when the host does not expose native slash commands.
 
 ## Current Action Surface
 
@@ -125,16 +121,22 @@ For the current package line, the stable operator-facing wrapper targets are:
 
 - `rl-init`
 - `rl-resume`
-- `rl-validate`
 - `rl-status`
+- `rl-validate`
 
 `rl-init` is the primary operator-friendly first-attach action name.
 The others are operator-facing stable action names that can be interpreted by the host agent or mapped into native custom commands when the host supports that surface.
 `rl-bridge` remains the canonical dispatcher/helper action label for bridge work, but this package line does not promise a universal native wrapper or deterministic first-hop routing for that label.
+Natural language remains the default public phrasing for these actions.
 
-The dispatcher command surface also includes `quick-summary`, `append`, and `write`.
-Use `quick-summary` for low-latency current-state snapshots, `append --entry-json` for structured milestone logging, and `write --type ... --dry-run` before applying typed managed-file writes.
+The dispatcher command surface also includes `quick-summary`, `append`, `write`, and `sync-current-state-after-append`.
+Use `quick-summary` for current-state snapshots, `append --entry-json` for milestone logging, `write --type ... --source-file <prepared-file> --dry-run` or `write --type ... --stdin --dry-run` before typed managed-file writes, and `sync-current-state-after-append --stdin --input-format json` only after preflight allows `post_append_summary_sync`.
 These dispatcher additions are optional for existing `v0.3.4` projects and do not change sidecar protocol `1.0`.
+
+Native wrappers for `rl-init`, `rl-resume`, `rl-status`, and `rl-validate`
+are convenience entrypoints only. They must delegate to the same dispatcher and
+must not replace natural-language restore requests, bypass helpers, or create a
+host-specific product logic copy.
 
 ## Initialized-Project Restore Contract
 
@@ -156,6 +158,7 @@ RecallLoom should default to user task language, not implementation language.
 - Do not lead with helper names, section keys, or the `coldstart` label unless the user is explicitly doing operator/debug work.
 - Keep the first response result-first and action-light: one clear next move is better than exposing routing details.
 - Do not invent a manual sidecar fallback when runtime requirements are missing; surface the blocked state and stop.
+- This is not hand-building a sidecar; it is the packaged restore and helper contract.
 
 ## Fast And Deep Paths
 
@@ -192,22 +195,9 @@ File responsibilities in one sentence:
 - `state.json` tracks workspace revision and helper-visible sidecar state.
 - `update_protocol.md`, when present, can narrow or strengthen the default read/write rules for this specific project.
 
-`STORAGE_ROOT` is one of:
+`STORAGE_ROOT` is either `PROJECT_ROOT/.recallloom/` or `PROJECT_ROOT/recallloom/`. Exactly one valid storage root MAY exist; if both exist, stop instead of guessing.
 
-- `PROJECT_ROOT/.recallloom/` (default)
-- `PROJECT_ROOT/recallloom/` (optional visible sidecar)
-
-Exactly one valid `STORAGE_ROOT` may exist for a project at a time.
-
-If both sidecars exist, that is a conflict and tools should stop rather than guess.
-
-See `references/file-contracts.md` for the detailed contract.
-
-Machine-readable markers, not heading labels, are the normative file contract.
-
-This allows workspace files to stay localizable without breaking validation or integration.
-
-For protocol `1.0`, supported workspace languages are limited to `en` and `zh-CN`.
+Machine-readable markers, not heading labels, are the normative file contract. Protocol `1.0` supports workspace languages `en` and `zh-CN`. See `references/file-contracts.md`.
 
 ## Minimum Cold-Start Flow
 
@@ -227,44 +217,21 @@ See `references/operation-playbooks.md` for the full flow.
 
 ## Current Read-Side Helpers
 
-This package line now has three read-side helper directions worth knowing:
+Three read-side helpers matter here:
 
-- `preflight_context_check.py`
-  - revision-aware freshness review before formal writes
-  - returns handoff-first digests, suggested read targets, write-tier guidance, and trust/drift state
-- `summarize_continuity_status.py`
-  - ambient continuity status surface using the same freshness baseline
-  - returns the same handoff-first digest family plus shared workday-state and trust/drift guidance for quick orientation
-- `query_continuity.py`
-  - read-only continuity recall surface
-  - returns answer-first recall with `answer`, supporting citations, and a risk/freshness note
-  - also returns hits, token estimate, budget hint, freshness/conflict state, trust/drift state, an output variant label, and override review targets
-  - daily-log citations include explicit `date` values
-  - prefers current-state files over historical daily logs when match strength ties
-  - defaults to the quick freshness path, but can explicitly upgrade to a fuller freshness scan when needed
-  - can explicitly surface freshness conflicts when the workspace has moved beyond the current summary
-  - explicitly surfaces freshness risk via `freshness_risk_level` and `freshness_risk_note`
-  - surfaces `update_protocol.md` as a review target before recall should drive write decisions
-  - keeps `supporting_context_window` bounded instead of expanding every matching excerpt
+- `preflight_context_check.py`: revision-aware freshness review before formal writes; returns handoff-first digests, suggested read targets, write-tier guidance, and trust/drift state.
+- `summarize_continuity_status.py`: ambient continuity status surface on the same freshness baseline; returns the same digest family plus shared workday-state and trust/drift guidance.
+- `query_continuity.py`: read-only continuity recall surface; returns answer-first recall with `answer`, supporting citations, and a risk/freshness note. It also returns hits, token estimate, budget hint, freshness/conflict state, trust/drift state, an output variant label, and override review targets. Daily-log citations include explicit `date` values, current-state files win ties, and the context window stays bounded.
 
 All attach-safe continuity text returned through these read-side surfaces is expected to respect the shared attached-text scan rules.
 
 ## Minimum Write Rules
 
 - Before choosing a write target, read `STORAGE_ROOT/update_protocol.md` if it exists.
-- Update the rolling summary for current-state changes.
-- Update `context_brief.md` only for high-level framing changes.
-- Update the daily log only for milestone-level events.
+- `current_state` changes usually target `rolling_summary.md`.
+- `stable_rule` changes usually target `context_brief.md`.
+- `milestone_evidence` usually targets the daily log.
 - Do not update context files for trivial reads or minor edits with no durable change.
-
-Practical interpretation:
-
-- `stable_rule`: usually `context_brief.md`
-- `current_state`: usually `rolling_summary.md`
-- New current-state fact or next-step change: usually `rolling_summary.md`
-- High-level mission or phase change: maybe `context_brief.md`
-- `milestone_evidence`: daily log only when a milestone actually happened
-- Deliverable completion or end-of-day milestone: daily log
 
 Default exits before any write should stay explicit:
 
@@ -279,50 +246,36 @@ Read-side trust notes:
 - `continuity_drift_risk_level` is a review signal, not proof that the sidecar is damaged
 - `allowed_operation_level` helps hosts route low-risk read vs review-first vs write-after-preflight flows
 
-Project-local overrides may narrow the default read order, write order, or archive behavior, but they do not replace the core file contract.
+Project-local overrides MAY narrow read order, write order, or archive behavior, but they do not replace the core file contract.
 
 ## Agent Layered Write Judgment
 
-Before writing continuity content, the agent should make the layer decision itself.
-Helpers can provide safe write context and static write-tier guidance, but they must not replace agent judgment about what the content means.
+Before writing continuity content, the agent should make the layer decision itself. Helpers can provide safe write context and static write-tier guidance, but they must not replace agent judgment about what the content means.
 
-Use this quick consistency check before editing managed files:
+Use this quick check before editing managed files:
 
 1. Is there a new durable fact, or is `no_write` the right result?
-2. If writing is needed, is the main content a `stable_rule`, `current_state`, or `milestone_evidence`?
-3. Does the event contain different facts that need a `multi_layer_split`?
-4. Does the target layer already contain the same fact, so the right action is merge instead of duplicate?
+2. If writing is needed, is the main content `stable_rule`, `current_state`, or `milestone_evidence`?
+3. Does the event span multiple layers, so it needs a `multi_layer_split`?
+4. Is the same fact already present, so the right action is merge instead of duplicate?
 5. Is the layer uncertain enough to `defer` or `confirm` rather than guess?
 
 Layer defaults:
 
-- `stable_rule`: long-lived workflow rules, source-of-truth routing, project boundaries, or recovery facts that should be known before reading current state. Default target: `context_brief.md`.
+- `stable_rule`: long-lived workflow rules, source-of-truth routing, project boundaries, or recovery facts. Default target: `context_brief.md`.
 - `current_state`: what is true now, including current phase, active risks, active judgments, and next steps. Default target: `rolling_summary.md`.
 - `milestone_evidence`: completed validations, approvals, releases, accepted decisions, or other durable evidence. Default target: daily log.
-- `no_write`, `defer`, and `confirm` are valid outcomes when no durable fact changed, the discussion is unstable, or the boundary needs explicit user approval.
+- `no_write`, `defer`, and `confirm` are valid outcomes when nothing durable changed, the discussion is unstable, or the boundary needs explicit approval.
 
-When more than one layer is valid, split different facts across layers.
-Do not copy the same sentence into multiple files.
+When more than one layer is valid, split different facts across layers and do not duplicate the same sentence.
 
 For the detailed rules, conflict order, self-review template, and anonymized calibration cases, see `references/operation-playbooks.md`.
 
-For protocol `1.0`, `update_protocol.md` is a human-reviewed override layer.
-Preflight, archive guidance, and thin-bridge guidance should surface it clearly, but helpers do not automatically execute its natural-language rules.
+For protocol `1.0`, `update_protocol.md` is a human-reviewed override layer; helpers surface it but do not automatically execute its natural-language rules.
 
-RecallLoom prefers the smallest valid write set, not maximal updating.
+RecallLoom prefers the smallest valid write set. The agent decides what should change and prepares content; helpers decide whether the write is still safe to apply.
 
-When deterministic write safety matters, keep the roles separate:
-
-- the agent decides what should change and prepares the content
-- the packaged helper scripts decide whether the write is still safe to apply
-
-For overwrite-style files, follow the write red lines above; revision-aware helper commits are the normal write path.
-
-Revision-aware write helpers protect against stale writes, but they do not automatically reread `update_protocol.md` on every commit or append.
-
-Preflight checks may keep `context_brief.md` and existing daily logs out of the primary write-target list, but they should still surface them as conditional review targets when framing drift or milestone logging needs to be considered.
-
-When generating or maintaining workspace files, prefer the user's workspace language when it is one of the supported protocol `1.0` workspace languages (`en`, `zh-CN`).
+When generating workspace files, prefer the user's workspace language when it is supported by protocol `1.0` (`en`, `zh-CN`).
 
 ## When Not To Update Context
 
@@ -337,37 +290,14 @@ The protocol is designed to reduce noise, not to turn every session into documen
 
 ## Profiles
 
-RecallLoom currently provides four profiles:
+RecallLoom provides four profiles:
 
 - `profiles/general-project-continuity.md`
 - `profiles/research-writing.md`
 - `profiles/product-doc-collaboration.md`
 - `profiles/software-project-coordination.md`
 
-Profiles do not replace the core protocol.
-They are thin guidance layers that refine emphasis, evidence handling, and common drift risks for different project shapes.
-
-Default rule:
-
-- use `general-project-continuity.md` by default
-- switch to a specialized profile only when the project shape is a high-confidence match
-- if you are unsure, do not guess; stay on the general profile
-
-Use the specialized profiles only when the primary artifact, working style, and likely drift risks clearly line up:
-
-- `research-writing.md`
-  - use when the work is driven by sources, claims, evidence, and long-form analytical writing
-- `product-doc-collaboration.md`
-  - use when the work is driven by PRDs, RFCs, strategy docs, scope decisions, or stakeholder-aligned product writing
-- `software-project-coordination.md`
-  - use when the work is driven by engineering planning, spec-to-implementation coordination, or repo-level software project continuity
-
-Use `general-project-continuity.md` when:
-
-- the project mixes multiple artifact types
-- the project is cross-functional rather than domain-pure
-- no specialized profile is an obvious fit
-- you need a stable fallback that preserves continuity without over-assuming the project shape
+Profiles refine emphasis, evidence handling, and drift risk. Use `general-project-continuity.md` by default; switch to a specialized profile only when the project shape is a high-confidence match.
 
 ## What RecallLoom Does Not Try To Be
 

@@ -32,28 +32,37 @@ def bridge_block_integrity(text: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def _exact_marker_line_indices(text: str, marker: str) -> list[int]:
+    return [idx for idx, line in enumerate(text.splitlines()) if line == marker]
+
+
 def exclude_block_integrity(text: str) -> tuple[bool, str | None]:
-    start_count = text.count(EXCLUDE_BLOCK_START)
-    end_count = text.count(EXCLUDE_BLOCK_END)
+    start_indices = _exact_marker_line_indices(text, EXCLUDE_BLOCK_START)
+    end_indices = _exact_marker_line_indices(text, EXCLUDE_BLOCK_END)
+    start_count = len(start_indices)
+    end_count = len(end_indices)
+    if text.count(EXCLUDE_BLOCK_START) != start_count or text.count(EXCLUDE_BLOCK_END) != end_count:
+        return False, "exclude_marker_line_invalid"
     if start_count == 0 and end_count == 0:
         return True, None
     if start_count != end_count:
         return False, "exclude_start_end_mismatch"
     if start_count > 1:
         return False, "exclude_duplicate_blocks"
-    if text.find(EXCLUDE_BLOCK_START) > text.find(EXCLUDE_BLOCK_END):
+    if start_indices[0] > end_indices[0]:
         return False, "exclude_order_invalid"
     return True, None
 
 
 def managed_exclude_block_text(text: str) -> str | None:
-    start_idx = text.find(EXCLUDE_BLOCK_START)
-    end_idx = text.find(EXCLUDE_BLOCK_END)
-    if start_idx == -1 and end_idx == -1:
+    lines = text.splitlines()
+    start_indices = [idx for idx, line in enumerate(lines) if line == EXCLUDE_BLOCK_START]
+    end_indices = [idx for idx, line in enumerate(lines) if line == EXCLUDE_BLOCK_END]
+    if not start_indices and not end_indices:
         return None
-    if start_idx == -1 or end_idx == -1 or start_idx > end_idx:
+    if len(start_indices) != 1 or len(end_indices) != 1 or start_indices[0] > end_indices[0]:
         return None
-    return text[start_idx : end_idx + len(EXCLUDE_BLOCK_END)]
+    return "\n".join(lines[start_indices[0] : end_indices[0] + 1])
 
 
 def _to_posix_relative(from_dir: Path, to_path: Path) -> str:

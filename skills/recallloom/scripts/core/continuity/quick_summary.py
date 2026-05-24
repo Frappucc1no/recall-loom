@@ -194,6 +194,8 @@ def build_quick_summary_payload(
             "workspace_revision": state["workspace_revision"],
             "rolling_summary_revision": summary_revision,
             "summary_stale": freshness["summary_stale"],
+            "workspace_newer_than_summary": freshness["workspace_newer_than_summary"],
+            "workspace_artifact_newer_than_summary": freshness["workspace_artifact_newer_than_summary"],
             "freshness_risk_level": freshness_risk["level"],
         },
         "continuity_state": continuity_state,

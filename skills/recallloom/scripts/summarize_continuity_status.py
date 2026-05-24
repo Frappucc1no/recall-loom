@@ -140,6 +140,7 @@ from _common import (
     EnvironmentContractError,
     enforce_package_support_gate,
     ensure_supported_python_version,
+    exit_if_startup_scratch_residue,
     exit_with_cli_error,
     find_recallloom_root,
     latest_active_daily_log,
@@ -467,6 +468,12 @@ def main() -> None:
                 extra={"continuity_confidence": "broken"},
             ),
         )
+    startup_residue_report = exit_if_startup_scratch_residue(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
 
     try:
         summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
@@ -581,6 +588,7 @@ def main() -> None:
         digests = continuity_digest_bundle(
             summary_text=summary_text,
             latest_daily_log_text=latest_daily_log_text,
+            project_root=workspace.project_root,
         )
         continuity_state, continuity_seeded = continuity_state_for_workspace(
             state=state,
@@ -691,6 +699,7 @@ def main() -> None:
         )
 
     payload = {
+        "schema_version": "1.1",
         "project_root": public_project_root,
         "storage_root": public_storage_root,
         "timezone": zone_label,
@@ -741,6 +750,8 @@ def main() -> None:
     }
 
     if args.json:
+        if startup_residue_report is not None:
+            payload["startup_residue_report"] = startup_residue_report
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"RecallLoom root: {workspace.project_root}")

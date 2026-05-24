@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 
 from core.output.privacy import publicize_json_value
 from core.protocol import contracts as protocol_contracts
+from _common import enforce_package_support_gate
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -17,6 +19,14 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 README_PATH = REPO_ROOT / "README.md"
 USAGE_PATH = REPO_ROOT / "USAGE.md"
 SKILL_DOC_PATH = SKILL_ROOT / "SKILL.md"
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ACTIVE_ENGLISH_RE = re.compile(r"\*\*\s*English\s*\*\*", re.IGNORECASE)
+_ACTIVE_CHINESE_RE = re.compile(r"\*\*\s*简体中文\s*\*\*")
 
 
 def resolve_doc_target(path_str: str) -> Path:
@@ -48,8 +58,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def infer_doc_language_from_text(text: str, *, fallback: str = "en") -> str:
+    active_english = _ACTIVE_ENGLISH_RE.search(text) is not None
+    active_chinese = _ACTIVE_CHINESE_RE.search(text) is not None
+    if active_chinese and not active_english:
+        return "zh-CN"
+    if active_english and not active_chinese:
+        return "en"
+
+    sample = _FENCED_CODE_RE.sub("", text)
+    sample = _INLINE_CODE_RE.sub("", sample)
+    sample = _HTML_TAG_RE.sub(" ", sample)
+    cjk_count = len(_CJK_RE.findall(sample))
+    latin_count = len(_LATIN_RE.findall(sample))
+    if cjk_count >= 8 and cjk_count >= max(1, latin_count) * 0.2:
+        return "zh-CN"
+    return fallback
+
+
 def doc_language_for_path(path: Path) -> str:
-    return "zh-CN" if path.name.endswith(".zh-CN.md") else "en"
+    if path.name.endswith(".zh-CN.md"):
+        return "zh-CN"
+    if path.name.endswith(".en.md"):
+        return "en"
+    try:
+        return infer_doc_language_from_text(path.read_text(encoding="utf-8"))
+    except OSError:
+        return "en"
 
 
 def render_runtime_requirements_block(*, language: str) -> str:
@@ -203,6 +238,12 @@ def replace_sync_block(text: str, block_name: str, rendered: str) -> str:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    enforce_package_support_gate(
+        parser,
+        json_mode=args.json,
+        action_name="sync_contract_docs.py",
+        action_level="diagnostic" if args.check else "mutating",
+    )
 
     changed_files: list[str] = []
     checked_files: list[str] = []

@@ -1,10 +1,10 @@
 {
   "package_name": "recallloom",
   "display_name": "RecallLoom",
-  "package_version": "0.3.5",
+  "package_version": "0.4.0",
   "release_channel": "stable",
   "public_release_status": "released",
-  "install_guidance": "Install RecallLoom through the documented Skills CLI or directory-based skill package flow. Use npx skills update to refresh installed skills.",
+  "install_guidance": "Install the latest public RecallLoom package from the published release. Existing protocol 1.0 workspaces do not require sidecar migration.",
   "protocol_version": "1.0",
   "supported_protocol_versions": [
     "1.0"

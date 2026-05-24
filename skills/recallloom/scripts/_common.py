@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import hashlib
 import json
 import os
@@ -22,6 +22,16 @@ REVIEW_RECORD_FILE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}-[A-Za-
 MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.*?)\s*$")
 HEADING_NUMBER_PREFIX_RE = re.compile(r"^\s*[0-9]+(?:\.[0-9]+)*[.)、:：-]?\s*")
 INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u2060\u2066-\u2069\ufeff]")
+PACKAGE_SUPPORT_PUBLIC_REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+PACKAGE_SUPPORT_PUBLIC_HINT_KEY_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+PACKAGE_SUPPORT_PUBLIC_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._,;:()'+-]{0,159}$")
+PACKAGE_SUPPORT_PRIVATE_TEXT_RE = re.compile(
+    r"(?i)(?:https?://|file://|/|\\|@|\b(?:api[_-]?key|token|secret|password|credential)\b|"
+    r"\bsk-[A-Za-z0-9]{6,}\b|"
+    r"\bghp_[A-Za-z0-9_]{6,}\b|"
+    r"\bgithub_pat_[A-Za-z0-9_]{6,}\b|"
+    r"\bbearer\s+[A-Za-z0-9._-]+)"
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -44,8 +54,13 @@ from core.output.privacy import (
     public_project_root_label as shared_public_project_root_label,
     publicize_json_value,
 )
+from core.safety.scratch_residue import (
+    ScratchResidueReport,
+    external_scratch_roots_for_sources,
+    scan_startup_scratch_residue,
+)
 from core.support.cache import SUPPORT_STATE_ENV, package_support_result
-from core.support.policy import action_level_for_script
+from core.support.policy import action_level_for_script, user_message_for_state
 from core.safety import attached_text as safety_attached_text
 
 METADATA_PATH = PACKAGE_ROOT / "package-metadata.json"
@@ -455,59 +470,73 @@ PACKAGE_VERSION = PACKAGE_METADATA["package_version"]
 
 
 # ---------------------------------------------------------------------------
-# Agent + model auto-detection for writer_id
-# Reads AI_AGENT (standard agent identity) and the first model env var
-# found among common provider names.  Concatenates with ``+`` as separator.
-# Falls back to the package display name when no agent env is detected.
-# No subprocess, no I/O — pure env reads, runs once at module load.
+# Safe runtime writer attribution for public helper JSON.
+# Protocol 1.0 markers and state still persist only the canonical writer_id.
 # ---------------------------------------------------------------------------
 
-_AGENT_ID_CACHE: str | None = None
-
-# Order does not imply priority; the first one found wins.
-_MODEL_ENV_VARS = (
-    "ANTHROPIC_MODEL",
-    "OPENAI_MODEL",
-    "GEMINI_MODEL",
-    "MODEL",
-    "LLM_MODEL",
+UNKNOWN_WRITER_ID = "unknown"
+WRITER_ID_ENV = "RECALLLOOM_WRITER_ID"
+WRITER_ID_MAX_LENGTH = 64
+_SAFE_WRITER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+ :\-]{0,63}$")
+_WRITER_ID_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_WRITER_ID_ACCOUNT_IDENTIFIER_RE = re.compile(
+    r"(?i)(?:^|[._ +:\-])(?:account|acct|tenant|workspace|user|profile)(?=[A-Za-z0-9._ +:\-]|$)"
+)
+_WRITER_ID_PRIVATE_IDENTIFIER_RE = re.compile(
+    r"(?i)(?:^|[._ +:\-])(?:private|session|sid|transcript|conversation|thread|trace)(?=[A-Za-z0-9._ +:\-]|$)"
+)
+_WRITER_ID_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|credential)\s*[:=]\s*['\"]?[^\s,'\"]+"
+)
+_WRITER_ID_SECRET_WORD_RE = re.compile(
+    r"(?i)(?:^|[._ +:\-])(?:api[_-]?key|token|secret|password|credential)(?=[A-Za-z0-9._ +:\-]|$)"
+)
+_WRITER_ID_COMMON_TOKEN_RE = re.compile(
+    r"\b(ghp_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b"
+)
+_WRITER_ID_OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9]{8,}\b")
+_WRITER_ID_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]+")
+_WRITER_ID_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
+_SENSITIVE_WRITER_PREFIXES = (
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "bearer ",
 )
 
 
-def _clean_writer_value(value: str) -> str:
-    """Strip control chars, pipe and bracket so the value is safe in all marker fields."""
-    return "".join(ch for ch in value if ch not in {"|", "]", "\n", "\r"}).strip()
+@dataclass(frozen=True)
+class WriterAttribution:
+    writer_id: str
+    writer_id_source: str
+    invocation_surface: str
+    attribution_confidence: str
+    attribution_reason: str
+
+    def public_fields(self) -> dict[str, str]:
+        return {
+            "writer_id": self.writer_id,
+            "writer_id_source": self.writer_id_source,
+            "invocation_surface": self.invocation_surface,
+            "attribution_confidence": self.attribution_confidence,
+            "attribution_reason": self.attribution_reason,
+        }
 
 
 def get_default_writer_id() -> str:
     """
-    Return the canonical writer-id for the current session.
+    Return the protocol-safe fallback writer-id for the current session.
 
-    Reads ``AI_AGENT`` as-is and joins it with the first model env var
-    that is set.  Falls back to ``display_name`` when neither is found.
+    Runtime host/model environment values are intentionally not trusted as
+    writer identity. Helpers that need attribution should call
+    ``resolve_writer_attribution`` so the public JSON can state the source.
     """
-    global _AGENT_ID_CACHE
-    if _AGENT_ID_CACHE is not None:
-        return _AGENT_ID_CACHE
-
-    agent_raw = os.environ.get("AI_AGENT", "")
-    model_raw = ""
-    for var in _MODEL_ENV_VARS:
-        model_raw = os.environ.get(var, "")
-        if model_raw:
-            break
-
-    agent_part = _clean_writer_value(agent_raw.split("/")[0]) if agent_raw else ""
-    model_part = _clean_writer_value(model_raw) if model_raw else ""
-
-    if agent_part:
-        _AGENT_ID_CACHE = f"{agent_part}+{model_part}" if model_part else agent_part
-    elif model_part:
-        _AGENT_ID_CACHE = model_part
-    else:
-        _AGENT_ID_CACHE = PACKAGE_METADATA["display_name"]
-
-    return _AGENT_ID_CACHE
+    return UNKNOWN_WRITER_ID
 
 
 DISPLAY_NAME = get_default_writer_id()
@@ -583,6 +612,632 @@ def validate_writer_id(value: str) -> str:
             "writer_id may not contain '|', ']', or line-break characters because it is embedded in machine-readable markers"
         )
     return value.strip()
+
+
+def _token_like_writer_id(value: str) -> bool:
+    lowered = value.strip().casefold()
+    if any(lowered.startswith(prefix) for prefix in _SENSITIVE_WRITER_PREFIXES):
+        return True
+    return any(
+        pattern.search(value)
+        for pattern in (
+            _WRITER_ID_SECRET_ASSIGNMENT_RE,
+            _WRITER_ID_SECRET_WORD_RE,
+            _WRITER_ID_COMMON_TOKEN_RE,
+            _WRITER_ID_OPENAI_TOKEN_RE,
+            _WRITER_ID_BEARER_TOKEN_RE,
+        )
+    )
+
+
+def _unsafe_writer_id_reason(value: object) -> str | None:
+    if not isinstance(value, str):
+        return "invalid_writer_id_type"
+    normalized = value.strip()
+    if not normalized:
+        return "empty_writer_id"
+    if len(normalized) > WRITER_ID_MAX_LENGTH:
+        return "overlong_writer_id"
+    if normalized.startswith("~") or "/" in normalized or "\\" in normalized or _WRITER_ID_DRIVE_PATH_RE.match(normalized):
+        return "path_like_writer_id"
+    if _WRITER_ID_EMAIL_RE.search(normalized) or _WRITER_ID_ACCOUNT_IDENTIFIER_RE.search(normalized):
+        return "account_identifier_writer_id"
+    if _token_like_writer_id(normalized):
+        return "token_like_writer_id"
+    if _WRITER_ID_PRIVATE_IDENTIFIER_RE.search(normalized):
+        return "private_identifier_writer_id"
+    if not _SAFE_WRITER_ID_RE.fullmatch(normalized):
+        return "unsafe_writer_id_characters"
+    try:
+        validate_writer_id(normalized)
+    except ConfigContractError:
+        return "marker_unsafe_writer_id"
+    return None
+
+
+def normalize_safe_writer_id(value: str) -> str | None:
+    if _unsafe_writer_id_reason(value) is not None:
+        return None
+    return validate_writer_id(value.strip())
+
+
+def validate_explicit_writer_id(value: str, *, marker_role: str = "writer_id") -> str:
+    writer_id = normalize_safe_writer_id(value)
+    if writer_id is None:
+        return UNKNOWN_WRITER_ID
+    if marker_role == "tool_name":
+        return validate_tool_name(writer_id)
+    return validate_writer_id(writer_id)
+
+
+def resolve_writer_attribution(
+    *,
+    explicit_writer_id: str | None,
+    invocation_surface: str,
+    explicit_marker_role: str = "writer_id",
+    wrapper_metadata: dict[str, object] | None = None,
+    env: dict[str, str] | None = None,
+) -> WriterAttribution:
+    env = os.environ if env is None else env
+    if explicit_writer_id is not None:
+        writer_id = validate_explicit_writer_id(explicit_writer_id, marker_role=explicit_marker_role)
+        if writer_id == UNKNOWN_WRITER_ID:
+            return WriterAttribution(
+                writer_id=UNKNOWN_WRITER_ID,
+                writer_id_source="explicit_cli",
+                invocation_surface=invocation_surface,
+                attribution_confidence="low",
+                attribution_reason="explicit_cli_rejected",
+            )
+        return WriterAttribution(
+            writer_id=writer_id,
+            writer_id_source="explicit_cli",
+            invocation_surface=invocation_surface,
+            attribution_confidence="high",
+            attribution_reason="explicit_cli_valid",
+        )
+
+    if isinstance(wrapper_metadata, dict):
+        wrapper_attribution = wrapper_metadata.get("writer_attribution")
+        if isinstance(wrapper_attribution, dict):
+            writer_id_raw = wrapper_attribution.get("writer_id")
+            writer_id = writer_id_raw if isinstance(writer_id_raw, str) else UNKNOWN_WRITER_ID
+            return WriterAttribution(
+                writer_id=writer_id,
+                writer_id_source="wrapper_metadata",
+                invocation_surface=str(wrapper_attribution.get("invocation_surface") or invocation_surface),
+                attribution_confidence=str(wrapper_attribution.get("confidence") or "medium"),
+                attribution_reason=str(wrapper_attribution.get("reason") or "wrapper_metadata_valid"),
+            )
+
+    env_writer_id = normalize_safe_writer_id(env.get(WRITER_ID_ENV, ""))
+    if env_writer_id is not None:
+        return WriterAttribution(
+            writer_id=env_writer_id,
+            writer_id_source="env_allowlist",
+            invocation_surface=invocation_surface,
+            attribution_confidence="medium",
+            attribution_reason="env_allowlist_valid",
+        )
+
+    return WriterAttribution(
+        writer_id=UNKNOWN_WRITER_ID,
+        writer_id_source="fallback_unknown",
+        invocation_surface=invocation_surface,
+        attribution_confidence="low",
+        attribution_reason="no_safe_signal",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Safe wrapper metadata for additive public helper JSON.
+# This never writes sidecar state or protocol markers.
+# ---------------------------------------------------------------------------
+
+WRAPPER_METADATA_SCHEMA_VERSION = "wrapper-metadata.public.v1"
+WRAPPER_METADATA_ALLOWED_KEYS = frozenset(
+    {
+        "client_name",
+        "confidence",
+        "detected_by",
+        "host",
+        "host_id",
+        "host_version",
+        "invocation_surface",
+        "surface",
+        "local_wrapper_version",
+        "metadata_schema_version",
+        "session_id_hash",
+        "task_id_hash",
+        "thread_id_hash",
+        "unknown_reason",
+        "writer_id",
+    }
+)
+WRAPPER_METADATA_MAX_VALUE_LENGTH = 64
+_SAFE_WRAPPER_METADATA_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+ -]{0,63}$")
+_WRAPPER_METADATA_LOCAL_VERSION_RE = re.compile(
+    r"^v?\d+(?:\.\d+){1,3}(?P<suffix>[-+][A-Za-z0-9][A-Za-z0-9.-]{0,39})?$"
+)
+_WRAPPER_METADATA_LOCAL_VERSION_SAFE_SUFFIX_TOKEN_RE = re.compile(
+    r"(?i)^(?:alpha|beta|build|canary|ci|dev|dirty|local|nightly|pkg|preview|rc|release|"
+    r"snapshot|test|wrapper|v?\d+|[0-9a-f]{1,12})$"
+)
+_WRAPPER_METADATA_HEX_FINGERPRINT_RE = re.compile(r"(?i)^[a-f0-9]{32,}$")
+_WRAPPER_METADATA_COLON_FINGERPRINT_RE = re.compile(r"(?i)^(?:[a-f0-9]{2}:){15,}[a-f0-9]{2}$")
+_WRAPPER_METADATA_URL_RE = re.compile(r"(?i)\b(?:https?|file)://")
+_WRAPPER_METADATA_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_WRAPPER_METADATA_ACCOUNT_IDENTIFIER_RE = re.compile(
+    r"(?i)(?:^|[._ +\-])(?:account|acct|tenant|workspace|user|profile)(?=[A-Za-z0-9._ +\-]|$)"
+)
+_WRAPPER_METADATA_PRIVATE_IDENTIFIER_RE = re.compile(
+    r"(?i)(?:^|[._ +\-])(?:private|session|sid|transcript|conversation|thread|trace)(?=[A-Za-z0-9._ +\-]|$)"
+)
+_WRAPPER_METADATA_ARTIFACT_WORD_RE = re.compile(
+    r"(?i)(?:^|[._ +\-])(?:artifact|source)(?=[A-Za-z0-9._ +\-]|$)"
+)
+_WRAPPER_METADATA_ARTIFACT_IDENTIFIER_RE = re.compile(
+    r"(?i)^(?:P\d{3,}|WA|SRC|FI|UF|DG|LC|HM|HSC|SC|PS|RC|RO|RAG|MA|DOCSYNC|ENTRY|WRAP)(?:[-_][A-Z0-9]+)+$"
+)
+_WRAPPER_METADATA_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|credential)\s*[:=]\s*['\"]?[^\s,'\"]+"
+)
+_WRAPPER_METADATA_COMMON_TOKEN_RE = re.compile(
+    r"\b(ghp_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b"
+)
+_WRAPPER_METADATA_OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9]{8,}\b")
+_WRAPPER_METADATA_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]+")
+_WRAPPER_METADATA_PRIVATE_PATH_RE = re.compile(r"(^|[\s\"'=])(?:~|/|[A-Za-z]:[\\/])")
+_WRAPPER_METADATA_HASH_REF_RE = re.compile(r"^(?:hmac:[a-f0-9]{16,64}|ephemeral:[A-Za-z0-9._+-]{1,48}|none)$")
+
+_WRAPPER_HOST_ALIASES = {
+    "claude": "claude_code",
+    "claude_code": "claude_code",
+    "claude_desktop": "claude_code",
+    "codex": "codex",
+    "codex_cli": "codex",
+    "codex_desktop": "codex",
+    "opencode": "opencode",
+    "open_code": "opencode",
+}
+_WRAPPER_GOOGLE_TRANSITION_ALIASES = {
+    "antigravity_2_0",
+    "antigravity_cli",
+    "gemini",
+    "gemini_cli",
+    "gemini_cli_legacy_transition",
+    "google_ai",
+    "google_ai_studio",
+    "google_cli",
+    "google_gemini",
+    "google_gemini_cli",
+    "google_genai",
+    "google_genai_cli",
+}
+_WRAPPER_SURFACE_ALIASES = {
+    "api": "api",
+    "cli": "cli",
+    "cli_json": "cli_json",
+    "direct_helper": "direct_helper",
+    "direct_script": "direct_script",
+    "dispatcher": "dispatcher",
+    "entry_json": "cli_json",
+    "helper": "direct_helper",
+    "host_wrapper": "native_command",
+    "json_cli": "cli_json",
+    "native_command": "native_command",
+    "native_wrapper": "native_command",
+    "stdin_json": "cli_json",
+    "unknown": "unknown",
+    "wrapper": "native_command",
+}
+_WRAPPER_HOST_ID_VALUES = {"codex", "claude_code", "google_transition", "opencode", "generic_agent", "unknown"}
+_WRAPPER_CLIENT_NAME_VALUES = {
+    "codex_desktop",
+    "codex_cli",
+    "codex_exec",
+    "claude_code",
+    "antigravity_2_0",
+    "antigravity_cli",
+    "gemini_cli",
+    "gemini_cli_legacy_transition",
+    "opencode",
+    "unknown",
+}
+_WRAPPER_DETECTED_BY_VALUES = {"explicit_cli", "wrapper_metadata", "env_allowlist", "fallback_unknown"}
+_WRAPPER_CONFIDENCE_VALUES = {"high", "medium", "low"}
+_WRAPPER_UNKNOWN_REASON_VALUES = {
+    "no_safe_signal",
+    "conflicting_safe_signals",
+    "host_transition_fallback",
+    "privacy_filtered",
+}
+
+
+class WrapperMetadataSecurityError(ValueError):
+    """Public-safe wrapper metadata rejection."""
+
+    def __init__(self, message: str, *, details: dict[str, object]):
+        super().__init__(message)
+        self.details = details
+
+
+def _wrapper_metadata_failure_details(
+    *,
+    reason_code: str,
+    field: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    details: dict[str, object] = {
+        "input_role": "wrapper_metadata",
+        "reason_code": reason_code,
+        "allowed_keys": sorted(WRAPPER_METADATA_ALLOWED_KEYS),
+        "raw_metadata_public_safe": False,
+        "side_effect": "none",
+    }
+    if field is not None:
+        details["field"] = field
+    if extra:
+        details.update(extra)
+    return details
+
+
+def _raise_wrapper_metadata_security_error(
+    *,
+    reason_code: str,
+    field: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    raise WrapperMetadataSecurityError(
+        "Wrapper metadata was rejected by the public-safe allowlist.",
+        details=_wrapper_metadata_failure_details(
+            reason_code=reason_code,
+            field=field,
+            extra=extra,
+        ),
+    )
+
+
+def _wrapper_metadata_key_label(value: object) -> str | None:
+    return value if isinstance(value, str) and value in WRAPPER_METADATA_ALLOWED_KEYS else None
+
+
+def _canonical_wrapper_token(value: str) -> str:
+    token = value.strip().casefold()
+    token = re.sub(r"[^a-z0-9]+", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token or "unknown"
+
+
+def _wrapper_metadata_value_is_path_like(value: str) -> bool:
+    if _WRAPPER_METADATA_URL_RE.search(value):
+        return True
+    if _WRAPPER_METADATA_PRIVATE_PATH_RE.search(value):
+        return True
+    return "/" in value or "\\" in value
+
+
+def _wrapper_metadata_value_is_token_like(value: str) -> bool:
+    lowered = value.strip().casefold()
+    if any(lowered.startswith(prefix) for prefix in _SENSITIVE_WRITER_PREFIXES):
+        return True
+    return any(
+        pattern.search(value)
+        for pattern in (
+            _WRAPPER_METADATA_SECRET_ASSIGNMENT_RE,
+            _WRAPPER_METADATA_COMMON_TOKEN_RE,
+            _WRAPPER_METADATA_OPENAI_TOKEN_RE,
+            _WRAPPER_METADATA_BEARER_TOKEN_RE,
+        )
+    )
+
+
+def _wrapper_metadata_value_is_fingerprint(value: str) -> bool:
+    normalized = value.strip()
+    return bool(
+        _WRAPPER_METADATA_HEX_FINGERPRINT_RE.fullmatch(normalized)
+        or _WRAPPER_METADATA_COLON_FINGERPRINT_RE.fullmatch(normalized)
+    )
+
+
+def _wrapper_metadata_private_identifier_reason(value: str) -> str | None:
+    normalized = value.strip()
+    artifact_token = re.sub(r"[ _]+", "-", normalized).upper()
+    if _WRAPPER_METADATA_ARTIFACT_IDENTIFIER_RE.fullmatch(artifact_token):
+        return "artifact_identifier_value"
+    if _WRAPPER_METADATA_ARTIFACT_WORD_RE.search(normalized):
+        return "artifact_identifier_value"
+    if _WRAPPER_METADATA_ACCOUNT_IDENTIFIER_RE.search(normalized):
+        return "account_identifier_value"
+    if _WRAPPER_METADATA_PRIVATE_IDENTIFIER_RE.search(normalized):
+        return "private_identifier_value"
+    return None
+
+
+def _validate_local_wrapper_version_surface(field: str, value: str) -> None:
+    if field != "local_wrapper_version" or not value:
+        return
+    match = _WRAPPER_METADATA_LOCAL_VERSION_RE.fullmatch(value)
+    if not match:
+        _raise_wrapper_metadata_security_error(
+            reason_code="local_wrapper_version_not_version_like",
+            field=field,
+        )
+    suffix = match.group("suffix")
+    if suffix is None:
+        return
+    suffix_tokens = re.findall(r"[A-Za-z0-9]+", suffix[1:])
+    if not suffix_tokens or any(
+        not _WRAPPER_METADATA_LOCAL_VERSION_SAFE_SUFFIX_TOKEN_RE.fullmatch(token)
+        for token in suffix_tokens
+    ):
+        _raise_wrapper_metadata_security_error(
+            reason_code="local_wrapper_version_not_version_like",
+            field=field,
+        )
+
+
+def _validate_wrapper_metadata_enum(field: str, value: str, allowed: set[str]) -> str:
+    token = _canonical_wrapper_token(value)
+    if token not in allowed:
+        _raise_wrapper_metadata_security_error(
+            reason_code="enum_value_out_of_range",
+            field=field,
+        )
+    return token
+
+
+def _validate_wrapper_metadata_writer_id(field: str, value: object) -> str:
+    if not isinstance(value, str):
+        _raise_wrapper_metadata_security_error(
+            reason_code="invalid_value_type",
+            field=field,
+            extra={"expected_type": "string"},
+        )
+    writer_id = normalize_safe_writer_id(value)
+    if writer_id is None:
+        _raise_wrapper_metadata_security_error(
+            reason_code=_unsafe_writer_id_reason(value) or "unsafe_explicit_writer_id",
+            field=field,
+        )
+    return writer_id
+
+
+def _validate_wrapper_metadata_hash_ref(field: str, value: object) -> str:
+    if not isinstance(value, str):
+        _raise_wrapper_metadata_security_error(
+            reason_code="invalid_value_type",
+            field=field,
+            extra={"expected_type": "string"},
+        )
+    normalized = value.strip()
+    if len(normalized) > WRAPPER_METADATA_MAX_VALUE_LENGTH:
+        _raise_wrapper_metadata_security_error(
+            reason_code="overlong_value",
+            field=field,
+            extra={"max_value_length": WRAPPER_METADATA_MAX_VALUE_LENGTH},
+        )
+    if not _WRAPPER_METADATA_HASH_REF_RE.fullmatch(normalized):
+        _raise_wrapper_metadata_security_error(reason_code="unsafe_hash_reference", field=field)
+    return normalized
+
+
+def _validate_wrapper_metadata_string(field: str, value: object) -> str:
+    if not isinstance(value, str):
+        _raise_wrapper_metadata_security_error(
+            reason_code="invalid_value_type",
+            field=field,
+            extra={"expected_type": "string"},
+        )
+    normalized = value.strip()
+    if len(normalized) > WRAPPER_METADATA_MAX_VALUE_LENGTH:
+        _raise_wrapper_metadata_security_error(
+            reason_code="overlong_value",
+            field=field,
+            extra={"max_value_length": WRAPPER_METADATA_MAX_VALUE_LENGTH},
+        )
+    if not normalized:
+        return ""
+    if _WRAPPER_METADATA_EMAIL_RE.search(normalized):
+        _raise_wrapper_metadata_security_error(reason_code="account_identifier_value", field=field)
+    if _wrapper_metadata_value_is_token_like(normalized):
+        _raise_wrapper_metadata_security_error(reason_code="token_like_value", field=field)
+    identifier_reason = _wrapper_metadata_private_identifier_reason(normalized)
+    if identifier_reason is not None:
+        _raise_wrapper_metadata_security_error(reason_code=identifier_reason, field=field)
+    if _wrapper_metadata_value_is_path_like(normalized):
+        _raise_wrapper_metadata_security_error(reason_code="path_like_value", field=field)
+    if _wrapper_metadata_value_is_fingerprint(normalized):
+        _raise_wrapper_metadata_security_error(reason_code="fingerprint_value", field=field)
+    if not _SAFE_WRAPPER_METADATA_VALUE_RE.fullmatch(normalized):
+        _raise_wrapper_metadata_security_error(reason_code="unsafe_value_characters", field=field)
+    _validate_local_wrapper_version_surface(field, normalized)
+    return normalized
+
+
+def _validate_wrapper_metadata_field(field: str, value: object) -> str:
+    if field == "writer_id":
+        return _validate_wrapper_metadata_writer_id(field, value)
+    if field == "host_id":
+        return _validate_wrapper_metadata_enum(field, _validate_wrapper_metadata_string(field, value), _WRAPPER_HOST_ID_VALUES)
+    if field == "client_name":
+        return _validate_wrapper_metadata_enum(
+            field,
+            _validate_wrapper_metadata_string(field, value),
+            _WRAPPER_CLIENT_NAME_VALUES,
+        )
+    if field == "invocation_surface":
+        return _validate_wrapper_metadata_enum(
+            field,
+            _validate_wrapper_metadata_string(field, value),
+            set(_WRAPPER_SURFACE_ALIASES),
+        )
+    if field == "detected_by":
+        return _validate_wrapper_metadata_enum(
+            field,
+            _validate_wrapper_metadata_string(field, value),
+            _WRAPPER_DETECTED_BY_VALUES,
+        )
+    if field == "confidence":
+        return _validate_wrapper_metadata_enum(
+            field,
+            _validate_wrapper_metadata_string(field, value),
+            _WRAPPER_CONFIDENCE_VALUES,
+        )
+    if field == "unknown_reason":
+        return _validate_wrapper_metadata_enum(
+            field,
+            _validate_wrapper_metadata_string(field, value),
+            _WRAPPER_UNKNOWN_REASON_VALUES,
+        )
+    if field == "metadata_schema_version":
+        normalized = _validate_wrapper_metadata_string(field, value)
+        if normalized != "1":
+            _raise_wrapper_metadata_security_error(
+                reason_code="metadata_schema_version_unsupported",
+                field=field,
+            )
+        return normalized
+    if field in {"session_id_hash", "task_id_hash", "thread_id_hash"}:
+        return _validate_wrapper_metadata_hash_ref(field, value)
+    if field == "host_version":
+        normalized = _validate_wrapper_metadata_string(field, value)
+        if normalized != "unknown":
+            _validate_local_wrapper_version_surface("local_wrapper_version", normalized)
+        return normalized
+    return _validate_wrapper_metadata_string(field, value)
+
+
+def _load_wrapper_metadata(raw_json: str) -> dict[str, str]:
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        _raise_wrapper_metadata_security_error(
+            reason_code="malformed_json",
+            extra={"json_error_line": exc.lineno, "json_error_column": exc.colno},
+        )
+    if not isinstance(payload, dict):
+        _raise_wrapper_metadata_security_error(
+            reason_code="top_level_not_object",
+            extra={"expected_type": "object"},
+        )
+
+    unknown_key_count = sum(1 for key in payload if key not in WRAPPER_METADATA_ALLOWED_KEYS)
+    if unknown_key_count:
+        _raise_wrapper_metadata_security_error(
+            reason_code="unknown_key",
+            extra={"unknown_key_count": unknown_key_count},
+        )
+
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in payload.items():
+        field = _wrapper_metadata_key_label(raw_key)
+        if field is None:
+            _raise_wrapper_metadata_security_error(reason_code="unknown_key")
+        normalized_value = _validate_wrapper_metadata_field(field, raw_value)
+        if normalized_value:
+            normalized[field] = normalized_value
+    return normalized
+
+
+def _normalize_wrapper_host(value: str | None) -> tuple[str, str]:
+    if not value:
+        return "unknown", "absent"
+    token = _canonical_wrapper_token(value)
+    if token in _WRAPPER_HOST_ALIASES:
+        return _WRAPPER_HOST_ALIASES[token], "normalized"
+    if token in _WRAPPER_GOOGLE_TRANSITION_ALIASES:
+        return "google_transition", "google_transition_alias"
+    if token.startswith("google_") or token.startswith("gemini_google_"):
+        return "google_transition", "google_transition_alias"
+    return "unknown", "safe_fallback_unknown"
+
+
+def _normalize_wrapper_surface(value: str | None) -> tuple[str, str]:
+    if not value:
+        return "unknown", "absent"
+    token = _canonical_wrapper_token(value)
+    if token in _WRAPPER_SURFACE_ALIASES:
+        return _WRAPPER_SURFACE_ALIASES[token], "normalized"
+    return "unknown", "safe_fallback_unknown"
+
+
+def _wrapper_host_input(normalized: dict[str, str]) -> str | None:
+    if normalized.get("host"):
+        return normalized["host"]
+    if normalized.get("host_id"):
+        return normalized["host_id"]
+    if normalized.get("client_name"):
+        return normalized["client_name"]
+    return None
+
+
+def _wrapper_surface_input(normalized: dict[str, str]) -> str | None:
+    return normalized.get("surface") or normalized.get("invocation_surface")
+
+
+def _wrapper_writer_attribution(normalized: dict[str, str], *, invocation_surface: str) -> dict[str, str] | None:
+    writer_id = normalized.get("writer_id")
+    if writer_id is None:
+        return None
+    reason = normalized.get("unknown_reason") if writer_id == UNKNOWN_WRITER_ID else "wrapper_metadata_valid"
+    return {
+        "writer_id": writer_id,
+        "writer_id_source": "wrapper_metadata",
+        "detected_by": normalized.get("detected_by", "wrapper_metadata"),
+        "confidence": normalized.get("confidence", "medium"),
+        "reason": reason or "wrapper_metadata_valid",
+        "invocation_surface": invocation_surface,
+    }
+
+
+def _wrapper_version_observation(local_wrapper_version: str | None) -> dict[str, str | bool]:
+    base: dict[str, str | bool] = {
+        "observed_package_version": PACKAGE_VERSION,
+        "comparison_basis": "local_package_metadata_only",
+        "release_status_claim": "not_evaluated",
+    }
+    if not local_wrapper_version:
+        return {
+            **base,
+            "status": "absent",
+        }
+    status = (
+        "matches_observed_package"
+        if local_wrapper_version == PACKAGE_VERSION
+        else "differs_from_observed_package"
+    )
+    return {
+        **base,
+        "local_wrapper_version": local_wrapper_version,
+        "status": status,
+    }
+
+
+def normalize_wrapper_metadata_json(raw_json: str | None) -> dict[str, object] | None:
+    if raw_json is None:
+        return None
+    normalized = _load_wrapper_metadata(raw_json)
+    host, host_signal = _normalize_wrapper_host(_wrapper_host_input(normalized))
+    surface, surface_signal = _normalize_wrapper_surface(_wrapper_surface_input(normalized))
+    payload: dict[str, object] = {
+        "schema_version": WRAPPER_METADATA_SCHEMA_VERSION,
+        "host": host,
+        "surface": surface,
+        "host_signal": host_signal,
+        "surface_signal": surface_signal,
+        "version": _wrapper_version_observation(normalized.get("local_wrapper_version")),
+        "consumer_migration_required": False,
+        "privacy": {
+            "raw_metadata_retained": False,
+            "host_private_identifiers": "absent_or_rejected",
+            "host_memory_truth_contribution": False,
+        },
+    }
+    writer_attribution = _wrapper_writer_attribution(normalized, invocation_surface=surface)
+    if writer_attribution is not None:
+        payload["writer_attribution"] = writer_attribution
+    return payload
 WORKSPACE_LOCK_FILENAME = workspace_runtime.WORKSPACE_LOCK_FILENAME
 STALE_LOCK_MAX_AGE_SECONDS = 6 * 3600
 
@@ -650,18 +1305,25 @@ def now_iso_timestamp() -> str:
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.tmp-",
-        delete=False,
-    ) as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temp_path = Path(handle.name)
-    os.replace(temp_path, path)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.tmp-",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        if temp_path is not None:
+            with suppress(FileNotFoundError):
+                temp_path.unlink()
+        raise
 
 
 def read_text(path: Path) -> str:
@@ -754,6 +1416,42 @@ def public_json_payload(
     return publicized if isinstance(publicized, dict) else payload
 
 
+def _public_package_support_text(value: object, *, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    stripped = value.strip()
+    if not stripped:
+        return fallback
+    if PACKAGE_SUPPORT_PRIVATE_TEXT_RE.search(stripped):
+        return fallback
+    if not PACKAGE_SUPPORT_PUBLIC_TEXT_RE.match(stripped):
+        return fallback
+    return stripped
+
+
+def _public_package_support_reason_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if PACKAGE_SUPPORT_PUBLIC_REASON_RE.match(stripped):
+        return stripped
+    return "redacted"
+
+
+def _public_package_support_update_hints(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    public: dict[str, str] = {}
+    for raw_key, raw_hint in value.items():
+        if not isinstance(raw_key, str):
+            continue
+        key = raw_key.strip()
+        if not PACKAGE_SUPPORT_PUBLIC_HINT_KEY_RE.match(key):
+            continue
+        public[key] = _public_package_support_text(raw_hint, fallback="redacted")
+    return public
+
+
 def public_package_support_payload(support: dict | None) -> dict | None:
     if support is None:
         return None
@@ -778,6 +1476,11 @@ def public_package_support_payload(support: dict | None) -> dict | None:
         "disabled",
     )
     public = {key: support[key] for key in allowed_keys if key in support}
+    public["user_message"] = user_message_for_state(
+        str(public.get("package_support_state") or "unknown_offline")
+    )
+    public["reason_code"] = _public_package_support_reason_code(public.get("reason_code"))
+    public["update_hints"] = _public_package_support_update_hints(public.get("update_hints"))
     source = public.get("source")
     if isinstance(source, str):
         if source.startswith("file:"):
@@ -845,7 +1548,12 @@ def enforce_package_support_gate(
     os.environ[SUPPORT_STATE_ENV] = json.dumps(support, ensure_ascii=False)
     if support["allowed"]:
         return support
-    message = support.get("user_message") or "RecallLoom package support gate blocked this action."
+    public_support = public_package_support_payload(support)
+    message = (
+        public_support.get("user_message")
+        if isinstance(public_support, dict) and isinstance(public_support.get("user_message"), str)
+        else "RecallLoom package support gate blocked this action."
+    )
     exit_with_cli_error(
         parser,
         json_mode=json_mode,
@@ -854,9 +1562,86 @@ def enforce_package_support_gate(
         payload=cli_failure_payload(
             "package_support_blocked",
             error=message,
-            details={"package_support": support},
-            extra={"package_support": support},
+            details={"package_support": public_support},
+            extra={"package_support": public_support},
         ),
+    )
+
+
+def startup_scratch_residue_report(
+    project_root: str | Path,
+    storage_root: str | Path,
+    *,
+    external_roots: Iterable[str | Path] | None = None,
+) -> ScratchResidueReport:
+    return scan_startup_scratch_residue(
+        project_root=project_root,
+        storage_root=storage_root,
+        external_roots=external_roots,
+    )
+
+
+def startup_residue_report_for_sources(
+    project_root: str | Path,
+    storage_root: str | Path,
+    *source_paths: str | Path | None,
+) -> ScratchResidueReport:
+    return startup_scratch_residue_report(
+        project_root,
+        storage_root,
+        external_roots=external_scratch_roots_for_sources(*source_paths),
+    )
+
+
+def exit_if_startup_scratch_residue(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: str | Path,
+    storage_root: str | Path,
+    external_roots: Iterable[str | Path] | None = None,
+) -> dict | None:
+    report = startup_scratch_residue_report(
+        project_root,
+        storage_root,
+        external_roots=external_roots,
+    )
+    if report.blocked:
+        public_report = report.public_dict()
+        message = "RecallLoom startup scratch residue detected; no files were changed."
+        exit_with_cli_error(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "startup_residue_detected",
+                error=message,
+                details={
+                    "project_root": str(project_root),
+                    "startup_residue_report": public_report,
+                },
+                findings=public_report["findings"],
+                extra={"startup_residue_report": public_report},
+            ),
+        )
+    return report.report_only_public_dict()
+
+
+def exit_if_startup_scratch_residue_for_sources(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: str | Path,
+    storage_root: str | Path,
+    source_paths: Iterable[str | Path | None],
+) -> dict | None:
+    return exit_if_startup_scratch_residue(
+        parser,
+        json_mode=json_mode,
+        project_root=project_root,
+        storage_root=storage_root,
+        external_roots=external_scratch_roots_for_sources(*source_paths),
     )
 
 
@@ -1346,10 +2131,12 @@ def continuity_digest_bundle(
     *,
     summary_text: str,
     latest_daily_log_text: str | None = None,
+    project_root: str | Path | None = None,
 ) -> dict:
     return continuity_freshness.continuity_digest_bundle(
         summary_text=summary_text,
         latest_daily_log_text=latest_daily_log_text,
+        project_root=project_root,
     )
 
 

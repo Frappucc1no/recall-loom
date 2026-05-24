@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
+import stat
 import sys
 
 from _common import (
@@ -18,6 +19,7 @@ from _common import (
     enforce_package_support_gate,
     ensure_supported_python_version,
     exit_with_cli_error,
+    exit_with_failure_contract,
     now_iso_timestamp,
     public_json_payload,
     public_project_path,
@@ -220,6 +222,7 @@ Summarize briefly:
 """,
     },
 }
+PROJECT_SCOPE_DISPATCHER_UNSAFE_SHELL_RE = re.compile(r"[;&|<>`$]|\r|\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -248,7 +251,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--dispatcher-command",
         help=(
             "Exact shell command prefix to invoke the RecallLoom dispatcher, "
-            'for example: "/abs/path/to/python3" "/abs/path/to/recallloom.py"'
+            'for project scope use a Python 3.10+ relative form such as: python3.x "skills/recallloom/scripts/recallloom.py"; '
+            "for user scope an absolute dispatcher can be provided with --scope user."
         ),
     )
     parser.add_argument(
@@ -273,7 +277,9 @@ def project_root(path_raw: str) -> Path:
     return Path(path_raw).expanduser().resolve()
 
 
-def current_python_command() -> str:
+def current_python_command(*, scope: str) -> str:
+    if scope == "project":
+        return f"python{sys.version_info.major}.{sys.version_info.minor}"
     candidate = Path(sys.executable).expanduser()
     if candidate.is_absolute():
         return f'"{candidate}"'
@@ -282,6 +288,65 @@ def current_python_command() -> str:
     except OSError:
         resolved = candidate
     return f'"{resolved}"'
+
+
+def validate_project_scope_dispatcher_script(path: Path, project: Path) -> tuple[str, str | None]:
+    candidate = path if path.is_absolute() else project / path
+    try:
+        candidate_stat = candidate.lstat()
+        project_resolved = project.resolve(strict=True)
+    except FileNotFoundError:
+        return (
+            "missing_project_dispatcher",
+            "Project-scope native wrappers require an existing project-local RecallLoom dispatcher script.",
+        )
+    except OSError:
+        return (
+            "unreadable_project_dispatcher",
+            "Project-scope native wrappers require a readable project-local RecallLoom dispatcher script.",
+        )
+    if stat.S_ISLNK(candidate_stat.st_mode):
+        return (
+            "symlink_project_dispatcher",
+            "Project-scope native wrappers require a regular project-local dispatcher script, not a symlink.",
+        )
+    if not stat.S_ISREG(candidate_stat.st_mode):
+        return (
+            "non_regular_project_dispatcher",
+            "Project-scope native wrappers require a regular project-local RecallLoom dispatcher script.",
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return (
+            "unreadable_project_dispatcher",
+            "Project-scope native wrappers require a readable project-local RecallLoom dispatcher script.",
+        )
+    try:
+        resolved.relative_to(project_resolved)
+    except ValueError:
+        return (
+            "external_project_dispatcher",
+            "Project-scope native wrappers require the dispatcher script to resolve inside the target project.",
+        )
+    return ("relative_project_dispatcher", None)
+
+
+def validate_project_scope_dispatcher_token(script_token: str) -> tuple[Path | None, str | None, str | None]:
+    if "\\" in script_token:
+        return (
+            None,
+            "windows_separator_project_dispatcher",
+            "Project-scope dispatcher commands must use portable POSIX-style project-relative paths.",
+        )
+    posix_path = PurePosixPath(script_token)
+    if posix_path.is_absolute() or ".." in posix_path.parts or "" in posix_path.parts:
+        return (
+            None,
+            "escaping_project_dispatcher",
+            "Project-scope dispatcher commands must not use absolute paths, empty path parts, or parent-directory escapes.",
+        )
+    return Path(*posix_path.parts), None, None
 
 
 def host_command_dir(host: str, *, scope: str, project: Path) -> Path:
@@ -295,28 +360,44 @@ def host_command_dir(host: str, *, scope: str, project: Path) -> Path:
 
 
 def detect_dispatcher_command(project: Path, *, scope: str) -> str:
-    python_command = current_python_command()
+    python_command = current_python_command(scope=scope)
     candidates = [
         project / "skills" / "recallloom" / "scripts" / "recallloom.py",
         project / ".claude" / "skills" / "recallloom" / "scripts" / "recallloom.py",
         project / ".agents" / "skills" / "recallloom" / "scripts" / "recallloom.py",
-        SCRIPT_DIR / "recallloom.py",
     ]
+    if scope != "project":
+        candidates.append(SCRIPT_DIR / "recallloom.py")
     for candidate in candidates:
-        if candidate.is_file():
-            if scope == "project":
-                try:
-                    rel = candidate.relative_to(project)
-                    return f'{python_command} "{rel.as_posix()}"'
-                except ValueError:
-                    return f'{python_command} "{candidate}"'
+        if scope == "project":
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            stability, advisory = validate_project_scope_dispatcher_script(candidate, project)
+            if stability != "relative_project_dispatcher":
+                raise ConfigContractError(
+                    advisory
+                    or "Project-scope native wrappers require a portable project-local dispatcher command."
+                )
+            try:
+                rel = candidate.relative_to(project)
+                return f'{python_command} "{rel.as_posix()}"'
+            except ValueError:
+                continue
+        elif candidate.is_file():
             return f'{python_command} "{candidate}"'
     raise ConfigContractError(
-        "Could not auto-detect a RecallLoom dispatcher path. Re-run with --dispatcher-command."
+        "Could not auto-detect a project-local RecallLoom dispatcher path. "
+        "For project-scope native wrappers, install the skill in the project or "
+        "re-run with a portable relative --dispatcher-command. Use --scope user for local absolute dispatchers."
     )
 
 
 def classify_project_scope_dispatcher_path(dispatcher_command: str, project: Path) -> tuple[str, str | None]:
+    if PROJECT_SCOPE_DISPATCHER_UNSAFE_SHELL_RE.search(dispatcher_command):
+        return (
+            "unsafe_dispatcher_command",
+            "Project-scope dispatcher command must be a simple dispatcher invocation without shell metacharacters.",
+        )
     try:
         tokens = shlex.split(dispatcher_command)
     except ValueError:
@@ -324,12 +405,27 @@ def classify_project_scope_dispatcher_path(dispatcher_command: str, project: Pat
     if not tokens:
         return ("unknown", None)
 
+    for token in tokens:
+        if not token or token.startswith("-"):
+            continue
+        if Path(token).expanduser().is_absolute():
+            return (
+                "absolute_command_token",
+                "project scope command files must not embed absolute local paths; use a relative project dispatcher command or --scope user.",
+            )
+
     script_token = next((token for token in reversed(tokens) if token.endswith("recallloom.py")), None)
     if script_token is None:
         return ("unknown", None)
 
-    candidate = Path(script_token).expanduser()
+    candidate, token_stability, token_advisory = validate_project_scope_dispatcher_token(script_token)
+    if token_stability is not None:
+        return (token_stability, token_advisory)
+    assert candidate is not None
     if not candidate.is_absolute():
+        stability, advisory = validate_project_scope_dispatcher_script(candidate, project)
+        if stability != "relative_project_dispatcher":
+            return (stability, advisory)
         return ("relative_project_dispatcher", None)
 
     try:
@@ -447,9 +543,52 @@ def is_recallloom_managed_wrapper(host: str, filename: str, existing_content: st
 
 def write_wrapper_content(destination: Path, content: str) -> None:
     if destination.is_symlink():
-        write_text(destination.resolve(strict=True), content)
-        return
+        raise ConfigContractError(
+            "Refusing to write through a symlinked native command file. "
+            "Remove the symlink and retry the install."
+        )
     write_text(destination, content)
+
+
+def native_command_file_ref(destination: Path, *, scope: str, project: Path) -> str:
+    if scope == "project":
+        try:
+            return destination.relative_to(project).as_posix()
+        except ValueError:
+            return destination.name
+    return str(destination)
+
+
+def validate_project_scope_command_dir(destination_dir: Path, project: Path) -> None:
+    try:
+        relative = destination_dir.relative_to(project)
+        project_resolved = project.resolve(strict=True)
+    except (ValueError, OSError) as exc:
+        raise ConfigContractError(
+            "Project-scope native wrapper destination must stay inside the target project."
+        ) from exc
+
+    current = project
+    for part in relative.parts:
+        current = current / part
+        if not current.exists() and not current.is_symlink():
+            continue
+        try:
+            current_stat = current.lstat()
+        except OSError as exc:
+            raise ConfigContractError(
+                "Project-scope native wrapper destination contains an unreadable path component."
+            ) from exc
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ConfigContractError(
+                "Project-scope native wrapper destination must not contain symlinked directories."
+            )
+        try:
+            current.resolve(strict=True).relative_to(project_resolved)
+        except (OSError, ValueError) as exc:
+            raise ConfigContractError(
+                "Project-scope native wrapper destination must resolve inside the target project."
+            ) from exc
 
 
 def install_host(
@@ -462,34 +601,37 @@ def install_host(
     apply: bool,
 ) -> dict:
     destination_dir = host_command_dir(host, scope=scope, project=project)
+    if scope == "project":
+        validate_project_scope_command_dir(destination_dir, project)
     rendered = render_templates_for_host(host, dispatcher_command=dispatcher_command)
     results = []
 
     for filename, content in rendered.items():
         destination = destination_dir / filename
+        file_ref = native_command_file_ref(destination, scope=scope, project=project)
         is_symlink = destination.is_symlink()
+        if is_symlink:
+            results.append(
+                {
+                    "file": file_ref,
+                    "changed": True,
+                    "applied": False,
+                    "managed": False,
+                    "symlink": True,
+                    "reason": "symlink_not_supported",
+                }
+            )
+            continue
         existed = destination.exists() or is_symlink
         existing_content = read_text(destination) if existed and (destination.exists() or not is_symlink) else None
         changed = (not existed) or existing_content != content
         recallloom_managed = bool(
             existed and existing_content is not None and is_recallloom_managed_wrapper(host, filename, existing_content)
         )
-        if existed and changed and is_symlink and not force:
-            results.append(
-                {
-                    "file": str(destination),
-                    "changed": True,
-                    "applied": False,
-                    "managed": recallloom_managed,
-                    "symlink": True,
-                    "reason": "exists_requires_force",
-                }
-            )
-            continue
         if existed and changed and not force and not recallloom_managed:
             results.append(
                 {
-                    "file": str(destination),
+                    "file": file_ref,
                     "changed": True,
                     "applied": False,
                     "managed": False,
@@ -503,7 +645,7 @@ def install_host(
             write_wrapper_content(destination, content)
         results.append(
             {
-                "file": str(destination),
+                "file": file_ref,
                 "changed": changed,
                 "applied": applied_change,
                 "managed": recallloom_managed,
@@ -533,7 +675,7 @@ def public_dispatcher_command(command: str, *, project_root: Path) -> str:
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return command
+        return "unparseable-dispatcher-command"
 
     public_tokens: list[str] = []
     for token in tokens:
@@ -599,8 +741,43 @@ def main() -> None:
             json_mode=args.json,
             exit_code=2,
             message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="invalid_prepared_input"),
+                payload=cli_failure_payload_for_exception(exc, default_reason="invalid_prepared_input"),
         )
+    try:
+        shlex.split(dispatcher_command)
+    except ValueError:
+        exit_with_failure_contract(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message="Dispatcher command could not be parsed safely.",
+            reason="invalid_prepared_input",
+            details={
+                "dispatcher_command_parse": "invalid",
+                "side_effect": "none",
+            },
+        )
+
+    project_scope_path_stability = "not_applicable"
+    project_scope_path_advisory = None
+    if args.scope == "project":
+        project_scope_path_stability, project_scope_path_advisory = classify_project_scope_dispatcher_path(
+            dispatcher_command,
+            project,
+        )
+        if project_scope_path_stability != "relative_project_dispatcher":
+            exit_with_failure_contract(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=project_scope_path_advisory
+                or "Project-scope native wrappers require a portable relative dispatcher command.",
+                reason="invalid_prepared_input",
+                details={
+                    "project_scope_path_stability": project_scope_path_stability,
+                    "side_effect": "none",
+                },
+            )
 
     hosts = list(SUPPORTED_HOSTS) if args.host == "all" else [args.host]
 
@@ -634,19 +811,12 @@ def main() -> None:
             payload=cli_failure_payload("damaged_sidecar", error=message),
         )
 
-    project_scope_path_stability = "not_applicable"
-    project_scope_path_advisory = None
-    if args.scope == "project":
-        project_scope_path_stability, project_scope_path_advisory = classify_project_scope_dispatcher_path(
-            dispatcher_command,
-            project,
-        )
-
     all_results = [result for host_payload in host_results for result in host_payload["results"]]
     changed_count = sum(1 for result in all_results if result["changed"])
     applied_count = sum(1 for result in all_results if result["applied"])
     requires_force_count = sum(1 for result in all_results if result["reason"] == "exists_requires_force")
-    ok = not (args.yes and requires_force_count > 0)
+    symlink_blocked_count = sum(1 for result in all_results if result["reason"] == "symlink_not_supported")
+    ok = not (args.yes and (requires_force_count > 0 or symlink_blocked_count > 0))
 
     payload = {
         "ok": ok,
@@ -667,6 +837,7 @@ def main() -> None:
             "changed": changed_count,
             "applied": applied_count,
             "requires_force": requires_force_count,
+            "symlink_blocked": symlink_blocked_count,
         },
         "generated_at": now_iso_timestamp(),
         "host_results": host_results,
@@ -678,7 +849,10 @@ def main() -> None:
 
     if args.json:
         public_payload = public_json_payload(payload, project_root=project)
-        for host_payload in public_payload.get("host_results", []):
+        for host_payload, raw_host_payload in zip(
+            public_payload.get("host_results", []),
+            host_results,
+        ):
             if not isinstance(host_payload, dict):
                 continue
             dispatcher_command = host_payload.get("dispatcher_command")
@@ -687,12 +861,24 @@ def main() -> None:
                     dispatcher_command,
                     project_root=project,
                 )
+            if args.scope == "project":
+                raw_results = raw_host_payload.get("results", [])
+                public_results = host_payload.get("results", [])
+                if isinstance(public_results, list):
+                    for result, raw_result in zip(public_results, raw_results):
+                        if isinstance(result, dict) and isinstance(raw_result, dict):
+                            result["file"] = raw_result.get("file", result.get("file"))
         print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:
         if not args.yes:
             print(f"Previewed native RecallLoom command wrappers for scope={args.scope}")
         elif not ok:
-            print(f"Native RecallLoom command wrapper refresh requires --force for some existing files (scope={args.scope})")
+            if symlink_blocked_count > 0:
+                print(
+                    f"Native RecallLoom command wrapper refresh blocked symlinked command files (scope={args.scope})"
+                )
+            else:
+                print(f"Native RecallLoom command wrapper refresh requires --force for some existing files (scope={args.scope})")
         elif applied_count > 0:
             print(f"Installed native RecallLoom command wrappers for scope={args.scope}")
         else:
@@ -702,11 +888,17 @@ def main() -> None:
         elif project_scope_path_advisory is not None:
             print(f"Advisory: {project_scope_path_advisory}")
         for host_payload in host_results:
-            print(f"- {host_payload['host']}: {host_payload['destination_dir']}")
+            destination_dir = public_project_path(
+                host_payload["destination_dir"],
+                project_root=project,
+            )
+            print(f"- {host_payload['host']}: {destination_dir}")
             for result in host_payload["results"]:
                 status = "changed" if result["changed"] else "unchanged"
                 if result["reason"] == "exists_requires_force":
                     status = "requires --force"
+                elif result["reason"] == "symlink_not_supported":
+                    status = "symlink blocked"
                 print(f"  - {Path(result['file']).name}: {status}")
 
     raise SystemExit(0 if ok else 1)

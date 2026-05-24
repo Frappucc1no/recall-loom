@@ -11,6 +11,37 @@ import sys
 from core.output.privacy import private_json_paths_enabled, publicize_json_value, publicize_text_paths
 
 
+ROLLING_SUMMARY_JSON_SECTION_KEYS = frozenset(
+    (
+        "current_state",
+        "active_judgments",
+        "risks_open_questions",
+        "next_step",
+        "recent_pivots",
+    )
+)
+
+MANAGED_MARKDOWN_WRITE_ROUTES = {
+    ("context_brief", "stable-context"): {
+        "file_key": "context_brief",
+        "write_type": "stable-context",
+        "label": "context-brief",
+        "source_placeholder": "<context-brief-source.md>",
+    },
+    ("rolling_summary", "current-state"): {
+        "file_key": "rolling_summary",
+        "write_type": "current-state",
+        "label": "rolling-summary",
+        "source_placeholder": "<rolling-summary-source.md>",
+    },
+    ("update_protocol", "protocol-rules"): {
+        "file_key": "update_protocol",
+        "write_type": "protocol-rules",
+        "label": "update-protocol",
+        "source_placeholder": "<update-protocol-source.md>",
+    },
+}
+
 FAILURE_REASON_ALIASES = {
     "attached_text_safety_blocked": "attach_scan_blocked",
 }
@@ -212,6 +243,21 @@ FAILURE_REASON_REGISTRY = {
             "zh-CN": "请修复损坏的 managed 文件，不要绕过 marker 或 section 校验。",
         },
     },
+    "derived_overlay_conflict": {
+        "blocked": True,
+        "recoverability": "operator_repair_required",
+        "surface_level": "operator",
+        "trust_effect": "conflicting",
+        "next_actions": ["inspect_derived_overlay", "keep_rolling_summary_as_current_truth"],
+        "user_message": {
+            "en": "A derived overlay conflicts with rolling_summary current truth, so RecallLoom stopped instead of promoting derived data.",
+            "zh-CN": "派生 overlay 与 rolling_summary 当前真相冲突，RecallLoom 已停止，未提升派生数据。",
+        },
+        "operator_note": {
+            "en": "Treat rolling_summary.md as the current truth and repair or remove the optional derived overlay.",
+            "zh-CN": "请把 rolling_summary.md 视为当前真相，并修复或移除可选派生 overlay。",
+        },
+    },
     "invalid_prepared_input": {
         "blocked": True,
         "recoverability": "user_input_required",
@@ -225,6 +271,36 @@ FAILURE_REASON_REGISTRY = {
         "operator_note": {
             "en": "Fix the prepared source file or stdin content before retrying.",
             "zh-CN": "请先修正 source file 或 stdin 内容，再重试。",
+        },
+    },
+    "privacy_security_failure": {
+        "blocked": True,
+        "recoverability": "security_blocked",
+        "surface_level": "user_safe",
+        "trust_effect": "security_blocked",
+        "next_actions": ["revise_wrapper_metadata", "retry_helper"],
+        "user_message": {
+            "en": "The wrapper metadata did not pass the public-safety allowlist.",
+            "zh-CN": "wrapper metadata 没有通过 public-safety allowlist。",
+        },
+        "operator_note": {
+            "en": "Remove private identifiers, paths, tokens, fingerprints, and unsupported keys before retrying.",
+            "zh-CN": "重试前请移除私有标识符、路径、token、fingerprint 和不支持的字段。",
+        },
+    },
+    "startup_residue_detected": {
+        "blocked": True,
+        "recoverability": "operator_repair_required",
+        "surface_level": "user_safe",
+        "trust_effect": "review_required",
+        "next_actions": ["inspect_helper_scratch_residue", "remove_confirmed_residue", "retry_helper"],
+        "user_message": {
+            "en": "RecallLoom found helper-owned startup scratch residue and stopped before making changes.",
+            "zh-CN": "RecallLoom 发现 helper-owned 启动残留，已在作出改动前停止。",
+        },
+        "operator_note": {
+            "en": "Inspect the public-safe residue report, remove only confirmed helper scratch residue, then retry.",
+            "zh-CN": "请检查 public-safe 残留报告，只移除确认属于 helper scratch 的残留后再重试。",
         },
     },
     "historical_append_requires_confirmation": {
@@ -395,6 +471,55 @@ def _prepared_input_mode(details: dict | None) -> str | None:
     return None
 
 
+def _rolling_summary_section_from_field_path(field_path: object) -> str | None:
+    if not isinstance(field_path, str) or not field_path.startswith("$."):
+        return None
+    section_key = field_path[2:].split(".", 1)[0].split("[", 1)[0]
+    return section_key if section_key in ROLLING_SUMMARY_JSON_SECTION_KEYS else None
+
+
+def _is_rolling_summary_json_reserved_marker(details: dict | None) -> bool:
+    if not details or details.get("reason_code") != "reserved_marker_injection":
+        return False
+    input_mode = _prepared_input_mode(details)
+    if not isinstance(input_mode, str) or not input_mode.startswith("json-"):
+        return False
+    section_key = details.get("section_key")
+    return (
+        section_key in ROLLING_SUMMARY_JSON_SECTION_KEYS
+        or _rolling_summary_section_from_field_path(details.get("field_path")) is not None
+    )
+
+
+def _is_rolling_summary_json_builder(details: dict | None) -> bool:
+    if not details:
+        return False
+    return (
+        details.get("prepared_input_builder") == "rolling_summary_json"
+        or _is_rolling_summary_json_reserved_marker(details)
+        or (
+            details.get("file_key") == "rolling_summary"
+            and details.get("write_type") == "current-state"
+            and _prepared_input_mode(details) in {"json-file", "json-stdin"}
+        )
+    )
+
+
+def _managed_markdown_write_route(details: dict | None) -> dict | None:
+    if not details:
+        return None
+    input_mode = _prepared_input_mode(details)
+    if input_mode not in {"file", "stdin"}:
+        return None
+    route = MANAGED_MARKDOWN_WRITE_ROUTES.get(
+        (
+            details.get("file_key"),
+            details.get("write_type"),
+        )
+    )
+    return dict(route) if route is not None else None
+
+
 def _append_input_source_args(details: dict | None) -> list[str] | None:
     if not details:
         return None
@@ -417,6 +542,57 @@ def _append_input_source_args(details: dict | None) -> list[str] | None:
 
 def _invalid_prepared_input_suggestion(language: str, details: dict | None) -> str:
     input_mode = _prepared_input_mode(details)
+    if _is_rolling_summary_json_builder(details):
+        if input_mode == "json-file":
+            return _localized_text(
+                language,
+                en=(
+                    "Fix the rolling-summary JSON source file, then rerun the current-state write "
+                    "with --source-file and --input-format json."
+                ),
+                zh_cn=(
+                    "请先修正 rolling-summary JSON source file，再用 --source-file 和 "
+                    "--input-format json 重新执行 current-state write。"
+                ),
+            )
+        return _localized_text(
+            language,
+            en=(
+                "Fix the rolling-summary JSON payload on stdin, then rerun the current-state write "
+                "with --stdin --input-format json."
+            ),
+            zh_cn=(
+                "请先修正 stdin 中的 rolling-summary JSON payload，再用 --stdin "
+                "--input-format json 重新执行 current-state write。"
+            ),
+        )
+    managed_markdown_route = _managed_markdown_write_route(details)
+    if managed_markdown_route is not None:
+        label = managed_markdown_route["label"]
+        write_type = managed_markdown_route["write_type"]
+        if input_mode == "file":
+            return _localized_text(
+                language,
+                en=(
+                    f"Fix the {label} markdown source file, then rerun the {write_type} write "
+                    "with --source-file."
+                ),
+                zh_cn=(
+                    f"请先修正 {label} markdown source file，再用 --source-file "
+                    f"重新执行 {write_type} write。"
+                ),
+            )
+        return _localized_text(
+            language,
+            en=(
+                f"Fix the {label} markdown payload on stdin, then rerun the {write_type} write "
+                "with --stdin."
+            ),
+            zh_cn=(
+                f"请先修正 stdin 中的 {label} markdown payload，再用 --stdin "
+                f"重新执行 {write_type} write。"
+            ),
+        )
     if input_mode == "json-string":
         return _localized_text(
             language,
@@ -454,6 +630,71 @@ def _invalid_prepared_input_recovery_action(
 ) -> str | None:
     helper_name = _normalize_script_name(script_name) or "append_daily_log_entry.py"
     input_mode = _prepared_input_mode(details)
+    if _is_rolling_summary_json_builder(details):
+        source_path = details.get("source_path") if details else None
+        source_arg = _quote_or_placeholder(
+            source_path if isinstance(source_path, str) else None,
+            "rolling-summary.json",
+        )
+        project_root = _infer_project_root(details)
+        project_arg = _quote_or_placeholder(project_root, "<project-path>")
+        if helper_name == "recallloom.py":
+            if input_mode == "json-file":
+                return (
+                    f"Fix the rolling-summary JSON source file, then re-run {helper_name} write "
+                    f"{project_arg} --type current-state --source-file {source_arg} "
+                    "--input-format json --json."
+                )
+            return (
+                f"Fix the rolling-summary JSON payload on stdin, then re-run {helper_name} write "
+                f"{project_arg} --type current-state --stdin --input-format json --json."
+            )
+        if input_mode == "json-file":
+            return (
+                f"Fix the rolling-summary JSON source file, then re-run {helper_name} "
+                f"{project_arg} --file-key rolling_summary --source-file {source_arg} "
+                "--input-format json with fresh expected revisions."
+            )
+        return (
+            f"Fix the rolling-summary JSON payload on stdin, then re-run {helper_name} "
+            f"{project_arg} --file-key rolling_summary --stdin --input-format json "
+            "with fresh expected revisions."
+        )
+    managed_markdown_route = _managed_markdown_write_route(details)
+    if managed_markdown_route is not None:
+        file_key = managed_markdown_route["file_key"]
+        write_type = managed_markdown_route["write_type"]
+        label = managed_markdown_route["label"]
+        source_path = details.get("source_path") if details else None
+        source_arg = _quote_or_placeholder(
+            source_path if isinstance(source_path, str) else None,
+            managed_markdown_route["source_placeholder"],
+        )
+        project_root = _infer_project_root(details)
+        project_arg = _quote_or_placeholder(project_root, "<project-path>")
+        dispatcher_file_action = (
+            f"Fix the {label} markdown source file, then re-run recallloom.py write "
+            f"{project_arg} --type {write_type} --source-file {source_arg} --json."
+        )
+        dispatcher_stdin_action = (
+            f"Fix the {label} markdown payload on stdin, then re-run recallloom.py write "
+            f"{project_arg} --type {write_type} --stdin --json."
+        )
+        if helper_name == "recallloom.py":
+            if input_mode == "file":
+                return dispatcher_file_action
+            return dispatcher_stdin_action
+        if input_mode == "file":
+            return (
+                f"Fix the {label} markdown source file, then re-run {helper_name} "
+                f"{project_arg} --file-key {file_key} --source-file {source_arg} "
+                f"with fresh expected revisions. Dispatcher equivalent: {dispatcher_file_action}"
+            )
+        return (
+            f"Fix the {label} markdown payload on stdin, then re-run {helper_name} "
+            f"{project_arg} --file-key {file_key} --stdin with fresh expected revisions. "
+            f"Dispatcher equivalent: {dispatcher_stdin_action}"
+        )
     if input_mode == "json-string":
         return f"Re-run {helper_name} with --entry-json and a valid daily-log JSON object."
     if input_mode == "json-stdin":
@@ -653,6 +894,27 @@ def _failure_suggestion(
         )
     if reason == "invalid_prepared_input":
         return _invalid_prepared_input_suggestion(language, details)
+    if reason == "privacy_security_failure":
+        return _localized_text(
+            language,
+            en=(
+                "Retry with only supported wrapper metadata keys and short public enum-like values; "
+                "do not include private paths, account IDs, tokens, fingerprints, or raw host state."
+            ),
+            zh_cn=(
+                "请只使用受支持的 wrapper metadata 字段和短的 public enum-like 值重试；"
+                "不要包含私有路径、账户 ID、token、fingerprint 或原始 host 状态。"
+            ),
+        )
+    if reason == "startup_residue_detected":
+        return _localized_text(
+            language,
+            en=(
+                "Review the startup_residue_report, remove only confirmed helper-owned scratch "
+                "residue, then rerun the same command."
+            ),
+            zh_cn="请检查 startup_residue_report，只移除确认属于 helper-owned scratch 的残留后再重新执行同一命令。",
+        )
     if reason == "malformed_managed_file":
         return _localized_text(
             language,
@@ -754,6 +1016,14 @@ def _failure_recovery_command(
             return _script_command("unlock_write_lock.py", project_arg, "--json")
         return "Wait for the active writer to finish, then rerun the helper after the lock clears."
     if reason == "invalid_prepared_input":
+        if _is_rolling_summary_json_builder(details):
+            source_action = _invalid_prepared_input_recovery_action(script_name, details)
+            if source_action is not None:
+                return source_action
+        if _managed_markdown_write_route(details) is not None:
+            source_action = _invalid_prepared_input_recovery_action(script_name, details)
+            if source_action is not None:
+                return source_action
         retry_date = target_date if isinstance(target_date, str) and target_date else None
         if retry_date is not None:
             command = _append_retry_command(date_value=retry_date)
@@ -767,6 +1037,10 @@ def _failure_recovery_command(
             "use --input-format json for JSON file/stdin input, then rerun append_daily_log_entry.py "
             "from the project root with the current workspace revision."
         )
+    if reason == "privacy_security_failure":
+        return "Remove unsafe wrapper metadata fields or values, then rerun the same helper command."
+    if reason == "startup_residue_detected":
+        return "Inspect the public-safe startup_residue_report, remove confirmed helper scratch residue, then rerun the same command."
     if reason == "historical_append_requires_confirmation":
         append_date = target_date if isinstance(target_date, str) and target_date else None
         if append_date is not None:

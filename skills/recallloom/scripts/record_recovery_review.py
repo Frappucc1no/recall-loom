@@ -80,7 +80,7 @@ def main() -> None:
 
     source_path = Path(args.source_file).expanduser().resolve()
     if not source_path.is_file():
-        message = f"Source file does not exist: {source_path}"
+        message = "Source file does not exist or is not a regular file."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -89,13 +89,13 @@ def main() -> None:
             payload=cli_failure_payload(
                 "invalid_prepared_input",
                 error=message,
-                details={"source_file": str(source_path)},
+                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
             ),
         )
     try:
         body_text = read_text(source_path)
     except (OSError, UnicodeDecodeError) as exc:
-        message = f"Filesystem error: {exc}"
+        message = "Source file could not be read."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -104,11 +104,15 @@ def main() -> None:
             payload=cli_failure_payload(
                 "invalid_prepared_input",
                 error=message,
-                details={"source_file": str(source_path)},
+                details={
+                    "source_file_ref": "provided_source_file",
+                    "side_effect": "none",
+                    "error_type": type(exc).__name__,
+                },
             ),
         )
     if not body_text.strip():
-        message = f"Source file is empty: {source_path}"
+        message = "Source file is empty."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -117,7 +121,7 @@ def main() -> None:
             payload=cli_failure_payload(
                 "invalid_prepared_input",
                 error=message,
-                details={"source_file": str(source_path)},
+                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
             ),
         )
     review_errors = validate_recovery_review_text(body_text)

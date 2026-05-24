@@ -56,15 +56,23 @@ def evaluate_trust_state(
 
     if sidecar_trust_state in {"damaged", "conflicting", "security_blocked"}:
         allowed_operation_level = "none"
+        read_confidence = "untrusted"
     elif continuity_state == "initialized_empty_shell":
         allowed_operation_level = "read_summary_only"
+        read_confidence = "empty_shell"
     elif drift_level in {"high", "medium"}:
         allowed_operation_level = "read_current_state"
+        read_confidence = "review_recommended"
     else:
         allowed_operation_level = "write_current_state_after_preflight"
+        read_confidence = "trusted_current_read"
 
     return {
         "sidecar_trust_state": sidecar_trust_state,
         "continuity_drift_risk_level": drift_level,
         "allowed_operation_level": allowed_operation_level,
+        "read_confidence": read_confidence,
+        "read_trust_note": (
+            "Read-side trust only; this does not relax write gates or cursor guards."
+        ),
     }

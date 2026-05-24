@@ -33,12 +33,14 @@ from _common import (
     EnvironmentContractError,
     enforce_package_support_gate,
     ensure_supported_python_version,
+    exit_if_startup_scratch_residue,
     exit_with_cli_error,
     find_recallloom_root,
     invalid_iso_like_daily_log_files,
     latest_active_daily_log,
     load_workspace_state,
     detect_update_protocol_time_policy_cues,
+    daily_log_entries,
     extract_section_text,
     parse_daily_log_entry_line,
     parse_iso_date,
@@ -100,6 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit non-zero if a non-context workspace artifact is newer than the rolling summary.",
     )
+    parser.add_argument(
+        "--skip-startup-residue-scan",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
 
@@ -133,6 +140,152 @@ def recommended_actions_for_preflight(
     ):
         actions.append("consider_refresh_summary")
     return actions
+
+
+def build_post_append_summary_sync_contract(
+    *,
+    workspace,
+    state: dict,
+    summary_path: Path,
+    summary_state,
+    latest_daily_log: Path | None,
+    latest_daily_log_entry,
+    latest_daily_log_entry_count: int,
+    continuity_seeded: bool,
+    summary_revision_is_stale: bool,
+    summary_stale: bool,
+    workspace_is_newer: bool,
+    allowed_operation_level: str,
+    rolling_summary_handoff: dict,
+) -> dict:
+    safe_rolling_summary_handoff = {
+        "active_task_digest": rolling_summary_handoff.get("active_task_digest"),
+        "blocked_digest": rolling_summary_handoff.get("blocked_digest"),
+        "latest_daily_log_digest_available": bool(
+            rolling_summary_handoff.get("latest_relevant_log_digest")
+        ),
+        "latest_relevant_log_digest_redacted": bool(
+            rolling_summary_handoff.get("latest_relevant_log_digest")
+        ),
+        "suggested_handoff_sections": rolling_summary_handoff.get("suggested_handoff_sections", []),
+    }
+    target_path = summary_path.relative_to(workspace.project_root).as_posix()
+    latest_daily_log_path = (
+        latest_daily_log.relative_to(workspace.project_root).as_posix()
+        if latest_daily_log is not None
+        else None
+    )
+    read_set = [target_path]
+    if latest_daily_log_path is not None:
+        read_set.append(latest_daily_log_path)
+
+    daily_state = state.get("daily_logs")
+    latest_file_from_state = daily_state.get("latest_file") if isinstance(daily_state, dict) else None
+    latest_daily_log_storage_path = (
+        latest_daily_log.relative_to(workspace.storage_root).as_posix()
+        if latest_daily_log is not None
+        else None
+    )
+    cursor_matches_latest_log = (
+        isinstance(daily_state, dict)
+        and latest_daily_log_entry is not None
+        and latest_file_from_state == latest_daily_log_storage_path
+        and daily_state.get("latest_entry_id") == latest_daily_log_entry.entry_id
+        and daily_state.get("latest_entry_seq") == latest_daily_log_entry.entry_seq
+        and daily_state.get("entry_count") == latest_daily_log_entry_count
+    )
+    workspace_revision = state["workspace_revision"]
+    summary_base_workspace_revision = summary_state.base_workspace_revision if summary_state else None
+    single_append_delta = (
+        isinstance(summary_base_workspace_revision, int)
+        and workspace_revision == summary_base_workspace_revision + 1
+    )
+    non_summary_writes_after_summary_base: list[str] = []
+    files_state = state.get("files")
+    if isinstance(files_state, dict) and isinstance(summary_base_workspace_revision, int):
+        for file_key, file_state in sorted(files_state.items()):
+            if file_key == "rolling_summary" or not isinstance(file_state, dict):
+                continue
+            base_revision = file_state.get("base_workspace_revision")
+            if isinstance(base_revision, int) and base_revision > summary_base_workspace_revision:
+                non_summary_writes_after_summary_base.append(file_key)
+    latest_daily_log_newer_than_summary = (
+        latest_daily_log is not None
+        and latest_daily_log.stat().st_mtime > summary_path.stat().st_mtime
+    )
+    latest_daily_log_not_older_than_summary = (
+        latest_daily_log is not None
+        and latest_daily_log.stat().st_mtime >= summary_path.stat().st_mtime
+    )
+
+    reason_code = None
+    if not summary_stale or not workspace_is_newer:
+        reason_code = "summary_not_stale"
+    elif not summary_revision_is_stale:
+        reason_code = "summary_revision_not_stale"
+    elif not isinstance(summary_base_workspace_revision, int):
+        reason_code = "missing_summary_base_workspace_revision"
+    elif non_summary_writes_after_summary_base:
+        reason_code = "stale_cause_not_append_only"
+    elif not single_append_delta:
+        reason_code = "stale_not_single_append_delta"
+    elif not continuity_seeded:
+        reason_code = "continuity_not_seeded"
+    elif latest_daily_log is None:
+        reason_code = "missing_latest_daily_log"
+    elif latest_daily_log_entry is None:
+        reason_code = "missing_latest_daily_log_entry"
+    elif not isinstance(daily_state, dict):
+        reason_code = "invalid_daily_log_cursor"
+    elif not cursor_matches_latest_log:
+        reason_code = "daily_log_cursor_mismatch"
+    elif not latest_daily_log_not_older_than_summary:
+        reason_code = "stale_cause_not_append_only"
+
+    append_cursor = {
+        "latest_file": latest_file_from_state if isinstance(daily_state, dict) else None,
+        "latest_entry_id": latest_daily_log_entry.entry_id if latest_daily_log_entry else None,
+        "latest_entry_seq": latest_daily_log_entry.entry_seq if latest_daily_log_entry else None,
+        "entry_count": latest_daily_log_entry_count if latest_daily_log is not None else None,
+    }
+
+    contract = {
+        "contract_type": "post_append_summary_sync",
+        "allowed": reason_code is None,
+        "requires_repair_command_first": True,
+        "write_type": "current-state",
+        "file_key": "rolling_summary",
+        "input_format": "json",
+        "target_path": target_path,
+        "expected_file_revision": summary_state.revision if summary_state else None,
+        "expected_workspace_revision": workspace_revision,
+        "append_cursor": append_cursor,
+        "provenance_guard": {
+            "summary_base_workspace_revision": summary_base_workspace_revision,
+            "workspace_revision": workspace_revision,
+            "expected_workspace_revision_delta": 1,
+            "single_append_delta": single_append_delta,
+            "cursor_matches_latest_log": cursor_matches_latest_log,
+            "non_summary_writes_after_summary_base": non_summary_writes_after_summary_base,
+            "latest_daily_log_newer_than_summary": latest_daily_log_newer_than_summary,
+            "latest_daily_log_not_older_than_summary": latest_daily_log_not_older_than_summary,
+        },
+        "rolling_summary_handoff": safe_rolling_summary_handoff,
+        "read_set": read_set,
+        "ordinary_write_gate_preserved": True,
+        "ordinary_write_gate": {
+            "allowed_operation_level": allowed_operation_level,
+            "summary_stale": summary_stale,
+            "gate_condition": (
+                "recallloom.py write requires allowed_operation_level="
+                "write_current_state_after_preflight and summary_stale=false"
+            ),
+            "contract_does_not_authorize_recallloom_write": True,
+        },
+    }
+    if reason_code is not None:
+        contract["reason_code"] = reason_code
+    return contract
 
 
 def main() -> None:
@@ -171,6 +324,14 @@ def main() -> None:
                 error="No RecallLoom project root found.",
                 details={"project_root": str(Path(args.path).expanduser().resolve())},
             ),
+        )
+    startup_residue_report = None
+    if not args.skip_startup_residue_scan:
+        startup_residue_report = exit_if_startup_scratch_residue(
+            parser,
+            json_mode=args.json,
+            project_root=workspace.project_root,
+            storage_root=workspace.storage_root,
         )
 
     try:
@@ -254,8 +415,11 @@ def main() -> None:
                 )
 
         latest_daily_log_entry = None
+        latest_daily_log_entry_count = 0
         if latest_daily_log is not None:
-            for line in read_text(latest_daily_log).splitlines():
+            latest_daily_log_text_for_entries = read_text(latest_daily_log)
+            latest_daily_log_entry_count = len(daily_log_entries(latest_daily_log_text_for_entries))
+            for line in latest_daily_log_text_for_entries.splitlines():
                 entry = parse_daily_log_entry_line(line)
                 if entry is not None:
                     latest_daily_log_entry = entry
@@ -292,6 +456,7 @@ def main() -> None:
         digests = continuity_digest_bundle(
             summary_text=summary_text,
             latest_daily_log_text=latest_daily_log_text,
+            project_root=workspace.project_root,
         )
         continuity_state, continuity_seeded = continuity_state_for_workspace(
             state=state,
@@ -567,6 +732,25 @@ def main() -> None:
             },
         },
     }
+    if startup_residue_report is not None:
+        payload["startup_residue_report"] = startup_residue_report
+
+    rolling_summary_handoff = payload["safe_write_context"]["rolling_summary_handoff"]
+    payload["safe_write_context"]["post_append_summary_sync"] = build_post_append_summary_sync_contract(
+        workspace=workspace,
+        state=state,
+        summary_path=summary_path,
+        summary_state=summary_state,
+        latest_daily_log=latest_daily_log,
+        latest_daily_log_entry=latest_daily_log_entry,
+        latest_daily_log_entry_count=latest_daily_log_entry_count,
+        continuity_seeded=continuity_seeded,
+        summary_revision_is_stale=summary_revision_is_stale,
+        summary_stale=summary_stale,
+        workspace_is_newer=workspace_is_newer,
+        allowed_operation_level=trust_state["allowed_operation_level"],
+        rolling_summary_handoff=rolling_summary_handoff,
+    )
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))

@@ -11,6 +11,8 @@ from core.protocol.contracts import validate_workspace_language
 
 ROOT_ENTRY_CANDIDATES = (
     Path("README.md"),
+    Path("README.en.md"),
+    Path("README.zh-CN.md"),
     Path("AGENTS.md"),
     Path("CLAUDE.md"),
     Path("GEMINI.md"),
@@ -21,6 +23,28 @@ HIGH_SIGNAL_DOC_RE = re.compile(r"(change ?log|spec|roadmap|architecture)", re.I
 USER_REALITY_DOC_RE = re.compile(r"(memory|status|summary|handoff|decision|milestone|progress)", re.I)
 MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
 HOST_MEMORY_CONFIDENCE_LEVELS = {"low", "medium", "high"}
+HOST_MEMORY_PATH_REF = "host-memory:path"
+HOST_MEMORY_COMMAND_REF = "host-memory:command"
+HOST_MEMORY_PATH_PLACEHOLDER = (
+    "Host memory path declared explicitly as hint-only; contents are not copied into public output."
+)
+HOST_MEMORY_COMMAND_PLACEHOLDER = (
+    "Host memory command declared explicitly but not executed automatically."
+)
+HOST_MEMORY_SOURCE_MAX_LENGTH = 64
+_HOST_MEMORY_SOURCE_SAFE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+ -]{0,63}$")
+_HOST_MEMORY_SOURCE_URL_RE = re.compile(r"(?i)\b(?:https?|file)://")
+_HOST_MEMORY_SOURCE_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_HOST_MEMORY_SOURCE_SECRET_RE = re.compile(
+    r"(?i)(?:\b(?:api[_-]?key|token|secret|password|credential)\b|"
+    r"\bsk-[A-Za-z0-9]{8,}\b|"
+    r"\bghp_[A-Za-z0-9_]{8,}\b|"
+    r"\bgithub_pat_[A-Za-z0-9_]{8,}\b|"
+    r"\bbearer\s+[A-Za-z0-9._-]+)"
+)
+_HOST_MEMORY_SOURCE_PRIVATE_WORD_RE = re.compile(
+    r"(?i)(?:^|[._ +\-])(?:account|acct|tenant|workspace|user|profile|private|session|sid|transcript|conversation|thread|trace)(?=[A-Za-z0-9._ +\-]|$)"
+)
 
 
 def _resolved_path_within_project(candidate: Path, *, project_root: Path) -> Path | None:
@@ -93,6 +117,25 @@ def read_source_excerpt(path: Path, *, max_lines: int = 4) -> list[str]:
         return normalize_text_lines(path.read_text(encoding="utf-8"), max_lines=max_lines)
     except (OSError, UnicodeDecodeError):
         return []
+
+
+def sanitize_host_memory_source_label(source_label: str | None) -> str:
+    if not source_label or not source_label.strip():
+        raise ValueError("Enabling host memory requires --host-memory-source.")
+    normalized = source_label.strip()
+    if len(normalized) > HOST_MEMORY_SOURCE_MAX_LENGTH:
+        raise ValueError("Host memory source label must be a short public-safe host label.")
+    if (
+        _HOST_MEMORY_SOURCE_EMAIL_RE.search(normalized)
+        or _HOST_MEMORY_SOURCE_URL_RE.search(normalized)
+        or _HOST_MEMORY_SOURCE_SECRET_RE.search(normalized)
+        or _HOST_MEMORY_SOURCE_PRIVATE_WORD_RE.search(normalized)
+        or "/" in normalized
+        or "\\" in normalized
+        or not _HOST_MEMORY_SOURCE_SAFE_RE.fullmatch(normalized)
+    ):
+        raise ValueError("Host memory source label must be a short public-safe host label.")
+    return normalized
 
 
 def tier_a_sources(project_root: Path) -> list[dict]:
@@ -180,30 +223,42 @@ def tier_c_sources(project_root: Path) -> list[dict]:
 
 def tier_d_sources(project_root: Path, explicit_sources: list[str]) -> list[dict]:
     sources: list[dict] = []
-    missing: list[str] = []
+    missing_count = 0
+    try:
+        project_resolved = project_root.resolve(strict=True)
+    except OSError:
+        project_resolved = project_root.resolve()
     for raw in explicit_sources:
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = (project_root / candidate).resolve()
         if not candidate.is_file():
-            missing.append(str(candidate))
+            missing_count += 1
+            continue
+        try:
+            resolved_candidate = candidate.resolve(strict=True)
+            relative_path = resolved_candidate.relative_to(project_resolved).as_posix()
+            path_ref = str(resolved_candidate)
+            excerpt_lines = read_source_excerpt(resolved_candidate)
+        except ValueError:
+            relative_path = "external-source"
+            path_ref = "explicit-source:external"
+            excerpt_lines = []
+        except OSError:
+            missing_count += 1
             continue
         sources.append(
             {
                 "tier": "D",
-                "path": str(candidate),
-                "relative_path": candidate.relative_to(project_root).as_posix()
-                if project_root in candidate.parents or candidate == project_root
-                else str(candidate),
+                "path": path_ref,
+                "relative_path": relative_path,
                 "kind": "explicit_source",
                 "confidence": "high",
-                "excerpt_lines": read_source_excerpt(candidate),
+                "excerpt_lines": excerpt_lines,
             }
         )
-    if missing:
-        raise ValueError(
-            "Explicit Tier-D source paths must exist as files: " + ", ".join(sorted(missing))
-        )
+    if missing_count:
+        raise ValueError("One or more explicit Tier-D source paths must exist as regular files.")
     return sources
 
 
@@ -259,8 +314,7 @@ def build_host_memory_adapter(
             "error": None,
         }
 
-    if not source_label or not source_label.strip():
-        raise ValueError("Enabling host memory requires --host-memory-source.")
+    safe_source_label = sanitize_host_memory_source_label(source_label)
     if confidence not in HOST_MEMORY_CONFIDENCE_LEVELS:
         raise ValueError(
             "Enabling host memory requires --host-memory-confidence with one of: low, medium, high."
@@ -276,25 +330,25 @@ def build_host_memory_adapter(
         if not candidate.is_absolute():
             candidate = (project_root / candidate).resolve()
         if not candidate.is_file():
-            raise ValueError(f"Host memory path does not exist: {candidate}")
+            raise ValueError("Host memory path does not exist or is not a regular file.")
         return {
             "enabled": True,
-            "source": source_label.strip(),
+            "source": safe_source_label,
             "mode": "path",
-            "path": str(candidate),
+            "path": HOST_MEMORY_PATH_REF,
             "command": None,
             "confidence": confidence,
             "hint_only": True,
-            "ingested": True,
+            "ingested": False,
             "error": None,
         }
 
     return {
         "enabled": True,
-        "source": source_label.strip(),
+        "source": safe_source_label,
         "mode": "command",
         "path": None,
-        "command": command_raw,
+        "command": HOST_MEMORY_COMMAND_REF,
         "confidence": confidence,
         "hint_only": True,
         "ingested": False,
@@ -306,33 +360,26 @@ def tier_f_sources(project_root: Path, adapter: dict) -> list[dict]:
     if not adapter.get("enabled"):
         return []
     if adapter.get("mode") == "path" and adapter.get("path"):
-        candidate = Path(adapter["path"])
         return [
             {
                 "tier": "F",
-                "path": str(candidate),
-                "relative_path": (
-                    candidate.relative_to(project_root).as_posix()
-                    if project_root in candidate.parents or candidate == project_root
-                    else str(candidate)
-                ),
+                "path": HOST_MEMORY_PATH_REF,
+                "relative_path": HOST_MEMORY_PATH_REF,
                 "kind": "host_memory_path",
                 "confidence": adapter["confidence"],
                 "hint_only": True,
-                "excerpt_lines": read_source_excerpt(candidate),
+                "excerpt_lines": [HOST_MEMORY_PATH_PLACEHOLDER],
             }
         ]
     return [
         {
             "tier": "F",
-            "path": adapter["command"],
-            "relative_path": adapter["command"],
+            "path": HOST_MEMORY_COMMAND_REF,
+            "relative_path": HOST_MEMORY_COMMAND_REF,
             "kind": "host_memory_command",
             "confidence": adapter["confidence"],
             "hint_only": True,
-            "excerpt_lines": [
-                "Host memory command declared explicitly but not executed automatically."
-            ],
+            "excerpt_lines": [HOST_MEMORY_COMMAND_PLACEHOLDER],
         }
     ]
 

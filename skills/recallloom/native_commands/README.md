@@ -1,6 +1,7 @@
 # RecallLoom Native Command Templates
 
-This directory contains host-specific native command templates for platforms that support user-defined commands.
+This directory contains host-specific native command templates for supported
+platforms.
 
 Current supported hosts:
 
@@ -8,18 +9,30 @@ Current supported hosts:
 - `gemini-cli`
 - `opencode`
 
-These templates are not meant to be copied blindly as-is.
-They contain a `__DISPATCHER_COMMAND__` placeholder and are intended to be rendered through:
+These templates are rendered by
+[`scripts/install_native_commands.py`](../scripts/install_native_commands.py).
+They are convenience wrappers only and convenience entrypoints only. The wrapper
+layer delegates to the unified RecallLoom dispatcher.
 
-- `scripts/install_native_commands.py`
-
-The current native command set is intentionally small:
+Current wrapper scope:
 
 - `rl-init`
 - `rl-resume`
 - `rl-status`
 - `rl-validate`
 
-Each command calls the unified RecallLoom dispatcher rather than re-implementing host-specific logic.
-They are convenience wrappers only; they do not justify bypassing the dispatcher or hand-building sidecar files.
-They also do not replace host/router first-hop policy for generic “continue” or “restore” requests; that routing contract still belongs above the wrapper layer.
+The wrappers delegate to the same RecallLoom dispatcher contract described in
+[README.md](../../../README.md), [README.en.md](../../../README.en.md),
+[README.zh-CN.md](../../../README.zh-CN.md), [INDEX.md](../../../INDEX.md),
+[USAGE.md](../../../USAGE.md), and [`SKILL.md`](../SKILL.md).
+
+Boundary rules:
+
+- wrappers do not replace the skill package
+- wrappers do not create a second logic set
+- wrappers do not bypass the dispatcher or helper scripts
+- wrappers do not justify bypassing the dispatcher
+- wrappers do not replace host/router first-hop policy
+- wrappers do not turn host bridge text into product truth
+- wrapper layer text stays advisory
+- natural-language restore requests stay the primary public path

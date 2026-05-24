@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.output.privacy import redact_public_text
 from core.protocol.sections import extract_section_text
 
 DEFAULT_WORKSPACE_ARTIFACT_EXCLUDED_DIRS = {
@@ -216,7 +217,50 @@ def freshness_risk_summary(
     }
 
 
-def digest_excerpt(text: str, *, max_lines: int = 4) -> str | None:
+def read_freshness_semantics(
+    *,
+    workspace_artifact_scan_mode: str,
+    workspace_artifact_scan_performed: bool,
+    workspace_artifact_newer_than_summary: bool | None,
+    summary_revision_stale: bool,
+    workspace_newer_than_summary: bool,
+    continuity_confidence: str,
+) -> dict:
+    freshness_risk = freshness_risk_summary(
+        workspace_artifact_scan_mode=workspace_artifact_scan_mode,
+        workspace_artifact_scan_performed=workspace_artifact_scan_performed,
+        workspace_artifact_newer_than_summary=workspace_artifact_newer_than_summary,
+        summary_revision_stale=summary_revision_stale,
+        continuity_confidence=continuity_confidence,
+    )
+    if continuity_confidence == "high" and freshness_risk["level"] == "low":
+        read_confidence = "current"
+    elif workspace_artifact_newer_than_summary:
+        read_confidence = "workspace_newer_than_summary"
+    elif summary_revision_stale or workspace_newer_than_summary:
+        read_confidence = "stale_summary_review_recommended"
+    elif continuity_confidence == "broken":
+        read_confidence = "broken"
+    else:
+        read_confidence = "bounded"
+
+    return {
+        "legacy_path": "protocol_1_0_sidecar_compatible",
+        "legacy_path_compatible": True,
+        "stale_summary": summary_revision_stale,
+        "workspace_newer_than_summary": workspace_newer_than_summary,
+        "read_confidence": read_confidence,
+        "freshness_risk_level": freshness_risk["level"],
+        "freshness_risk_note": freshness_risk["note"],
+    }
+
+
+def digest_excerpt(
+    text: str,
+    *,
+    max_lines: int = 4,
+    project_root: str | Path | None = None,
+) -> str | None:
     lines: list[str] = []
     for raw in text.splitlines():
         stripped = raw.strip()
@@ -227,6 +271,7 @@ def digest_excerpt(text: str, *, max_lines: int = 4) -> str | None:
         stripped = stripped.lstrip("-* ").strip()
         if not stripped:
             continue
+        stripped = redact_public_text(stripped, project_root=project_root) or "redacted"
         lines.append(stripped)
         if len(lines) >= max_lines:
             break
@@ -235,14 +280,20 @@ def digest_excerpt(text: str, *, max_lines: int = 4) -> str | None:
     return " | ".join(lines)
 
 
-def _digest_excerpt(text: str, *, max_lines: int = 4) -> str | None:
-    return digest_excerpt(text, max_lines=max_lines)
+def _digest_excerpt(
+    text: str,
+    *,
+    max_lines: int = 4,
+    project_root: str | Path | None = None,
+) -> str | None:
+    return digest_excerpt(text, max_lines=max_lines, project_root=project_root)
 
 
 def continuity_digest_bundle(
     *,
     summary_text: str,
     latest_daily_log_text: str | None = None,
+    project_root: str | Path | None = None,
 ) -> dict:
     summary_is_empty_shell_template = summary_matches_empty_shell_template(summary_text)
     if summary_is_empty_shell_template:
@@ -252,9 +303,11 @@ def continuity_digest_bundle(
         next_step_text = extract_section_text(summary_text, "next_step")
         risks_text = extract_section_text(summary_text, "risks_open_questions")
         active_task_digest = (
-            None if is_effectively_empty_summary_next_step(next_step_text) else digest_excerpt(next_step_text)
+            None
+            if is_effectively_empty_summary_next_step(next_step_text)
+            else digest_excerpt(next_step_text, project_root=project_root)
         )
-        blocked_digest = digest_excerpt(risks_text)
+        blocked_digest = digest_excerpt(risks_text, project_root=project_root)
 
     latest_relevant_log_digest = None
     if latest_daily_log_text:
@@ -264,7 +317,8 @@ def continuity_digest_bundle(
             extract_section_text(latest_daily_log_text, "recommended_next_step"),
         ]
         latest_relevant_log_digest = digest_excerpt(
-            "\n".join(section for section in log_sections if section.strip())
+            "\n".join(section for section in log_sections if section.strip()),
+            project_root=project_root,
         )
 
     suggested_handoff_sections: list[str] = []
@@ -359,4 +413,12 @@ def evaluate_continuity_freshness(
         "workspace_newer_than_summary": workspace_is_newer,
         "summary_stale": workspace_is_newer,
         "continuity_confidence": continuity_confidence,
+        "read_freshness": read_freshness_semantics(
+            workspace_artifact_scan_mode=scan_mode,
+            workspace_artifact_scan_performed=workspace_artifact_scan_performed,
+            workspace_artifact_newer_than_summary=workspace_artifact_is_newer,
+            summary_revision_stale=summary_revision_is_stale,
+            workspace_newer_than_summary=workspace_is_newer,
+            continuity_confidence=continuity_confidence,
+        ),
     }

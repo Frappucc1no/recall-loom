@@ -990,11 +990,13 @@ def is_official_temp_storage_asset(
     if not sep or not candidate_name:
         return False
 
-    if path.parent == storage_root:
-        for rel_path in [*required_files, *optional_files]:
-            rel = PurePosixPath(rel_path)
-            if rel.parent.as_posix() in {".", ""} and rel.name == candidate_name:
-                return True
+    for rel_path in [*required_files, *optional_files]:
+        rel = PurePosixPath(rel_path)
+        if rel.name != candidate_name:
+            continue
+        expected_parent = storage_root if rel.parent.as_posix() in {".", ""} else storage_root / rel.parent
+        if path.parent == expected_parent:
+            return True
 
     for rule in dynamic_rules:
         base_dir = storage_root / PurePosixPath(rule["base_dir"])

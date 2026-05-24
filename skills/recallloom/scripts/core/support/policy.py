@@ -21,7 +21,7 @@ SCRIPT_ACTION_LEVELS = {
     "validate_context.py": "diagnostic",
     "summarize_continuity_status.py": "diagnostic",
     "unlock_write_lock.py": "diagnostic",
-    "sync_contract_docs.py": "diagnostic",
+    "sync_contract_docs.py": "mutating",
     "query_continuity.py": "readonly",
     "preflight_context_check.py": "readonly",
     "recommend_workday.py": "readonly",

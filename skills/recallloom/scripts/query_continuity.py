@@ -25,6 +25,7 @@ from _common import (
     exit_with_cli_error,
     ensure_supported_python_version,
     EnvironmentContractError,
+    exit_if_startup_scratch_residue,
     extract_section_text,
     find_recallloom_root,
     FILE_KEYS,
@@ -47,10 +48,29 @@ from _common import (
 
 SOURCE_TYPE_PRIORITY = {
     "rolling_summary": 4,
-    "context_brief": 3,
+    "derived_overlay": 3,
+    "context_brief": 2,
     "latest_daily_log": 2,
     "recent_daily_log": 1,
 }
+
+DERIVED_OVERLAY_REL_PATH = "derived/current-routing-overlay.json"
+DERIVED_OVERLAY_SCHEMA_VERSION = "recallloom.derived-current-routing-overlay.v1"
+DERIVED_OVERLAY_FALLBACK_SOURCE = "rolling_summary"
+RECALL_ACCURACY_MARKER = "rl-rag-contract-v1"
+RECALL_ACCURACY_FIXTURE_IDS = frozenset(
+    {"RAG-001", "RAG-002", "RAG-003", "RAG-004", "RAG-005", "RAG-006"}
+)
+RECALL_ACCURACY_MARKER_SOURCE_CLASSES = frozenset(
+    {
+        "release_truth",
+        "stale_candidate",
+        "redirect_stub",
+        "retired_material",
+        "boundary_marker",
+        "release_blocker",
+    }
+)
 
 SUPPORTING_CONTEXT_WINDOW_MAX_TOKENS = 160
 
@@ -435,6 +455,7 @@ def gather_file_hits(
                     "exact_phrase": exact_phrase,
                     "source_type": source_type,
                     "excerpt": excerpt_text(text),
+                    "full_text": text,
                 }
             )
         return hits
@@ -454,9 +475,333 @@ def gather_file_hits(
                 "exact_phrase": exact_phrase,
                 "source_type": source_type,
                 "excerpt": excerpt_text(section_text),
+                "full_text": section_text,
             }
         )
     return hits
+
+
+def gather_daily_log_hits(
+    *,
+    path: Path,
+    source_type: str,
+    query_terms: list[str],
+    full_query: str,
+    text: str | None = None,
+) -> list[dict]:
+    log_text = read_text(path) if text is None else text
+    hits: list[dict] = []
+    current_entry = None
+    current_section: str | None = None
+    section_lines: list[str] = []
+
+    def flush_section() -> None:
+        if current_entry is None or current_section is None:
+            return
+        section_text = "\n".join(section_lines)
+        score = score_text(section_text, query_terms)
+        if score <= 0:
+            return
+        exact_phrase = full_query in normalized_recall_text(section_text)
+        hits.append(
+            {
+                "path": str(path),
+                "section": current_section,
+                "score": score,
+                "matched_terms": matched_query_terms(section_text, query_terms),
+                "exact_phrase": exact_phrase,
+                "source_type": source_type,
+                "excerpt": excerpt_text(section_text),
+                "full_text": section_text,
+                "evidenced_by": {
+                    "daily_log_path": str(path),
+                    "entry_id": current_entry.entry_id,
+                    "entry_seq": current_entry.entry_seq,
+                },
+            }
+        )
+
+    for raw in log_text.splitlines():
+        entry = parse_daily_log_entry_line(raw)
+        if entry is not None:
+            flush_section()
+            current_entry = entry
+            current_section = None
+            section_lines = []
+            continue
+        stripped = raw.strip()
+        if stripped.startswith("<!-- section: "):
+            flush_section()
+            current_section = stripped.removeprefix("<!-- section: ").removesuffix(" -->")
+            section_lines = []
+            continue
+        section_lines.append(raw)
+
+    flush_section()
+    return hits
+
+
+def _overlay_malformed_review(
+    *,
+    path: Path,
+    reason_code: str,
+) -> dict:
+    return {
+        "path": str(path),
+        "status": "fallback",
+        "included": False,
+        "derived_overlay_read": True,
+        "warning_code": "derived_overlay_malformed",
+        "malformed_reason": reason_code,
+        "fallback_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
+        "truth_contribution": "none",
+        "public_safe": True,
+    }
+
+
+def _overlay_stale_review(
+    *,
+    path: Path,
+    base_revision: int,
+    current_revision: int,
+) -> dict:
+    return {
+        "path": str(path),
+        "status": "fallback",
+        "included": False,
+        "derived_overlay_read": True,
+        "warning_code": "derived_overlay_stale",
+        "base_rolling_summary_revision": base_revision,
+        "current_rolling_summary_revision": current_revision,
+        "fallback_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
+        "truth_contribution": "none",
+        "public_safe": True,
+    }
+
+
+def _normalize_overlay_answer(value: str) -> str:
+    return " ".join(normalized_content_lines(value)).casefold()
+
+
+def _overlay_claim_conflicts_with_primary(*, claim_answer: str, primary_excerpt: str) -> bool:
+    normalized_claim = _normalize_overlay_answer(claim_answer)
+    if not normalized_claim:
+        return False
+    normalized_primary = _normalize_overlay_answer(primary_excerpt)
+    if normalized_claim == normalized_primary:
+        return False
+    primary_lines = {_normalize_overlay_answer(line) for line in normalized_content_lines(primary_excerpt)}
+    primary_lines.discard("")
+    return normalized_claim not in primary_lines
+
+
+def _overlay_claim_matches_query(claim: dict, query_terms: list[str]) -> bool:
+    terms = claim.get("query_terms")
+    if not isinstance(terms, list):
+        return False
+    normalized_query_terms = set(query_terms)
+    for item in terms:
+        if not isinstance(item, str):
+            continue
+        analyzed = analyze_query(item)
+        if set(analyzed["terms"]).intersection(normalized_query_terms):
+            return True
+    return False
+
+
+def _validate_overlay_claim(raw_claim: object) -> dict | str:
+    if not isinstance(raw_claim, dict):
+        return "claim_not_object"
+    raw_query_terms = raw_claim.get("query_terms")
+    answer = raw_claim.get("answer")
+    if not isinstance(raw_query_terms, list) or not raw_query_terms:
+        return "claim_query_terms_invalid"
+    if not all(isinstance(item, str) and item.strip() for item in raw_query_terms):
+        return "claim_query_terms_invalid"
+    if not isinstance(answer, str) or not answer.strip():
+        return "claim_answer_invalid"
+    return {
+        "query_terms": [item.strip() for item in raw_query_terms],
+        "answer": answer.strip(),
+    }
+
+
+def load_derived_overlay_review(
+    *,
+    path: Path,
+    summary_revision: int,
+    query_terms: list[str],
+    primary_truth_hit: dict | None,
+) -> dict:
+    if not path.exists():
+        return {
+            "path": str(path),
+            "status": "absent",
+            "included": False,
+            "derived_overlay_read": False,
+            "fallback_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
+            "truth_contribution": "none",
+            "public_safe": True,
+        }
+    if not path.is_file():
+        return _overlay_malformed_review(path=path, reason_code="overlay_not_file")
+    try:
+        payload = json.loads(read_text(path))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return _overlay_malformed_review(path=path, reason_code="malformed_json")
+    if not isinstance(payload, dict):
+        return _overlay_malformed_review(path=path, reason_code="top_level_not_object")
+
+    schema_version = payload.get("schema_version")
+    base_revision = payload.get("base_rolling_summary_revision")
+    raw_claims = payload.get("current_truth_claims")
+    if schema_version != DERIVED_OVERLAY_SCHEMA_VERSION:
+        return _overlay_malformed_review(path=path, reason_code="invalid_schema_version")
+    if not isinstance(base_revision, int) or base_revision < 1:
+        return _overlay_malformed_review(path=path, reason_code="invalid_base_rolling_summary_revision")
+    if not isinstance(raw_claims, list):
+        return _overlay_malformed_review(path=path, reason_code="invalid_current_truth_claims")
+
+    claims: list[dict] = []
+    for raw_claim in raw_claims:
+        claim = _validate_overlay_claim(raw_claim)
+        if isinstance(claim, str):
+            return _overlay_malformed_review(path=path, reason_code=claim)
+        claims.append(claim)
+
+    if base_revision != summary_revision:
+        return _overlay_stale_review(
+            path=path,
+            base_revision=base_revision,
+            current_revision=summary_revision,
+        )
+
+    matching_claims = [claim for claim in claims if _overlay_claim_matches_query(claim, query_terms)]
+    supporting_hits = [
+        {
+            "path": str(path),
+            "section": "current_truth_claims",
+            "score": matched_query_terms(" ".join(claim["query_terms"]), query_terms),
+            "matched_terms": matched_query_terms(" ".join(claim["query_terms"]), query_terms),
+            "exact_phrase": False,
+            "source_type": "derived_overlay",
+            "excerpt": claim["answer"],
+            "full_text": claim["answer"],
+        }
+        for claim in matching_claims
+    ]
+    primary_excerpt = primary_truth_hit.get("excerpt") if primary_truth_hit else None
+    for claim in matching_claims:
+        if (
+            isinstance(primary_excerpt, str)
+            and primary_excerpt.strip()
+            and _overlay_claim_conflicts_with_primary(
+                claim_answer=claim["answer"],
+                primary_excerpt=primary_excerpt,
+            )
+        ):
+            return {
+                "path": str(path),
+                "status": "conflict",
+                "included": False,
+                "derived_overlay_read": True,
+                "reason_code": "derived_overlay_conflict",
+                "fallback_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
+                "truth_contribution": "none",
+                "base_rolling_summary_revision": base_revision,
+                "current_rolling_summary_revision": summary_revision,
+                "matched_claim_count": len(matching_claims),
+                "conflicting_claim_terms": claim["query_terms"],
+                "conflicting_claim_term_count": len(claim["query_terms"]),
+                "primary_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
+                "primary_source_class": primary_truth_hit.get("source_class"),
+                "primary_source_section": primary_truth_hit.get("section"),
+                "primary_excerpt_char_count": len(primary_excerpt),
+                "public_safe": True,
+            }
+
+    return {
+        "path": str(path),
+        "status": "included" if matching_claims else "fresh_no_match",
+        "included": bool(matching_claims),
+        "derived_overlay_read": True,
+        "fallback_source": None,
+        "truth_contribution": "supporting_derived_only" if matching_claims else "none",
+        "base_rolling_summary_revision": base_revision,
+        "current_rolling_summary_revision": summary_revision,
+        "matched_claim_count": len(matching_claims),
+        "supporting_hits": supporting_hits,
+        "public_safe": True,
+    }
+
+
+def source_class_for_hit(source_type: str, section: str | None) -> str:
+    if source_type == "rolling_summary":
+        if section in {"current_state", "active_judgments", "next_step", "risks_open_questions"}:
+            return "current_truth"
+        return "current_summary"
+    if source_type == "derived_overlay":
+        return "supporting_derived_overlay"
+    if source_type == "context_brief":
+        return "durable_context"
+    if source_type in {"latest_daily_log", "recent_daily_log"}:
+        return "historical_evidence"
+    if source_type == "update_protocol":
+        return "routing_policy"
+    return "supporting_context"
+
+
+def hit_is_primary_truth_candidate(hit: dict, *, operation_class: str) -> bool:
+    source_class = hit.get("source_class")
+    if source_class == "supporting_derived_overlay":
+        return False
+    if operation_class == "read_historical_fact" and source_class == "historical_evidence":
+        return True
+    if hit.get("do_not_use_as_current_fact"):
+        return False
+    return source_class in {"current_truth", "current_summary"}
+
+
+def annotate_hit_truth_metadata(hit: dict, *, active_source: bool) -> dict:
+    source_class = source_class_for_hit(hit["source_type"], hit.get("section"))
+    if source_class == "current_truth":
+        active_boundary = "rolling_summary_current_state"
+    elif source_class == "current_summary":
+        active_boundary = "rolling_summary_supporting_summary"
+    elif source_class == "supporting_derived_overlay":
+        active_boundary = "derived_overlay_support_only"
+    else:
+        active_boundary = "historical_or_context_support_only"
+    annotated = {
+        **hit,
+        "source_class": source_class,
+        "active_source": active_source,
+        "evidenced_by": hit.get("evidenced_by"),
+        "active_boundary": active_boundary,
+    }
+    if source_class == "historical_evidence":
+        annotated.update(
+            {
+                "do_not_promote_to_current": True,
+                "do_not_use_as_current_fact": True,
+            }
+        )
+    elif source_class in {"durable_context", "routing_policy", "supporting_derived_overlay"}:
+        annotated.update(
+            {
+                "do_not_promote_to_current": True,
+                "do_not_use_as_current_fact": source_class
+                in {"durable_context", "supporting_derived_overlay"},
+            }
+        )
+    else:
+        annotated.update(
+            {
+                "do_not_promote_to_current": False,
+                "do_not_use_as_current_fact": False,
+            }
+        )
+    return annotated
 
 
 def supporting_context_window(
@@ -619,11 +964,477 @@ def public_hits(hits: list[dict]) -> list[dict]:
             "section": item["section"],
             "score": item["score"],
             "source_type": item["source_type"],
+            "source_class": item.get("source_class"),
+            "active_source": item.get("active_source", False),
+            "evidenced_by": evidence_tuple_for_hit(item),
+            "active_boundary": item.get("active_boundary"),
+            "do_not_promote_to_current": item.get("do_not_promote_to_current", False),
+            "do_not_use_as_current_fact": item.get("do_not_use_as_current_fact", False),
             "date": citation_date(item["path"], item["source_type"]),
             "excerpt": item["excerpt"],
         }
         for item in hits
     ]
+
+
+def evidence_tuple_for_hit(hit: dict) -> dict | None:
+    evidence = hit.get("evidenced_by")
+    if not evidence:
+        return None
+    return {
+        **evidence,
+        "section": hit.get("section"),
+        "source_type": hit.get("source_type"),
+        "source_class": hit.get("source_class"),
+        "active_boundary": hit.get("active_boundary"),
+        "do_not_promote_to_current": hit.get("do_not_promote_to_current", True),
+        "do_not_use_as_current_fact": hit.get("do_not_use_as_current_fact", True),
+        "date": citation_date(hit["path"], hit["source_type"]),
+        "citation_assembly_required": False,
+    }
+
+
+def publicize_evidence_tuple_paths(
+    evidence: dict | None,
+    *,
+    project_root: Path,
+) -> dict | None:
+    if not evidence:
+        return None
+    public_evidence = dict(evidence)
+    if public_evidence.get("daily_log_path"):
+        public_evidence["daily_log_path"] = public_project_path(
+            public_evidence["daily_log_path"],
+            project_root=project_root,
+        )
+    if public_evidence.get("path"):
+        public_evidence["path"] = public_project_path(
+            public_evidence["path"],
+            project_root=project_root,
+        )
+    return public_evidence
+
+
+def publicize_public_hit_paths(
+    hits: list[dict],
+    *,
+    project_root: Path,
+) -> list[dict]:
+    return [
+        {
+            **item,
+            "path": public_project_path(item["path"], project_root=project_root),
+            "evidenced_by": publicize_evidence_tuple_paths(
+                item.get("evidenced_by"),
+                project_root=project_root,
+            ),
+        }
+        for item in hits
+    ]
+
+
+def operation_metadata_for_query(
+    *,
+    query_intent: str,
+    include_daily_logs: bool,
+    context_brief_included: bool,
+    recent_daily_logs_included: bool,
+    derived_overlay_read: bool,
+) -> dict:
+    if query_intent in {"timeline", "progress"} or include_daily_logs:
+        operation_class = "read_historical_fact"
+        recommended_path = "query_continuity --include-daily-logs"
+        reason = "Historical or timeline-oriented query; daily-log evidence must remain evidence, not current truth."
+        followup = "Use daily_log_path, entry_id, and entry_seq when citing evidence."
+        read_set = ["rolling_summary", "latest_daily_log"]
+        do_not_read_by_default = ["context_brief"]
+    else:
+        operation_class = "read_current_status"
+        recommended_path = "query_continuity --quick"
+        reason = "Fast current-status read uses bounded current sources and avoids context_brief by default."
+        followup = "Escalate to detailed/background review only when current sources are insufficient."
+        read_set = ["rolling_summary", "latest_daily_log"]
+        do_not_read_by_default = ["context_brief"]
+    if context_brief_included:
+        read_set.append("context_brief")
+        do_not_read_by_default = []
+    if derived_overlay_read:
+        read_set.append("derived_overlay")
+    if recent_daily_logs_included:
+        read_set.append("recent_daily_log")
+    return {
+        "operation_class": operation_class,
+        "recommended_path": recommended_path,
+        "reason": reason,
+        "followup": followup,
+        "read_set": read_set,
+        "do_not_read_by_default": do_not_read_by_default,
+    }
+
+
+def read_set_evidence_for_query(
+    *,
+    operation_metadata: dict,
+    sources_considered: list[dict],
+    context_brief_included: bool,
+    derived_overlay_review: dict,
+    include_daily_logs: bool,
+    recent_daily_logs_included: bool,
+    scan_mode: str,
+) -> dict:
+    return {
+        "read_set": operation_metadata["read_set"],
+        "sources": [
+            {
+                "source_type": item["source_type"],
+                "included": item["included"],
+                "do_not_read_by_default": item.get("do_not_read_by_default", False),
+                "derived_overlay_read": item.get("derived_overlay_read", False),
+            }
+            for item in sources_considered
+        ],
+        "context_brief_read": context_brief_included,
+        "context_brief_default_read": False,
+        "derived_overlay_read": derived_overlay_review.get("derived_overlay_read", False),
+        "derived_overlay_review": derived_overlay_review,
+        "include_daily_logs_requested": include_daily_logs,
+        "historical_log_sweep_performed": recent_daily_logs_included,
+        "workspace_artifact_scan_mode": scan_mode,
+        "public_safe": True,
+    }
+
+
+def historical_evidence_for_hits(
+    public_hit_list: list[dict],
+    *,
+    operation_class: str,
+    primary_truth_source_class: str | None,
+) -> dict:
+    tuples = [
+        item["evidenced_by"]
+        for item in public_hit_list
+        if item.get("source_class") == "historical_evidence" and item.get("evidenced_by")
+    ]
+    historical_hit_exists = any(
+        item.get("source_class") == "historical_evidence" for item in public_hit_list
+    )
+    if operation_class == "read_historical_fact" and primary_truth_source_class == "historical_evidence":
+        verdict = "historical_evidence_only"
+    elif historical_hit_exists:
+        verdict = "supporting_historical_evidence_available"
+    else:
+        verdict = "no_historical_evidence_match"
+    return {
+        "verdict": verdict,
+        "current_truth_promoted": False,
+        "citation_assembly_required": False,
+        "evidence_tuple": tuples[0] if tuples else None,
+        "evidence_tuples": tuples,
+    }
+
+
+def _marker_bool(value: str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.casefold() in {"1", "true", "yes", "y"}
+
+
+def _marker_list(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    return [item for item in (part.strip() for part in value.split(",")) if item]
+
+
+def recall_accuracy_contract_marker_for_hit(hit: dict) -> dict | None:
+    for line in normalized_content_lines(hit.get("full_text", "")):
+        if RECALL_ACCURACY_MARKER not in line:
+            continue
+        fields: dict[str, str] = {}
+        for token in line.split():
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            fields[key.strip()] = value.strip().strip(".,;")
+        fixture_id = fields.get("fixture_id")
+        marker_source_class = fields.get("source_class")
+        verdict = fields.get("verdict")
+        if (
+            fixture_id not in RECALL_ACCURACY_FIXTURE_IDS
+            or marker_source_class not in RECALL_ACCURACY_MARKER_SOURCE_CLASSES
+            or not verdict
+        ):
+            continue
+        return {
+            **fields,
+            "fixture_id": fixture_id,
+            "marker_source_class": marker_source_class,
+            "verdict": verdict,
+            "marker_active_source": _marker_bool(fields.get("active_source")),
+            "do_not_promote_to_current": _marker_bool(
+                fields.get("do_not_promote_to_current"),
+                default=not _marker_bool(fields.get("active_source")),
+            ),
+            "do_not_use_as_current_fact": _marker_bool(
+                fields.get("do_not_use_as_current_fact"),
+                default=not _marker_bool(fields.get("active_source")),
+            ),
+        }
+    return None
+
+
+def recall_accuracy_evidence_tuple_for_hit(item: dict, marker: dict) -> dict:
+    evidence = dict(item.get("evidenced_by") or {})
+    canonical_active_source = item.get("active_source", False)
+    evidence.update(
+        {
+            "fixture_id": marker["fixture_id"],
+            "path": item["path"],
+            "section": item["section"],
+            "source_type": item["source_type"],
+            "source_class": item.get("source_class"),
+            "marker_source_class": marker["marker_source_class"],
+            "verdict": marker["verdict"],
+            "active_source": canonical_active_source,
+            "marker_active_source": marker["marker_active_source"],
+            "active_boundary": item.get("active_boundary"),
+            "do_not_promote_to_current": marker["do_not_promote_to_current"],
+            "do_not_use_as_current_fact": marker["do_not_use_as_current_fact"],
+            "date": item.get("date"),
+        }
+    )
+    return evidence
+
+
+def recall_accuracy_relation_payload(*, first_hit: dict, marker: dict) -> dict[str, object]:
+    marker_source_class = marker["marker_source_class"]
+    if marker_source_class == "release_truth":
+        return {
+            "relation_class": "release_truth",
+            "today_verdict_first": True,
+            "historical_evidence_not_promoted_to_current": _marker_bool(
+                marker.get("historical_evidence_no_promotion"),
+                default=True,
+            ),
+            "current_truth_promoted_from_history": False,
+        }
+    if marker_source_class == "stale_candidate":
+        return {
+            "relation_class": "stale_candidate",
+            "superseded_by": marker.get("superseded_by", "release_truth"),
+            "stale_action_default": marker.get("stale_action_default", "replacement"),
+            "old_material_no_current_flag": _marker_bool(
+                marker.get("old_material_no_current_flag"),
+                default=True,
+            ),
+        }
+    if marker_source_class == "redirect_stub":
+        return {
+            "relation_class": "redirect_stub",
+            "redirects_to": marker.get("redirects_to", "successor"),
+            "redirect_stub_body_truth": False,
+            "successor_traceable": _marker_bool(marker.get("successor_traceable"), default=True),
+            "successor_active_source": _marker_bool(marker.get("successor_active_source"), default=True),
+        }
+    if marker_source_class == "retired_material":
+        return {
+            "relation_class": "retired_material",
+            "retired_by": marker.get("retired_by", "release_truth"),
+            "recovery_path": marker.get("recovery_path", "historical_reference"),
+            "retired_without_successor": _marker_bool(marker.get("retired_without_successor")),
+            "retired_material_reference_only": True,
+        }
+    if marker_source_class == "boundary_marker":
+        forbidden_scope = _marker_list(marker.get("forbidden_scope")) or [
+            "runtime",
+            "db",
+            "semantic_truth",
+        ]
+        return {
+            "relation_class": "boundary_marker",
+            "allowed_merge_scope": _marker_list(marker.get("allowed_merge_scope"))
+            or ["lightweight_route_markers"],
+            "forbidden_scope": forbidden_scope,
+            "runtime_truth_rejected": "runtime" in forbidden_scope,
+            "db_truth_rejected": "db" in forbidden_scope,
+            "semantic_truth_rejected": "semantic_truth" in forbidden_scope,
+            "forbidden_scope_bypass_rejected": _marker_bool(
+                marker.get("forbidden_scope_bypass_rejected"),
+                default=True,
+            ),
+        }
+    if marker_source_class == "release_blocker":
+        return {
+            "relation_class": "release_blocker",
+            "must_fix_for_next_release": _marker_list(marker.get("must_fix_for_next_release"))
+            or ["release_blocking_marker"],
+            "release_blocking": _marker_bool(marker.get("release_blocking"), default=True),
+            "auditable_evidence_pointer": {
+                "path": first_hit["path"],
+                "section": first_hit["section"],
+                "source_type": first_hit["source_type"],
+                "source_class": first_hit.get("source_class"),
+                "marker_source_class": marker["marker_source_class"],
+            },
+        }
+    return {}
+
+
+def recall_accuracy_evidence_for_query(
+    *,
+    operation_metadata: dict,
+    primary_truth_hit: dict | None,
+    hits: list[dict],
+    project_root: Path,
+) -> dict:
+    evidence_hits = []
+    for item in hits:
+        if item.get("source_class") == "supporting_derived_overlay":
+            continue
+        marker = recall_accuracy_contract_marker_for_hit(item)
+        if marker is None:
+            continue
+        evidence_hits.append({**item, "recall_accuracy_marker": marker})
+    if not evidence_hits:
+        return {
+            "verdict": "no_recall_accuracy_evidence_match",
+            "source_class": "no_match",
+            "fixture_id": None,
+            "active_source": False,
+            "evidence_tuple": None,
+            "evidence_tuples": [],
+            "current_truth_promoted": False,
+            "historical_evidence_not_promoted_to_current": True,
+            "do_not_promote_to_current": True,
+            "do_not_use_as_current_fact": True,
+            "public_safe": True,
+        }
+
+    first_hit = evidence_hits[0]
+    first_marker = first_hit["recall_accuracy_marker"]
+    evidence_tuples = [
+        recall_accuracy_evidence_tuple_for_hit(item, item["recall_accuracy_marker"])
+        for item in evidence_hits
+    ]
+    evidence_tuples = [
+        publicize_evidence_tuple_paths(item, project_root=project_root)
+        for item in evidence_tuples
+    ]
+    relation_payload = recall_accuracy_relation_payload(
+        first_hit=first_hit,
+        marker=first_marker,
+    )
+    if relation_payload.get("auditable_evidence_pointer"):
+        pointer = dict(relation_payload["auditable_evidence_pointer"])
+        pointer["path"] = public_project_path(pointer.get("path"), project_root=project_root)
+        relation_payload["auditable_evidence_pointer"] = pointer
+    historical_evidence_tuples = [
+        publicize_evidence_tuple_paths(
+            evidence_tuple_for_hit(item),
+            project_root=project_root,
+        )
+        for item in hits
+        if item.get("source_class") == "historical_evidence" and item.get("evidenced_by")
+    ]
+
+    return {
+        "verdict": first_marker["verdict"],
+        "source_class": first_hit.get("source_class"),
+        "marker_source_class": first_marker["marker_source_class"],
+        "fixture_id": first_marker["fixture_id"],
+        "active_source": first_hit.get("active_source", False),
+        "marker_active_source": first_marker["marker_active_source"],
+        "evidence_tuple": evidence_tuples[0] if evidence_tuples else None,
+        "evidence_tuples": evidence_tuples,
+        "current_truth_promoted": False,
+        "historical_evidence_not_promoted_to_current": True,
+        "historical_evidence_tuples": historical_evidence_tuples,
+        "do_not_promote_to_current": first_marker["do_not_promote_to_current"],
+        "do_not_use_as_current_fact": first_marker["do_not_use_as_current_fact"],
+        "public_safe": True,
+        "operation_class": operation_metadata["operation_class"],
+        "primary_truth_source_class": (
+            primary_truth_hit.get("source_class") if primary_truth_hit is not None else None
+        ),
+        **relation_payload,
+    }
+
+
+def ux_verdict_for_query(
+    *,
+    operation_metadata: dict,
+    primary_truth_hit: dict | None,
+    read_set_evidence: dict,
+    historical_evidence: dict,
+) -> dict:
+    operation_class = operation_metadata["operation_class"]
+    if operation_class == "read_historical_fact":
+        verdict = (
+            "historical_evidence_only"
+            if primary_truth_hit is not None and primary_truth_hit.get("source_class") == "historical_evidence"
+            else "historical_query_no_direct_evidence"
+        )
+        current_vs_historical = (
+            "historical_evidence_not_current_truth"
+            if verdict == "historical_evidence_only"
+            else "no_current_or_historical_truth_match"
+        )
+    else:
+        verdict = (
+            "current_status_found"
+            if primary_truth_hit is not None and primary_truth_hit.get("source_class") == "current_truth"
+            else "current_status_not_found"
+        )
+        current_vs_historical = (
+            "active_current_truth"
+            if verdict == "current_status_found"
+            else "no_active_current_truth_match"
+        )
+    return {
+        "operation_class": operation_class,
+        "verdict": verdict,
+        "current_vs_historical": current_vs_historical,
+        "reason": operation_metadata["reason"],
+        "followup": operation_metadata["followup"],
+        "read_set_evidence": read_set_evidence,
+        "historical_evidence": historical_evidence,
+        "current_truth_promoted_from_history": False,
+        "citation_assembly_required": False,
+        "public_safe": True,
+    }
+
+
+def context_risk_review_for_query(
+    *,
+    context_brief_included: bool,
+) -> dict:
+    if context_brief_included:
+        return {
+            "mode": "deep_context_risk_review",
+            "review_lane": "deep_context_risk_review",
+            "reason_code": "background_or_detailed_context_review_requested",
+            "human_decision_required": True,
+            "human_decision_point": (
+                "Decide before any later write, promotion, or escalation whether "
+                "context_brief background should influence the reviewed update."
+            ),
+            "context_brief_included": True,
+            "context_brief_default_read": False,
+            "context_brief_default_written": False,
+            "write_effect": "none",
+            "public_safe": True,
+        }
+    return {
+        "mode": "fast_current_status",
+        "review_lane": "fast_current_status",
+        "reason_code": "context_brief_not_default_read",
+        "human_decision_required": False,
+        "human_decision_point": "none",
+        "context_brief_included": False,
+        "context_brief_default_read": False,
+        "context_brief_default_written": False,
+        "write_effect": "none",
+        "public_safe": True,
+    }
 
 
 def render_synthesized_recall(
@@ -662,6 +1473,61 @@ def answer_for_query(*, hits: list[dict], continuity_state: str) -> str:
     if not hits:
         return "No strong continuity answer was found in the current core continuity files."
     return hits[0]["excerpt"]
+
+
+def surface_hits_for_query(
+    hits: list[dict],
+    *,
+    limit: int,
+    primary_truth_hit: dict | None,
+) -> list[dict]:
+    if not hits:
+        return []
+    if primary_truth_hit is None:
+        visible_hits = [hit for hit in hits if hit.get("source_class") != "supporting_derived_overlay"]
+        return visible_hits[:limit]
+
+    visible_hits = hits[:limit]
+    if primary_truth_hit in visible_hits:
+        return visible_hits
+    overlay_index = next(
+        (
+            idx
+            for idx, hit in enumerate(visible_hits)
+            if hit.get("source_class") == "supporting_derived_overlay"
+        ),
+        None,
+    )
+    if overlay_index is not None:
+        visible_hits[overlay_index] = primary_truth_hit
+    else:
+        visible_hits = [
+            hit
+            for hit in visible_hits
+            if hit.get("source_class") != "supporting_derived_overlay"
+        ]
+    return visible_hits
+
+
+def truth_surface_hit(
+    *,
+    hits: list[dict],
+    operation_class: str,
+) -> dict | None:
+    if not hits:
+        return None
+    if operation_class == "read_current_status":
+        for hit in hits:
+            if hit.get("source_class") == "current_truth" and hit.get("active_source"):
+                return hit
+        for hit in hits:
+            if hit_is_primary_truth_candidate(hit, operation_class=operation_class):
+                return hit
+        return None
+    for hit in hits:
+        if hit_is_primary_truth_candidate(hit, operation_class=operation_class):
+            return hit
+    return None
 
 
 def risk_freshness_note_for_query(
@@ -777,11 +1643,18 @@ def main() -> None:
                 details={"project_root": str(Path(args.path).expanduser().resolve())},
             ),
         )
+    startup_residue_report = exit_if_startup_scratch_residue(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
 
     summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
     context_brief_path = workspace.storage_root / FILE_KEYS["context_brief"]
     state_path = workspace.storage_root / FILE_KEYS["state"]
     update_protocol_path = workspace.storage_root / FILE_KEYS["update_protocol"]
+    derived_overlay_path = workspace.storage_root / DERIVED_OVERLAY_REL_PATH
     logs_dir = workspace.storage_root / DAILY_LOGS_DIRNAME
 
     try:
@@ -817,7 +1690,8 @@ def main() -> None:
                     error=f"Missing required file-state metadata marker: {summary_path}",
                 ),
             )
-        if context_brief_path.is_file():
+        context_brief_included = query_analysis["intent"] == "background" or args.mode == "detailed"
+        if context_brief_included and context_brief_path.is_file():
             context_brief_state = parse_file_state_marker(read_text(context_brief_path))
             if context_brief_state is None:
                 exit_with_cli_error(
@@ -907,9 +1781,19 @@ def main() -> None:
         {
             "path": str(context_brief_path),
             "source_type": "context_brief",
-            "included": continuity_has_seeded_state and context_brief_path.is_file(),
+            "included": continuity_has_seeded_state and context_brief_included and context_brief_path.is_file(),
+            "do_not_read_by_default": True,
+            "reason": "context_brief is reserved for background/deep review, not fast current-status reads.",
         },
         {"path": str(update_protocol_path), "source_type": "update_protocol", "included": update_protocol_path.is_file()},
+        {
+            "path": str(derived_overlay_path),
+            "source_type": "derived_overlay",
+            "included": False,
+            "derived_overlay_read": derived_overlay_path.exists(),
+            "do_not_promote_to_current": True,
+            "reason": "derived overlay is optional supporting evidence and cannot become current truth.",
+        },
     ]
 
     hits: list[dict] = []
@@ -922,7 +1806,7 @@ def main() -> None:
                 full_query=full_query,
             )
         )
-    if continuity_has_seeded_state and context_brief_path.is_file():
+    if continuity_has_seeded_state and context_brief_included and context_brief_path.is_file():
         hits.extend(
             gather_file_hits(
                 path=context_brief_path,
@@ -937,37 +1821,127 @@ def main() -> None:
             {"path": str(latest_daily_log), "source_type": "latest_daily_log", "included": True}
         )
         hits.extend(
-            gather_file_hits(
+            gather_daily_log_hits(
                 path=latest_daily_log,
                 source_type="latest_daily_log",
                 query_terms=query_terms,
                 full_query=full_query,
+                text=latest_daily_log_text,
             )
         )
 
+    recent_daily_logs_included = False
     if continuity_has_seeded_state and args.include_daily_logs:
         recent_logs = sorted_daily_log_files(logs_dir)[-3:]
         for log_path in recent_logs:
             if latest_daily_log is not None and log_path == latest_daily_log:
                 continue
+            recent_daily_logs_included = True
             sources_considered.append(
                 {"path": str(log_path), "source_type": "recent_daily_log", "included": True}
             )
+            log_text = read_text(log_path)
             hits.extend(
-                gather_file_hits(
+                gather_daily_log_hits(
                     path=log_path,
                     source_type="recent_daily_log",
                     query_terms=query_terms,
                     full_query=full_query,
+                    text=log_text,
                 )
             )
 
-    hits = sort_hits(hits, query_intent=query_analysis["intent"])
-    hits = hits[: args.limit]
+    sorted_hits = sort_hits(hits, query_intent=query_analysis["intent"])
+    truth_candidate_hits = [
+        annotate_hit_truth_metadata(
+            item,
+            active_source=source_class_for_hit(item["source_type"], item.get("section")) == "current_truth",
+        )
+        for item in sorted_hits
+    ]
+    operation_metadata = operation_metadata_for_query(
+        query_intent=query_analysis["intent"],
+        include_daily_logs=args.include_daily_logs,
+        context_brief_included=context_brief_included,
+        recent_daily_logs_included=recent_daily_logs_included,
+        derived_overlay_read=derived_overlay_path.exists(),
+    )
+    context_risk_review = context_risk_review_for_query(
+        context_brief_included=context_brief_included,
+    )
+    primary_truth_hit = truth_surface_hit(
+        hits=truth_candidate_hits,
+        operation_class=operation_metadata["operation_class"],
+    )
+    derived_overlay_review = load_derived_overlay_review(
+        path=derived_overlay_path,
+        summary_revision=summary_state.revision,
+        query_terms=query_terms,
+        primary_truth_hit=primary_truth_hit,
+    )
+    if derived_overlay_review["status"] == "conflict":
+        public_review = {
+            **derived_overlay_review,
+            "path": public_project_path(
+                derived_overlay_review["path"],
+                project_root=workspace.project_root,
+            ),
+        }
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=7,
+            message="Derived overlay conflicts with rolling_summary current truth.",
+            payload=cli_failure_payload(
+                "derived_overlay_conflict",
+                error="Derived overlay conflicts with rolling_summary current truth.",
+                details={
+                    "project_root": str(workspace.project_root),
+                    "path": str(derived_overlay_path),
+                    "reason_code": "derived_overlay_conflict",
+                    "fallback_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
+                },
+                extra={
+                    "reason_code": "derived_overlay_conflict",
+                    "derived_overlay_review": public_review,
+                },
+            ),
+        )
+    if derived_overlay_review.get("included"):
+        sources_considered[-1]["included"] = True
+        hits.extend(derived_overlay_review.get("supporting_hits", []))
+        sorted_hits = sort_hits(hits, query_intent=query_analysis["intent"])
+        truth_candidate_hits = [
+            annotate_hit_truth_metadata(
+                item,
+                active_source=source_class_for_hit(item["source_type"], item.get("section")) == "current_truth",
+            )
+            for item in sorted_hits
+        ]
+        primary_truth_hit = truth_surface_hit(
+            hits=truth_candidate_hits,
+            operation_class=operation_metadata["operation_class"],
+        )
+        operation_metadata = operation_metadata_for_query(
+            query_intent=query_analysis["intent"],
+            include_daily_logs=args.include_daily_logs,
+            context_brief_included=context_brief_included,
+            recent_daily_logs_included=recent_daily_logs_included,
+            derived_overlay_read=derived_overlay_review.get("derived_overlay_read", True),
+        )
     conflict_state = conflict_state_for_hits(
         freshness=freshness,
-        hits=hits,
+        hits=[
+            item
+            for item in truth_candidate_hits
+            if item.get("source_class") != "supporting_derived_overlay"
+        ],
         continuity_state=continuity_state,
+    )
+    surface_hits = surface_hits_for_query(
+        truth_candidate_hits,
+        limit=args.limit,
+        primary_truth_hit=primary_truth_hit,
     )
 
     citations = [
@@ -977,11 +1951,12 @@ def main() -> None:
             "source_type": item["source_type"],
             "date": citation_date(item["path"], item["source_type"]),
         }
-        for item in hits
+        for item in surface_hits
     ]
-    public_hit_list = public_hits(hits)
+    public_hit_list = public_hits(surface_hits)
     support_window = supporting_context_window(public_hit_list, mode=args.mode)
-    answer = answer_for_query(hits=public_hit_list, continuity_state=continuity_state)
+    answer_hits = [primary_truth_hit] if primary_truth_hit is not None else []
+    answer = answer_for_query(hits=answer_hits, continuity_state=continuity_state)
     risk_freshness_note = risk_freshness_note_for_query(
         freshness=freshness,
         conflict_state=conflict_state,
@@ -1056,19 +2031,77 @@ def main() -> None:
         {**item, "path": public_project_path(item["path"], project_root=workspace.project_root)}
         for item in sources_considered
     ]
-    public_hit_list = [
-        {**item, "path": public_project_path(item["path"], project_root=workspace.project_root)}
-        for item in public_hit_list
-    ]
+    public_hit_list = publicize_public_hit_paths(
+        public_hit_list,
+        project_root=workspace.project_root,
+    )
+    public_truth_candidate_hits = publicize_public_hit_paths(
+        public_hits(truth_candidate_hits),
+        project_root=workspace.project_root,
+    )
     citations = [
         {**item, "path": public_project_path(item["path"], project_root=workspace.project_root)}
+        for item in citations
+    ]
+    citations = [
+        {
+            **item,
+            "source_class": source_class_for_hit(item["source_type"], item.get("section")),
+            "do_not_promote_to_current": item["source_type"]
+            in {"latest_daily_log", "recent_daily_log", "derived_overlay"},
+            "do_not_use_as_current_fact": item["source_type"] == "derived_overlay",
+        }
         for item in citations
     ]
     support_window = [
         {**item, "path": public_project_path(item["path"], project_root=workspace.project_root)}
         for item in support_window
     ]
+    read_set_evidence = read_set_evidence_for_query(
+        operation_metadata=operation_metadata,
+        sources_considered=public_sources_considered,
+        context_brief_included=context_brief_included,
+        derived_overlay_review={
+            **derived_overlay_review,
+            "path": public_project_path(
+                derived_overlay_review["path"],
+                project_root=workspace.project_root,
+            ),
+            "supporting_hits": publicize_public_hit_paths(
+                public_hits(
+                    [
+                        annotate_hit_truth_metadata(item, active_source=False)
+                        for item in derived_overlay_review.get("supporting_hits", [])
+                    ]
+                ),
+                project_root=workspace.project_root,
+            ),
+        },
+        include_daily_logs=args.include_daily_logs,
+        recent_daily_logs_included=recent_daily_logs_included,
+        scan_mode=freshness["workspace_artifact_scan_mode"],
+    )
+    historical_evidence = historical_evidence_for_hits(
+        public_truth_candidate_hits,
+        operation_class=operation_metadata["operation_class"],
+        primary_truth_source_class=(
+            primary_truth_hit.get("source_class") if primary_truth_hit is not None else None
+        ),
+    )
+    ux_verdict = ux_verdict_for_query(
+        operation_metadata=operation_metadata,
+        primary_truth_hit=primary_truth_hit,
+        read_set_evidence=read_set_evidence,
+        historical_evidence=historical_evidence,
+    )
+    recall_accuracy_evidence = recall_accuracy_evidence_for_query(
+        operation_metadata=operation_metadata,
+        primary_truth_hit=primary_truth_hit,
+        hits=truth_candidate_hits,
+        project_root=workspace.project_root,
+    )
     payload = {
+        "schema_version": "1.1",
         "project_root": public_project_root,
         "storage_root": public_storage_root,
         "continuity_confidence": freshness["continuity_confidence"],
@@ -1083,6 +2116,13 @@ def main() -> None:
             "matched_keywords": query_analysis["matched_keywords"],
             "terms": query_terms,
         },
+        "operation_metadata": operation_metadata,
+        "ux_verdict": ux_verdict,
+        "read_set_evidence": read_set_evidence,
+        "historical_evidence": historical_evidence,
+        "recall_accuracy_evidence": recall_accuracy_evidence,
+        "context_risk_review": context_risk_review,
+        "derived_overlay_review": read_set_evidence["derived_overlay_review"],
         "answer": answer,
         "risk_freshness_note": risk_freshness_note,
         "token_estimate": estimate,
@@ -1114,9 +2154,18 @@ def main() -> None:
             "task_type": "query_continuity",
         },
         "source_type": "core_continuity_only",
+        "source_class": primary_truth_hit["source_class"] if primary_truth_hit is not None else "no_match",
+        "active_source": primary_truth_hit["active_source"] if primary_truth_hit is not None else False,
+        "active_boundary": primary_truth_hit["active_boundary"] if primary_truth_hit is not None else None,
+        "do_not_promote_to_current": (
+            primary_truth_hit["do_not_promote_to_current"] if primary_truth_hit is not None else True
+        ),
+        "do_not_use_as_current_fact": (
+            primary_truth_hit["do_not_use_as_current_fact"] if primary_truth_hit is not None else True
+        ),
         "confidence": confidence_for_hits(
             freshness["continuity_confidence"],
-            hits,
+            answer_hits,
             continuity_state=continuity_state,
             conflict_state=conflict_state,
             query_terms=query_terms,
@@ -1142,10 +2191,17 @@ def main() -> None:
                 summary_revision_stale=freshness["summary_revision_stale"],
                 continuity_confidence=freshness["continuity_confidence"],
             )["note"],
+            "read_freshness": freshness["read_freshness"],
+        },
+        "read_trust_state": {
+            "read_confidence": trust_state["read_confidence"],
+            "read_trust_note": trust_state["read_trust_note"],
         },
         "conflict_state": conflict_state,
         "attach_scan": attach_scan,
     }
+    if startup_residue_report is not None:
+        payload["startup_residue_report"] = startup_residue_report
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))

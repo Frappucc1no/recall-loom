@@ -53,6 +53,16 @@ _PATH_LIST_FIELDS = {
 _TRAILING_PATH_PUNCTUATION = ".,:;!?)]}"
 _QUOTED_PATH_PATTERN = re.compile(r"(?P<quote>[\"'])(?P<path>(?:~|/|[A-Za-z]:[\\\\/])[^\"']+)(?P=quote)")
 _UNQUOTED_PATH_PATTERN = re.compile(r"(?P<path>(?:~|/|[A-Za-z]:[\\\\/])\S+)")
+_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|credential)\s*[:=]\s*['\"]?[^\s,'\"]+"
+)
+_COMMON_TOKEN_PATTERN = re.compile(
+    r"\b(ghp_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[baprs]-[A-Za-z0-9-]{6,}|AKIA[0-9A-Z]{12,})\b"
+)
+_OPENAI_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9]{6,}\b")
+_BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]+")
+_URL_PATTERN = re.compile(r"(?i)\b(?:https?|file)://\S+")
 
 
 def private_json_paths_enabled(env: dict[str, str] | None = None) -> bool:
@@ -172,6 +182,26 @@ def publicize_text_paths(
 
     publicized = _QUOTED_PATH_PATTERN.sub(replace_quoted, text)
     return _UNQUOTED_PATH_PATTERN.sub(replace_unquoted, publicized)
+
+
+def redact_public_text(
+    text: str | None,
+    *,
+    project_root: str | Path | None = None,
+    private: bool | None = None,
+) -> str | None:
+    if not isinstance(text, str) or not text:
+        return text
+    publicized = publicize_text_paths(text, project_root=project_root, private=private)
+    if publicized is None:
+        return publicized
+    redacted = _SECRET_ASSIGNMENT_PATTERN.sub("credential=redacted", publicized)
+    redacted = _BEARER_TOKEN_PATTERN.sub("bearer redacted", redacted)
+    redacted = _COMMON_TOKEN_PATTERN.sub("redacted-token", redacted)
+    redacted = _OPENAI_TOKEN_PATTERN.sub("redacted-token", redacted)
+    redacted = _EMAIL_PATTERN.sub("redacted-email", redacted)
+    redacted = _URL_PATTERN.sub("redacted-url", redacted)
+    return redacted
 
 
 def _field_looks_pathlike(field_name: str | None) -> bool:

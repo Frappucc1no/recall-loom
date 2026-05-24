@@ -10,8 +10,27 @@ INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u2060\u2066-\u2069\ufeff]")
 SAFE_REMOTE_URL_RE = re.compile(r"\bhttps?://[^\s`\"'<>]+", re.I)
 PATH_TOKEN_BOUNDARY = r"(?=$|[\s`\"'<>.,;:!?)\]}])"
 PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~%-]+$")
+LOCAL_POSIX_SINGLE_SEGMENT_ROOTS = {
+    "applications",
+    "dev",
+    "etc",
+    "home",
+    "library",
+    "media",
+    "mnt",
+    "opt",
+    "private",
+    "root",
+    "run",
+    "tmp",
+    "users",
+    "usr",
+    "var",
+    "volumes",
+    "workspace",
+}
 POSIX_ABSOLUTE_PATH_RE = re.compile(
-    rf"(?<![A-Za-z0-9+.-])/(?!/)[^/\s`\"'<>]+(?:/[^/\s`\"'<>]+)*{PATH_TOKEN_BOUNDARY}"
+    rf"(?<![A-Za-z0-9+.-])/(?!/)[^:/\s`\"'<>]+(?:/[^:/\s`\"'<>]+)*{PATH_TOKEN_BOUNDARY}"
 )
 WINDOWS_DRIVE_ABSOLUTE_PATH_RE = re.compile(
     rf"(?<![A-Za-z0-9+.-])(?<!//)[A-Za-z]:[\\/][^\\/\s`\"'<>]+(?:[\\/][^\\/\s`\"'<>]+)*"
@@ -66,6 +85,8 @@ def _looks_like_local_posix_absolute_path(candidate: str) -> bool:
     if not segments or any(not PATH_SEGMENT_RE.fullmatch(segment) for segment in segments):
         return False
     if len(segments) >= 2:
+        return True
+    if segments[0].casefold() in LOCAL_POSIX_SINGLE_SEGMENT_ROOTS:
         return True
     return any(character.isupper() for character in segments[0]) or any(
         marker in segments[0] for marker in "._-%~"

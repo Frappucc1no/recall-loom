@@ -30,6 +30,7 @@ from _common import (
     LockBusyError,
     load_workspace_state,
     dump_json,
+    exit_if_startup_scratch_residue,
     latest_active_daily_log,
     managed_file_contract_issue,
     now_iso_timestamp,
@@ -198,6 +199,13 @@ def main() -> None:
             message="No RecallLoom project root found.",
             payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
         )
+
+    exit_if_startup_scratch_residue(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
 
     try:
         targets = resolve_targets(workspace.project_root, args.file)

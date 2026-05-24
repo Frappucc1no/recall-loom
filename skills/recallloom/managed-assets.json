@@ -7,13 +7,15 @@
     "rolling_summary.md"
   ],
   "optional_files": [
-    "update_protocol.md"
+    "update_protocol.md",
+    "derived/current-routing-overlay.json"
   ],
   "required_directories": [
     "daily_logs"
   ],
   "managed_directories": [
     "daily_logs/archive",
+    "derived",
     "companion",
     "companion/recovery",
     "companion/recovery/proposals",

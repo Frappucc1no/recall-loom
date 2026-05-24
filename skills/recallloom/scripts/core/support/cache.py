@@ -228,7 +228,9 @@ def result_from_advisory(
         diagnostic_reason = install_topology_reason(package_root, source=source)
     else:
         diagnostic_reason = None
-    if state == "unknown_offline" and fetch_error:
+    if state == "unknown_offline" and fetch_error == "no_advisory_config":
+        diagnostic_reason = "no_advisory_config"
+    elif state == "unknown_offline" and fetch_error:
         diagnostic_reason = "offline_cached_state_used"
 
     return {
@@ -317,6 +319,8 @@ def package_support_result(
             advisory, source, fetch_error, advisory_invalid = read_advisory(env, default_url=advisory_url)
             if advisory is None and advisory_invalid:
                 advisory = invalid_advisory(package_version)
+            if advisory is None and fetch_error is None and source == "no_advisory_config":
+                fetch_error = source
             if advisory is None and fetch_error and cached is not None:
                 stale_advisory = advisory_from_cached_support(cached)
                 result = result_from_advisory(

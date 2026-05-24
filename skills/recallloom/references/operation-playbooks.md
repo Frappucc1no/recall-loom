@@ -189,7 +189,8 @@ They are not project facts and should not be copied into a workspace sidecar.
 
 Before a helper proceeds, it may perform the daily package-support check described in `package-support-policy.md`.
 
-- `supported`, `upgrade_recommended`, and `unknown_offline` do not block actions
+- `supported` and `upgrade_recommended` do not block actions
+- `unknown_offline` allows diagnostic and read-only actions, but blocks mutating helpers until support can be verified
 - `readonly_only` blocks mutating helpers but permits diagnostic and read-only helpers
 - `diagnostic_only` permits diagnostic helpers only
 - dispatcher may share the same-day support payload through `RECALLLOOM_SUPPORT_STATE_JSON`, but child helpers still authorize from cache or advisory state instead of trusting env payloads alone

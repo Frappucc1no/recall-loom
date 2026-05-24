@@ -65,7 +65,12 @@ def main() -> None:
             message=str(exc),
             payload=cli_failure_payload("python_runtime_unavailable", error=str(exc)),
         )
-    enforce_package_support_gate(parser, json_mode=args.json)
+    enforce_package_support_gate(
+        parser,
+        json_mode=args.json,
+        action_name="unlock_write_lock.py",
+        action_level="mutating" if args.yes else "diagnostic",
+    )
 
     try:
         project_root = resolve_project_root(args.path)

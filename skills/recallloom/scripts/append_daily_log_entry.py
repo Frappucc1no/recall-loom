@@ -8,9 +8,7 @@ from datetime import date, datetime
 import json
 import os
 from pathlib import Path
-import select
 import sys
-import time
 
 from core.continuity.workday import logical_workday_for
 from core.failure.contracts import failure_payload, preferred_failure_language
@@ -29,6 +27,12 @@ from core.protocol.sections import (
     unknown_section_keys,
 )
 from core.safety.attached_text import scan_auto_attached_context_text
+from core.safety.prepared_input import (
+    PreparedInputSafetyError,
+    PreparedInputSource,
+    read_prepared_input_source_text,
+    validate_prepared_input_source_path,
+)
 
 from _common import (
     atomic_write_if_unchanged,
@@ -37,7 +41,6 @@ from _common import (
     ConfigContractError,
     DAILY_LOG_ENTRY_RE,
     DAILY_LOGS_DIRNAME,
-    DISPLAY_NAME,
     EnvironmentContractError,
     LockBusyError,
     StorageResolutionError,
@@ -45,32 +48,38 @@ from _common import (
     detect_update_protocol_time_policy_cues,
     enforce_package_support_gate,
     ensure_supported_python_version,
+    exit_if_startup_scratch_residue_for_sources,
     exit_with_cli_error,
     exit_with_failure_contract,
     find_recallloom_root,
     latest_active_daily_log,
     load_workspace_state,
+    normalize_wrapper_metadata_json,
     now_iso_timestamp,
     parse_daily_log_entry_line,
     parse_iso_date,
     read_text,
+    resolve_writer_attribution,
     restore_text_snapshot,
     validate_iso_date,
-    validate_writer_id,
+    WrapperMetadataSecurityError,
     workspace_write_lock,
 )
 
 
 DEFAULT_MAX_INPUT_BYTES = 4 * 1024 * 1024
-STDIN_READ_CHUNK_BYTES = 64 * 1024
-STDIN_READ_TIMEOUT_SECONDS = 30
 DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR = 3
-RESERVED_MARKER_PREFIXES = (
-    "<!-- recallloom:file=",
-    "<!-- last-writer:",
-    "<!-- file-state:",
-    "<!-- daily-log-entry:",
-    "<!-- daily-log-scaffold",
+DAILY_LOG_ENTRY_JSON_RETRY_PAYLOAD_SHAPE = {
+    key: "non-empty string | list[non-empty string]"
+    for key in SECTION_KEYS["daily_log"]
+}
+DAILY_LOG_ENTRY_JSON_ACCEPTED_SHAPES = ("string", "list[string]")
+RESERVED_MARKER_FAMILIES = (
+    ("<!-- recallloom:file=", "file_marker"),
+    ("<!-- last-writer:", "last_writer_marker"),
+    ("<!-- file-state:", "file_state_marker"),
+    ("<!-- daily-log-entry:", "daily_log_entry_marker"),
+    ("<!-- daily-log-scaffold", "daily_log_scaffold_marker"),
 )
 
 
@@ -129,111 +138,85 @@ def build_parser() -> argparse.ArgumentParser:
             "missing values from the locked workspace state."
         ),
     )
-    parser.add_argument("--writer-id", default=DISPLAY_NAME)
+    parser.add_argument("--writer-id")
+    parser.add_argument(
+        "--wrapper-metadata-json",
+        help=(
+            "Optional wrapper metadata JSON object for additive public output. "
+            "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
 
 
-def read_limited_file_text(parser, *, json_mode: bool, entry_path: Path, max_input_bytes: int) -> str:
+def prepared_input_failure_details(
+    error: PreparedInputSafetyError,
+    *,
+    input_mode: str | None = None,
+) -> dict[str, object]:
+    details = error.details
+    if input_mode is not None:
+        details["input_mode"] = input_mode
+    return details
+
+
+def exit_prepared_input_safety_error(
+    parser,
+    *,
+    json_mode: bool,
+    error: PreparedInputSafetyError,
+    input_mode: str | None = None,
+) -> None:
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=error.message,
+        reason="invalid_prepared_input",
+        details=prepared_input_failure_details(error, input_mode=input_mode),
+    )
+
+
+def read_limited_file_text(
+    parser,
+    *,
+    json_mode: bool,
+    entry_source: PreparedInputSource,
+    max_input_bytes: int,
+) -> str:
     try:
-        size = entry_path.stat().st_size
-    except OSError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=f"Failed to inspect entry file: {exc}",
-            reason="invalid_prepared_input",
+        return read_prepared_input_source_text(
+            entry_source,
+            max_input_bytes=max_input_bytes,
+            label="entry",
         )
-    if size > max_input_bytes:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=f"Entry file exceeds --max-input-bytes ({size} > {max_input_bytes}): {entry_path}",
-            reason="invalid_prepared_input",
-            details={"size": size, "max_input_bytes": max_input_bytes, "entry_path": str(entry_path)},
-        )
-    try:
-        return read_text(entry_path)
-    except UnicodeDecodeError:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=f"Entry file must be valid UTF-8: {entry_path}",
-            reason="invalid_prepared_input",
-            details={"entry_path": str(entry_path)},
-        )
-    except OSError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=f"Failed to read entry file: {exc}",
-            reason="invalid_prepared_input",
-        )
+    except PreparedInputSafetyError as exc:
+        exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
     raise AssertionError("unreachable")
 
 
 def read_limited_stdin(parser, *, json_mode: bool, max_input_bytes: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
-    deadline = time.monotonic() + STDIN_READ_TIMEOUT_SECONDS
-    fd = sys.stdin.buffer.fileno()
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=f"Timed out while reading stdin after {STDIN_READ_TIMEOUT_SECONDS} seconds.",
-                reason="invalid_prepared_input",
-            )
-        try:
-            ready, _, _ = select.select([fd], [], [], remaining)
-        except (OSError, ValueError) as exc:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=f"Failed to poll stdin: {exc}",
-                reason="invalid_prepared_input",
-            )
-        if not ready:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=f"Timed out while reading stdin after {STDIN_READ_TIMEOUT_SECONDS} seconds.",
-                reason="invalid_prepared_input",
-            )
-        try:
-            chunk = os.read(fd, STDIN_READ_CHUNK_BYTES)
-        except OSError as exc:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=f"Failed to read stdin: {exc}",
-                reason="invalid_prepared_input",
-            )
-        if chunk == b"":
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > max_input_bytes:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=f"Stdin input exceeds --max-input-bytes ({total} > {max_input_bytes}).",
-                reason="invalid_prepared_input",
-                details={"size": total, "max_input_bytes": max_input_bytes},
-            )
-    return b"".join(chunks)
+    try:
+        raw = sys.stdin.buffer.read(max_input_bytes + 1)
+    except OSError as exc:
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=f"Failed to read stdin: {exc}",
+            reason="invalid_prepared_input",
+        )
+    if len(raw) > max_input_bytes:
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=f"Stdin input exceeds --max-input-bytes ({len(raw)} > {max_input_bytes}).",
+            reason="invalid_prepared_input",
+            details={"size": len(raw), "max_input_bytes": max_input_bytes},
+        )
+    return raw
 
 
 def load_entry_source(
@@ -244,6 +227,8 @@ def load_entry_source(
     entry_file: str | None,
     use_stdin: bool,
     max_input_bytes: int,
+    project_root: Path | None = None,
+    storage_root: Path | None = None,
 ) -> tuple[str, str, Path | None]:
     selected_sources = int(entry_json is not None) + int(entry_file is not None) + int(use_stdin)
     if selected_sources != 1:
@@ -264,28 +249,52 @@ def load_entry_source(
         )
 
     if entry_json is not None:
-        return entry_json, "entry-json", None
-
-    if entry_file:
-        entry_path = Path(entry_file).expanduser().resolve()
-        if not entry_path.is_file():
+        entry_json_size = len(entry_json.encode("utf-8"))
+        if entry_json_size > max_input_bytes:
             exit_with_failure_contract(
                 parser,
                 json_mode=json_mode,
                 exit_code=2,
-                message=f"Entry file does not exist: {entry_path}",
+                message=f"Entry JSON input exceeds --max-input-bytes ({entry_json_size} > {max_input_bytes}).",
                 reason="invalid_prepared_input",
-                details={"entry_path": str(entry_path)},
+                details={"size": entry_json_size, "max_input_bytes": max_input_bytes},
+            )
+        return entry_json, "entry-json", None
+
+    if entry_file:
+        if project_root is None or storage_root is None:
+            exit_with_failure_contract(
+                parser,
+                json_mode=json_mode,
+                exit_code=2,
+                message="Internal error: project root is required before reading --entry-file.",
+                reason="invalid_prepared_input",
+                details={"input_mode": "file", "reason_code": "prepared_input_context_missing"},
+            )
+        try:
+            entry_source = validate_prepared_input_source_path(
+                entry_file,
+                project_root=project_root,
+                storage_root=storage_root,
+                input_role="entry-file",
+                label="entry",
+            )
+        except PreparedInputSafetyError as exc:
+            exit_prepared_input_safety_error(
+                parser,
+                json_mode=json_mode,
+                error=exc,
+                input_mode="file",
             )
         return (
             read_limited_file_text(
                 parser,
                 json_mode=json_mode,
-                entry_path=entry_path,
+                entry_source=entry_source,
                 max_input_bytes=max_input_bytes,
             ),
             "file",
-            entry_path,
+            entry_source.path,
         )
 
     if sys.stdin.isatty():
@@ -318,6 +327,33 @@ def load_entry_source(
     raise AssertionError("unreachable")
 
 
+def daily_log_json_failure_details(
+    recovery_details: dict | None = None,
+    *,
+    field_path: str = "$",
+    expected_type: str = "daily_log_json_object",
+    reason_code: str,
+    section_key: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    details = {
+        **(recovery_details or {}),
+        "prepared_input_builder": "daily_log_entry_json",
+        "field_path": field_path,
+        "expected_type": expected_type,
+        "accepted_shapes": list(DAILY_LOG_ENTRY_JSON_ACCEPTED_SHAPES),
+        "retry_payload_shape": dict(DAILY_LOG_ENTRY_JSON_RETRY_PAYLOAD_SHAPE),
+        "allowed_section_keys": list(SECTION_KEYS["daily_log"]),
+        "reason_code": reason_code,
+        "side_effect": "none",
+    }
+    if section_key is not None:
+        details["section_key"] = section_key
+    if extra:
+        details.update(extra)
+    return details
+
+
 def invalid_json_section_value(
     parser,
     *,
@@ -325,9 +361,17 @@ def invalid_json_section_value(
     section_key: str,
     message: str,
     recovery_details: dict | None = None,
+    field_path: str | None = None,
+    expected_type: str = "string_or_string_array",
+    reason_code: str = "invalid_section_value_type",
 ) -> None:
-    details = dict(recovery_details or {})
-    details["section_key"] = section_key
+    details = daily_log_json_failure_details(
+        recovery_details,
+        field_path=field_path or f"$.{section_key}",
+        expected_type=expected_type,
+        reason_code=reason_code,
+        section_key=section_key,
+    )
     exit_with_failure_contract(
         parser,
         json_mode=json_mode,
@@ -335,6 +379,62 @@ def invalid_json_section_value(
         message=message,
         reason="invalid_prepared_input",
         details=details,
+    )
+
+
+def reserved_marker_failure_details(
+    recovery_details: dict | None = None,
+    *,
+    line_number: int,
+    marker_family: str,
+    section_key: str | None = None,
+) -> dict:
+    details: dict[str, object] = {}
+    input_mode = (recovery_details or {}).get("input_mode")
+    if isinstance(input_mode, str) and input_mode.strip():
+        details["input_mode"] = input_mode
+    details.update(
+        {
+            "reason_code": "reserved_marker_injection",
+            "line_number": line_number,
+            "marker_family": marker_family,
+            "side_effect": "none",
+        }
+    )
+    if section_key is not None:
+        details["section_key"] = section_key
+        details["field_path"] = f"$.{section_key}"
+    return details
+
+
+def reject_json_reserved_markers(
+    parser,
+    *,
+    json_mode: bool,
+    section_key: str,
+    text: str,
+    recovery_details: dict | None = None,
+) -> None:
+    reserved = reserved_marker_lines(text, match_embedded=True)
+    if not reserved:
+        return
+    hit = reserved[0]
+    line_number = int(hit["line_number"])
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=(
+            "Refusing to append because prepared entry JSON section "
+            f"'{section_key}' contains a reserved RecallLoom marker on line {line_number}."
+        ),
+        reason="invalid_prepared_input",
+        details=reserved_marker_failure_details(
+            recovery_details,
+            line_number=line_number,
+            marker_family=str(hit["marker_family"]),
+            section_key=section_key,
+        ),
     )
 
 
@@ -358,6 +458,13 @@ def normalize_json_section_value(
     if isinstance(value, str):
         normalized = value.strip()
         if normalized:
+            reject_json_reserved_markers(
+                parser,
+                json_mode=json_mode,
+                section_key=section_key,
+                text=normalized,
+                recovery_details=recovery_details,
+            )
             return normalized
         invalid_json_section_value(
             parser,
@@ -368,6 +475,7 @@ def normalize_json_section_value(
                 "or a non-empty list of strings."
             ),
             recovery_details=recovery_details,
+            reason_code="empty_section_string",
         )
 
     if isinstance(value, list):
@@ -381,6 +489,7 @@ def normalize_json_section_value(
                     "or a non-empty list of strings."
                 ),
                 recovery_details=recovery_details,
+                reason_code="empty_section_list",
             )
         rendered_items: list[str] = []
         for item in value:
@@ -393,6 +502,9 @@ def normalize_json_section_value(
                         f"Prepared entry JSON section '{section_key}' list items must be non-empty strings."
                     ),
                     recovery_details=recovery_details,
+                    field_path=f"$.{section_key}[]",
+                    expected_type="non_empty_string",
+                    reason_code="invalid_section_list_item_type",
                 )
             normalized_item = item.strip()
             if not normalized_item:
@@ -404,7 +516,17 @@ def normalize_json_section_value(
                         f"Prepared entry JSON section '{section_key}' list items must be non-empty strings."
                     ),
                     recovery_details=recovery_details,
+                    field_path=f"$.{section_key}[]",
+                    expected_type="non_empty_string",
+                    reason_code="empty_section_list_item",
                 )
+            reject_json_reserved_markers(
+                parser,
+                json_mode=json_mode,
+                section_key=section_key,
+                text=normalized_item,
+                recovery_details=recovery_details,
+            )
             rendered_items.append(render_json_list_item(normalized_item))
         return "\n".join(rendered_items)
 
@@ -440,7 +562,13 @@ def normalize_json_entry_text(
                 f"{exc.msg} at line {exc.lineno} column {exc.colno}."
             ),
             reason="invalid_prepared_input",
-            details=recovery_details,
+            details=daily_log_json_failure_details(
+                recovery_details,
+                field_path="$",
+                expected_type="valid_json_object",
+                reason_code="malformed_json",
+                extra={"json_error_line": exc.lineno, "json_error_column": exc.colno},
+            ),
         )
 
     if not isinstance(payload, dict):
@@ -450,30 +578,45 @@ def normalize_json_entry_text(
             exit_code=2,
             message="Prepared entry JSON must be an object keyed by daily-log section names.",
             reason="invalid_prepared_input",
-            details=recovery_details,
+            details=daily_log_json_failure_details(
+                recovery_details,
+                field_path="$",
+                expected_type="object",
+                reason_code="top_level_not_object",
+            ),
         )
 
     required_keys = list(SECTION_KEYS["daily_log"])
     unknown_keys = sorted(key for key in payload if key not in required_keys)
     if unknown_keys:
-        details = dict(recovery_details or {})
-        details["unknown_section_keys"] = unknown_keys
+        details = daily_log_json_failure_details(
+            recovery_details,
+            field_path="$.<section_key>",
+            expected_type="allowed_section_key",
+            reason_code="unknown_section_key",
+            extra={
+                "unknown_section_key_count": len(unknown_keys),
+                "unknown_key_values_public_safe": False,
+            },
+        )
         exit_with_failure_contract(
             parser,
             json_mode=json_mode,
             exit_code=2,
-            message=(
-                "Prepared entry JSON contains unknown daily-log section keys: "
-                + ", ".join(unknown_keys)
-            ),
+            message="Prepared entry JSON contains unknown daily-log section keys.",
             reason="invalid_prepared_input",
             details=details,
         )
 
     missing_keys = [key for key in required_keys if key not in payload]
     if missing_keys:
-        details = dict(recovery_details or {})
-        details["missing_section_keys"] = missing_keys
+        details = daily_log_json_failure_details(
+            recovery_details,
+            field_path="$",
+            expected_type="object_with_all_required_sections",
+            reason_code="missing_section_key",
+            extra={"missing_section_keys": missing_keys},
+        )
         exit_with_failure_contract(
             parser,
             json_mode=json_mode,
@@ -510,6 +653,7 @@ def prepare_entry_text(
     raw_text: str,
     input_format: str,
     entry_path: Path | None,
+    project_root: Path | None = None,
 ) -> tuple[str, str]:
     if source_kind == "entry-json":
         recovery_details = {"input_mode": "json-string"}
@@ -538,6 +682,8 @@ def prepare_entry_text(
         recovery_details: dict[str, object] = {"input_mode": input_mode}
         if entry_path is not None:
             recovery_details["entry_path"] = str(entry_path)
+        if project_root is not None:
+            recovery_details["project_root"] = str(project_root)
         return (
             normalize_json_entry_text(
                 parser,
@@ -571,12 +717,19 @@ def existing_entry_sequences(text: str) -> list[int]:
     return sequences
 
 
-def reserved_marker_lines(text: str) -> list[tuple[int, str]]:
+def reserved_marker_lines(text: str, *, match_embedded: bool = False) -> list[dict[str, object]]:
     results = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         candidate = line.strip()
-        if any(candidate.startswith(prefix) for prefix in RESERVED_MARKER_PREFIXES):
-            results.append((line_number, candidate))
+        for prefix, marker_family in RESERVED_MARKER_FAMILIES:
+            if candidate.startswith(prefix) or (match_embedded and prefix in candidate):
+                results.append(
+                    {
+                        "line_number": line_number,
+                        "marker_family": marker_family,
+                    }
+                )
+                break
     return results
 
 
@@ -587,25 +740,23 @@ def validate_entry_body(
     body_text: str,
     recovery_details: dict | None = None,
 ) -> None:
-    reserved = reserved_marker_lines(body_text)
+    reserved = reserved_marker_lines(body_text, match_embedded=True)
     if reserved:
-        line_number, marker = reserved[0]
-        exit_with_cli_error(
+        hit = reserved[0]
+        line_number = int(hit["line_number"])
+        exit_with_failure_contract(
             parser,
             json_mode=json_mode,
             exit_code=2,
             message=(
                 "Refusing to append because the prepared entry contains a reserved RecallLoom marker "
-                f"on line {line_number}: {marker}"
+                f"on line {line_number}."
             ),
-            payload=failure_payload(
-                "invalid_prepared_input",
-                language=preferred_failure_language(os.environ),
-                error=(
-                    "Refusing to append because the prepared entry contains a reserved RecallLoom marker "
-                    f"on line {line_number}: {marker}"
-                ),
-                details=recovery_details,
+            reason="invalid_prepared_input",
+            details=reserved_marker_failure_details(
+                recovery_details,
+                line_number=line_number,
+                marker_family=str(hit["marker_family"]),
             ),
         )
     attach_scan = scan_auto_attached_context_text(body_text)
@@ -779,6 +930,18 @@ def main() -> None:
         )
     enforce_package_support_gate(parser, json_mode=args.json)
 
+    try:
+        wrapper_metadata = normalize_wrapper_metadata_json(args.wrapper_metadata_json)
+    except WrapperMetadataSecurityError as exc:
+        exit_with_failure_contract(
+            parser,
+            json_mode=args.json,
+            exit_code=4,
+            message=str(exc),
+            reason="privacy_security_failure",
+            details=exc.details,
+        )
+
     if args.date is not None and not validate_iso_date(args.date):
         exit_with_failure_contract(
             parser,
@@ -789,7 +952,12 @@ def main() -> None:
             details={"date": args.date},
         )
     try:
-        writer_id = validate_writer_id(args.writer_id)
+        attribution = resolve_writer_attribution(
+            explicit_writer_id=args.writer_id,
+            invocation_surface="append_daily_log_entry.py",
+            wrapper_metadata=wrapper_metadata,
+        )
+        writer_id = attribution.writer_id
     except ConfigContractError as exc:
         exit_with_failure_contract(
             parser,
@@ -797,25 +965,8 @@ def main() -> None:
             exit_code=2,
             message=str(exc),
             reason="invalid_tool_name",
-            details={"writer_id": args.writer_id},
+            details={"writer_id_source": "explicit_cli"},
         )
-
-    raw_entry_text, source_kind, entry_path = load_entry_source(
-        parser,
-        json_mode=args.json,
-        entry_json=args.entry_json,
-        entry_file=args.entry_file,
-        use_stdin=args.stdin,
-        max_input_bytes=args.max_input_bytes,
-    )
-    body_text, input_mode = prepare_entry_text(
-        parser,
-        json_mode=args.json,
-        source_kind=source_kind,
-        raw_text=raw_entry_text,
-        input_format=args.input_format,
-        entry_path=entry_path,
-    )
 
     try:
         workspace = find_recallloom_root(args.path)
@@ -835,6 +986,33 @@ def main() -> None:
             message="No RecallLoom project root found.",
             reason="no_project_root",
         )
+    startup_residue_report = exit_if_startup_scratch_residue_for_sources(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        source_paths=[args.entry_file],
+    )
+
+    raw_entry_text, source_kind, entry_path = load_entry_source(
+        parser,
+        json_mode=args.json,
+        entry_json=args.entry_json,
+        entry_file=args.entry_file,
+        use_stdin=args.stdin,
+        max_input_bytes=args.max_input_bytes,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
+    body_text, input_mode = prepare_entry_text(
+        parser,
+        json_mode=args.json,
+        source_kind=source_kind,
+        raw_text=raw_entry_text,
+        input_format=args.input_format,
+        entry_path=entry_path,
+        project_root=workspace.project_root,
+    )
     if args.no_auto_detect and (
         args.date is None or args.expected_workspace_revision is None
     ):
@@ -1177,6 +1355,11 @@ def main() -> None:
                 state["daily_logs"]["latest_entry_id"] = f"entry-{next_seq}"
                 state["daily_logs"]["latest_entry_seq"] = next_seq
                 state["daily_logs"]["entry_count"] = next_seq
+                if "updated_at" in state["daily_logs"]:
+                    refreshed_at = now_iso_timestamp()
+                    if refreshed_at == state["daily_logs"].get("updated_at"):
+                        refreshed_at = datetime.now().astimezone().isoformat(timespec="microseconds")
+                    state["daily_logs"]["updated_at"] = refreshed_at
             try:
                 dump_json(state_path, state)
             except OSError as exc:
@@ -1237,7 +1420,7 @@ def main() -> None:
         "new_workspace_revision": state["workspace_revision"],
         "allow_historical": args.allow_historical,
         "state_cursor_updated": target_is_latest_after_write,
-        "writer_id": writer_id,
+        **attribution.public_fields(),
         "auto_detect": {
             "date_used": args.date is None,
             "workspace_revision_used": args.expected_workspace_revision is None,
@@ -1253,7 +1436,11 @@ def main() -> None:
             "workspace_revision_guard_mode": workspace_revision_guard_mode,
         },
     }
+    if wrapper_metadata is not None:
+        payload["wrapper_metadata"] = wrapper_metadata
     if args.json:
+        if startup_residue_report is not None:
+            payload["startup_residue_report"] = startup_residue_report
         public_payload = publicize_json_value(payload, project_root=workspace.project_root)
         print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:

@@ -118,6 +118,7 @@ from core.failure.contracts import failure_payload, preferred_failure_language
 from core.protocol.contracts import FILE_KEYS, ROOT_ENTRY_CANDIDATES
 from core.protocol.markers import parse_file_state_marker
 from core.support.policy import action_level_for_dispatcher
+from core.trust.state import evaluate_trust_state
 
 from _common import (
     cli_failure_payload,
@@ -129,12 +130,16 @@ from _common import (
     exit_with_cli_error,
     find_recallloom_root,
     load_workspace_state,
+    normalize_safe_writer_id,
+    normalize_wrapper_metadata_json,
     normalize_start_path,
     public_package_support_payload,
     public_project_path,
     public_project_root_label,
     read_text,
     StorageResolutionError,
+    startup_scratch_residue_report,
+    WrapperMetadataSecurityError,
 )
 
 
@@ -142,9 +147,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SUPPORTED_BRIDGE_TARGETS = [path.as_posix() for path in ROOT_ENTRY_CANDIDATES]
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--max-input-bytes must be an integer.") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--max-input-bytes must be greater than zero.")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Unified RecallLoom command entry for init, resume, validate, status, quick-summary, append, write, and bridge flows."
+        description=(
+            "Unified RecallLoom command entry for init, resume, validate, status, "
+            "quick-summary, append, write, post-append summary sync, and bridge flows."
+        )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -348,6 +366,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Interpret prepared entry input as markdown or JSON.",
     )
     append_parser.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        help="Maximum prepared-entry input size in bytes forwarded to append_daily_log_entry.py.",
+    )
+    append_parser.add_argument(
         "--allow-historical",
         action="store_true",
         help="Allow appending to a non-latest ISO-dated daily log.",
@@ -360,6 +383,13 @@ def build_parser() -> argparse.ArgumentParser:
     append_parser.add_argument(
         "--writer-id",
         help="Override the writer ID for appended daily-log entries.",
+    )
+    append_parser.add_argument(
+        "--wrapper-metadata-json",
+        help=(
+            "Optional wrapper metadata JSON object for additive public output. "
+            "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
+        ),
     )
     append_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
@@ -388,6 +418,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read prepared managed-file markdown content from UTF-8 stdin instead of a file.",
     )
     write_parser.add_argument(
+        "--input-format",
+        choices=("markdown", "json"),
+        default="markdown",
+        help=(
+            "Interpret prepared managed-file input as markdown or rolling-summary JSON. "
+            "JSON input is only supported with --type current-state."
+        ),
+    )
+    write_parser.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        help="Maximum prepared-content input size in bytes forwarded to commit_context_file.py.",
+    )
+    write_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run preflight and report the target/revisions without writing sidecar state or files.",
@@ -396,7 +440,61 @@ def build_parser() -> argparse.ArgumentParser:
         "--writer-id",
         help="Override the writer ID used by commit_context_file.py.",
     )
+    write_parser.add_argument(
+        "--wrapper-metadata-json",
+        help=(
+            "Optional wrapper metadata JSON object for additive public output. "
+            "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
+        ),
+    )
     write_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+
+    post_append_sync_parser = subparsers.add_parser(
+        "sync-current-state-after-append",
+        help=(
+            "Consume the post_append_summary_sync preflight contract and sync "
+            "rolling_summary.md from reviewed JSON after an append."
+        ),
+    )
+    post_append_sync_parser.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="Project path or a descendant path. Defaults to the current working directory.",
+    )
+    post_append_sync_parser.add_argument(
+        "--source-file",
+        dest="source_file",
+        help=argparse.SUPPRESS,
+    )
+    post_append_sync_parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read reviewed rolling-summary JSON from UTF-8 stdin.",
+    )
+    post_append_sync_parser.add_argument(
+        "--input-format",
+        choices=("json",),
+        default="json",
+        help="Input format for this command. Only rolling-summary JSON is supported.",
+    )
+    post_append_sync_parser.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        help="Maximum reviewed-summary input size in bytes forwarded to commit_context_file.py.",
+    )
+    post_append_sync_parser.add_argument(
+        "--writer-id",
+        help="Override the writer ID used by commit_context_file.py.",
+    )
+    post_append_sync_parser.add_argument(
+        "--wrapper-metadata-json",
+        help=(
+            "Optional wrapper metadata JSON object for additive public output. "
+            "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
+        ),
+    )
+    post_append_sync_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
     bridge_parser = subparsers.add_parser(
         "bridge",
@@ -459,6 +557,41 @@ def _exit_with_support(
         message=message,
         payload=_with_package_support(payload, support),
     )
+
+
+def _exit_if_startup_scratch_residue_with_support(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: Path,
+    storage_root: Path,
+    support: dict,
+) -> dict | None:
+    report = startup_scratch_residue_report(
+        project_root,
+        storage_root,
+    )
+    if report.blocked:
+        public_report = report.public_dict()
+        message = "RecallLoom startup scratch residue detected; no files were changed."
+        _exit_with_support(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "startup_residue_detected",
+                error=message,
+                details={
+                    "project_root": str(project_root),
+                    "startup_residue_report": public_report,
+                },
+                findings=public_report["findings"],
+                extra={"startup_residue_report": public_report},
+            ),
+            support=support,
+        )
+    return report.report_only_public_dict()
 
 
 def _infer_helper_failure_reason(helper_name: str, message: str) -> str | None:
@@ -756,6 +889,8 @@ def _append_helper_args(args: argparse.Namespace) -> list[str]:
         helper_args.extend(["--entry-json", args.entry_json])
     if args.input_format is not None:
         helper_args.extend(["--input-format", args.input_format])
+    if args.max_input_bytes is not None:
+        helper_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
     if args.stdin:
         helper_args.append("--stdin")
     if args.entry_file is not None:
@@ -768,6 +903,8 @@ def _append_helper_args(args: argparse.Namespace) -> list[str]:
         helper_args.append("--no-auto-detect")
     if args.writer_id is not None:
         helper_args.extend(["--writer-id", args.writer_id])
+    if args.wrapper_metadata_json is not None:
+        helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
     if args.expected_workspace_revision is not None:
         helper_args.extend(["--expected-workspace-revision", str(args.expected_workspace_revision)])
     return helper_args
@@ -893,6 +1030,22 @@ def _validate_write_args(parser, args: argparse.Namespace, *, support: dict) -> 
                 "stdin_present": bool(args.stdin),
             },
         )
+    if args.input_format == "json" and file_key != "rolling_summary":
+        _exit_write_invalid_input(
+            parser,
+            args,
+            support=support,
+            message="Structured JSON input is only supported for --type current-state.",
+            recovery_command=(
+                "recallloom.py write <project> --type current-state "
+                "--stdin --input-format json --json"
+            ),
+            details={
+                "input_format": "json",
+                "received_write_type": args.write_type,
+                "accepted_write_type": "current-state",
+            },
+        )
     return file_key, input_mode
 
 
@@ -900,7 +1053,7 @@ def _preflight_payload(parser, args: argparse.Namespace, *, support: dict) -> di
     return _run_helper_json(
         parser,
         helper_name="preflight_context_check.py",
-        helper_args=[args.target],
+        helper_args=[args.target, "--skip-startup-residue-scan"],
         json_mode_on_failure=args.json,
         support=support,
         package_support_on_failure=True,
@@ -922,10 +1075,98 @@ def _preflight_gate_details(preflight_payload: dict) -> dict:
     return {key: preflight_payload.get(key) for key in detail_keys if key in preflight_payload}
 
 
+def _write_retry_payload(
+    args: argparse.Namespace,
+    *,
+    file_key: str,
+    input_mode: str,
+) -> dict:
+    writer_args: list[str] = []
+    writer_fields: dict[str, str | bool] = {}
+    if args.writer_id is not None:
+        safe_writer_id = normalize_safe_writer_id(args.writer_id)
+        writer_arg = safe_writer_id or "same_explicit_writer_id"
+        writer_args = ["--writer-id", writer_arg]
+        writer_fields = {
+            "writer_id_source": "explicit_cli",
+            "writer_id_ref": "same_explicit_writer_id",
+            "writer_id_public_safe": safe_writer_id is not None,
+        }
+        if safe_writer_id is not None:
+            writer_fields["writer_id"] = safe_writer_id
+
+    if input_mode == "file":
+        input_ref = "same_prepared_source_file"
+        input_args = ["--source-file", "same_prepared_source_file"]
+    else:
+        input_ref = "resubmit_same_stdin_payload"
+        input_args = ["--stdin"]
+    if args.input_format != "markdown":
+        input_args.extend(["--input-format", args.input_format])
+    if args.max_input_bytes is not None:
+        input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    if args.dry_run:
+        input_args.append("--dry-run")
+    return {
+        "command": "recallloom.py write",
+        "project_ref": "same_project",
+        "write_type": args.write_type,
+        "file_key": file_key,
+        "input_mode": input_mode,
+        "input_ref": input_ref,
+        "input_format": args.input_format,
+        "argv_template": [
+            "recallloom.py",
+            "write",
+            "same_project",
+            "--type",
+            args.write_type,
+            *input_args,
+            *writer_args,
+            "--json",
+        ],
+        "requires_repair_command_first": True,
+        "side_effect": "none_until_retry",
+        **writer_fields,
+    }
+
+
+def _write_preflight_failure_payload(
+    args: argparse.Namespace,
+    *,
+    file_key: str,
+    input_mode: str,
+    message: str,
+    details: dict,
+) -> dict:
+    # Keep repair_command tied to the public failure contract while letting
+    # retry_payload pass through the contract's final publicization step.
+    base_payload = cli_failure_payload(
+        "stale_write_context",
+        error=message,
+        details=details,
+    )
+    return cli_failure_payload(
+        "stale_write_context",
+        error=message,
+        details=details,
+        extra={
+            "repair_command": base_payload["recovery_command"],
+            "retry_payload": _write_retry_payload(
+                args,
+                file_key=file_key,
+                input_mode=input_mode,
+            ),
+        },
+    )
+
+
 def _enforce_write_preflight_gate(
     parser,
     args: argparse.Namespace,
     *,
+    file_key: str,
+    input_mode: str,
     preflight_payload: dict,
     support: dict,
 ) -> None:
@@ -938,16 +1179,19 @@ def _enforce_write_preflight_gate(
         "Preflight requires review before write. recallloom.py write only proceeds when "
         "allowed_operation_level is write_current_state_after_preflight and summary_stale is false."
     )
+    payload = _write_preflight_failure_payload(
+        args,
+        file_key=file_key,
+        input_mode=input_mode,
+        message=message,
+        details=_preflight_gate_details(preflight_payload),
+    )
     _exit_with_support(
         parser,
         json_mode=args.json,
         exit_code=3,
         message=message,
-        payload=cli_failure_payload(
-            "stale_write_context",
-            error=message,
-            details=_preflight_gate_details(preflight_payload),
-        ),
+        payload=payload,
         support=support,
     )
 
@@ -1058,9 +1302,421 @@ def _commit_context_file_args(
         helper_args.extend(["--source-file", args.source_file])
     if args.stdin:
         helper_args.append("--stdin")
+    if args.input_format != "markdown":
+        helper_args.extend(["--input-format", args.input_format])
+    if args.max_input_bytes is not None:
+        helper_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
     if args.writer_id is not None:
         helper_args.extend(["--writer-id", args.writer_id])
+    if args.wrapper_metadata_json is not None:
+        helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
     return helper_args
+
+
+POST_APPEND_SYNC_COMMAND = "sync-current-state-after-append"
+POST_APPEND_SYNC_CONTRACT_TYPE = "post_append_summary_sync"
+
+
+def _post_append_sync_retry_payload(
+    args: argparse.Namespace,
+    *,
+    input_mode: str,
+) -> dict:
+    writer_args: list[str] = []
+    writer_fields: dict[str, str | bool] = {}
+    if args.writer_id is not None:
+        safe_writer_id = normalize_safe_writer_id(args.writer_id)
+        writer_arg = safe_writer_id or "same_explicit_writer_id"
+        writer_args = ["--writer-id", writer_arg]
+        writer_fields = {
+            "writer_id_source": "explicit_cli",
+            "writer_id_ref": "same_explicit_writer_id",
+            "writer_id_public_safe": safe_writer_id is not None,
+        }
+        if safe_writer_id is not None:
+            writer_fields["writer_id"] = safe_writer_id
+
+    input_ref = "resubmit_same_stdin_payload"
+    input_args = ["--stdin"]
+    if args.max_input_bytes is not None:
+        input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    return {
+        "command": f"recallloom.py {POST_APPEND_SYNC_COMMAND}",
+        "project_ref": "same_project",
+        "write_type": "current-state",
+        "file_key": "rolling_summary",
+        "input_mode": input_mode,
+        "input_ref": input_ref,
+        "input_format": "json",
+        "argv_template": [
+            "recallloom.py",
+            POST_APPEND_SYNC_COMMAND,
+            "same_project",
+            *input_args,
+            "--input-format",
+            "json",
+            *writer_args,
+            "--json",
+        ],
+        "requires_repair_command_first": True,
+        "side_effect": "none_until_contract_allows_retry",
+        **writer_fields,
+    }
+
+
+def _post_append_sync_failure_payload(
+    args: argparse.Namespace,
+    *,
+    input_mode: str,
+    message: str,
+    reason_code: str,
+    contract: dict | None,
+) -> dict:
+    provenance_guard = contract.get("provenance_guard") if isinstance(contract, dict) else None
+    append_cursor = contract.get("append_cursor") if isinstance(contract, dict) else None
+    ordinary_write_gate = contract.get("ordinary_write_gate") if isinstance(contract, dict) else None
+    return {
+        "ok": False,
+        "schema_version": "1.1",
+        "blocked": True,
+        "blocked_reason": "post_append_summary_sync_not_allowed",
+        "recoverability": "retryable",
+        "surface_level": "operator",
+        "trust_effect": "review_required",
+        "command": POST_APPEND_SYNC_COMMAND,
+        "contract_type": (
+            contract.get("contract_type")
+            if isinstance(contract, dict) and isinstance(contract.get("contract_type"), str)
+            else POST_APPEND_SYNC_CONTRACT_TYPE
+        ),
+        "write_type": "current-state",
+        "file_key": "rolling_summary",
+        "input_mode": input_mode,
+        "input_format": "json",
+        "reason_code": reason_code,
+        "error": message,
+        "user_message": "Post-append summary sync is not allowed for the current sidecar state.",
+        "operator_note": (
+            "Rerun preflight and only retry this command when the post_append_summary_sync "
+            "contract is allowed for a single append delta."
+        ),
+        "next_actions": ["rerun_preflight", "review_post_append_summary_sync_contract"],
+        "append_cursor": append_cursor if isinstance(append_cursor, dict) else None,
+        "provenance_guard": provenance_guard if isinstance(provenance_guard, dict) else {},
+        "ordinary_write_gate_preserved": (
+            contract.get("ordinary_write_gate_preserved")
+            if isinstance(contract, dict)
+            else None
+        ),
+        "ordinary_write_gate": ordinary_write_gate if isinstance(ordinary_write_gate, dict) else None,
+        "retry_payload": _post_append_sync_retry_payload(args, input_mode=input_mode),
+    }
+
+
+def _post_append_sync_invalid_input_payload(
+    args: argparse.Namespace,
+    *,
+    message: str,
+    source_file_present: bool,
+    stdin_present: bool,
+) -> dict:
+    input_args = ["--stdin", "--input-format", "json"]
+    if args.max_input_bytes is not None:
+        input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    return cli_failure_payload(
+        "invalid_prepared_input",
+        error=message,
+        details={
+            "input_contract": "stdin_only_json",
+            "source_file_present": source_file_present,
+            "stdin_present": stdin_present,
+            "accepted_input": "--stdin",
+            "input_format": "json",
+        },
+        extra={
+            "command": POST_APPEND_SYNC_COMMAND,
+            "write_type": "current-state",
+            "file_key": "rolling_summary",
+            "input_format": "json",
+            "retry_payload": {
+                "command": f"recallloom.py {POST_APPEND_SYNC_COMMAND}",
+                "project_ref": "same_project",
+                "input_mode": "json-stdin",
+                "input_ref": "resubmit_same_stdin_payload",
+                "input_format": "json",
+                "argv_template": [
+                    "recallloom.py",
+                    POST_APPEND_SYNC_COMMAND,
+                    "same_project",
+                    *input_args,
+                    "--json",
+                ],
+                "requires_repair_command_first": True,
+                "side_effect": "none_until_contract_allows_retry",
+            },
+        },
+    )
+
+
+def _post_append_sync_input_mode(args: argparse.Namespace) -> str:
+    return "json-stdin"
+
+
+def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support: dict) -> None:
+    source_file_present = args.source_file is not None
+    stdin_present = bool(args.stdin)
+    if source_file_present or not stdin_present:
+        if source_file_present:
+            message = (
+                "sync-current-state-after-append only accepts reviewed rolling-summary JSON "
+                "through --stdin; --source-file is not part of this command surface."
+            )
+        else:
+            message = (
+                "sync-current-state-after-append requires reviewed rolling-summary JSON "
+                "through --stdin."
+            )
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=_post_append_sync_invalid_input_payload(
+                args,
+                message=message,
+                source_file_present=source_file_present,
+                stdin_present=stdin_present,
+            ),
+            support=support,
+        )
+
+    if args.writer_id is not None and normalize_safe_writer_id(args.writer_id) is None:
+        message = "Explicit writer id for post-append summary sync is not public-safe."
+        input_args = ["--stdin", "--input-format", "json"]
+        if args.max_input_bytes is not None:
+            input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=4,
+            message=message,
+            payload=cli_failure_payload(
+                "privacy_security_failure",
+                error=message,
+                details={
+                    "field": "writer_id",
+                    "reason_code": "unsafe_explicit_writer_id",
+                    "writer_id_source": "explicit_cli",
+                    "writer_id_public_safe": False,
+                },
+                extra={
+                    "command": POST_APPEND_SYNC_COMMAND,
+                    "write_type": "current-state",
+                    "file_key": "rolling_summary",
+                    "input_mode": "json-stdin",
+                    "input_format": "json",
+                    "retry_payload": {
+                        "command": f"recallloom.py {POST_APPEND_SYNC_COMMAND}",
+                        "project_ref": "same_project",
+                        "input_mode": "json-stdin",
+                        "input_ref": "resubmit_same_stdin_payload",
+                        "input_format": "json",
+                        "writer_id_source": "explicit_cli",
+                        "writer_id_ref": "same_explicit_writer_id",
+                        "writer_id_public_safe": False,
+                        "argv_template": [
+                            "recallloom.py",
+                            POST_APPEND_SYNC_COMMAND,
+                            "same_project",
+                            *input_args,
+                            "--writer-id",
+                            "same_public_safe_writer_id",
+                            "--json",
+                        ],
+                        "requires_repair_command_first": True,
+                        "side_effect": "none_until_contract_allows_retry",
+                    },
+                },
+            ),
+            support=support,
+        )
+
+
+def _required_contract_bool_guard(
+    provenance_guard: dict,
+    *,
+    key: str,
+    expected: bool,
+) -> str | None:
+    if provenance_guard.get(key) is expected:
+        return None
+    return f"provenance_guard_{key}_invalid"
+
+
+def _post_append_sync_contract_reason(contract: object) -> str | None:
+    if not isinstance(contract, dict):
+        return "missing_post_append_summary_sync_contract"
+    if contract.get("allowed") is not True:
+        reason_code = contract.get("reason_code")
+        return reason_code if isinstance(reason_code, str) and reason_code else "contract_not_allowed"
+    if contract.get("contract_type") != POST_APPEND_SYNC_CONTRACT_TYPE:
+        return "contract_type_mismatch"
+    if contract.get("file_key") != "rolling_summary":
+        return "file_key_mismatch"
+    if contract.get("write_type") != "current-state":
+        return "write_type_mismatch"
+    if contract.get("input_format") != "json":
+        return "input_format_mismatch"
+    expected_file_revision = contract.get("expected_file_revision")
+    expected_workspace_revision = contract.get("expected_workspace_revision")
+    if not isinstance(expected_file_revision, int) or not isinstance(expected_workspace_revision, int):
+        return "missing_expected_revision"
+    if contract.get("ordinary_write_gate_preserved") is not True:
+        return "ordinary_write_gate_not_preserved"
+    ordinary_write_gate = contract.get("ordinary_write_gate")
+    if not isinstance(ordinary_write_gate, dict):
+        return "missing_ordinary_write_gate"
+    if ordinary_write_gate.get("contract_does_not_authorize_recallloom_write") is not True:
+        return "ordinary_write_gate_authorization_mismatch"
+    if ordinary_write_gate.get("allowed_operation_level") != "read_current_state":
+        return "ordinary_write_gate_level_mismatch"
+    if ordinary_write_gate.get("summary_stale") is not True:
+        return "ordinary_write_gate_stale_state_mismatch"
+    provenance_guard = contract.get("provenance_guard")
+    if not isinstance(provenance_guard, dict):
+        return "missing_provenance_guard"
+    for key in (
+        "single_append_delta",
+        "cursor_matches_latest_log",
+        "latest_daily_log_not_older_than_summary",
+    ):
+        reason = _required_contract_bool_guard(provenance_guard, key=key, expected=True)
+        if reason is not None:
+            return reason
+    non_summary_writes = provenance_guard.get("non_summary_writes_after_summary_base")
+    if non_summary_writes != []:
+        return "stale_cause_not_append_only"
+    append_cursor = contract.get("append_cursor")
+    if not isinstance(append_cursor, dict):
+        return "missing_append_cursor"
+    if not isinstance(append_cursor.get("latest_file"), str):
+        return "missing_append_cursor_latest_file"
+    if not isinstance(append_cursor.get("latest_entry_id"), str):
+        return "missing_append_cursor_latest_entry_id"
+    if not isinstance(append_cursor.get("latest_entry_seq"), int):
+        return "missing_append_cursor_latest_entry_seq"
+    if not isinstance(append_cursor.get("entry_count"), int):
+        return "missing_append_cursor_entry_count"
+    return None
+
+
+def _post_append_sync_contract_from_preflight(preflight_payload: dict) -> dict | None:
+    safe_write_context = preflight_payload.get("safe_write_context")
+    if not isinstance(safe_write_context, dict):
+        return None
+    contract = safe_write_context.get(POST_APPEND_SYNC_CONTRACT_TYPE)
+    return contract if isinstance(contract, dict) else None
+
+
+def _post_append_sync_commit_args(args: argparse.Namespace, *, contract: dict) -> list[str]:
+    helper_args = [
+        args.target,
+        "--file-key",
+        "rolling_summary",
+        "--expected-file-revision",
+        str(contract["expected_file_revision"]),
+        "--expected-workspace-revision",
+        str(contract["expected_workspace_revision"]),
+        "--input-format",
+        "json",
+    ]
+    helper_args.append("--stdin")
+    if args.max_input_bytes is not None:
+        helper_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    if args.writer_id is not None:
+        safe_writer_id = normalize_safe_writer_id(args.writer_id)
+        if safe_writer_id is None:
+            raise ConfigContractError("writer_id must be public-safe for post-append summary sync")
+        helper_args.extend(["--writer-id", safe_writer_id])
+    if args.wrapper_metadata_json is not None:
+        helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
+    return helper_args
+
+
+def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, support: dict) -> None:
+    _validate_post_append_sync_args(parser, args, support=support)
+    input_mode = _post_append_sync_input_mode(args)
+    try:
+        wrapper_metadata = normalize_wrapper_metadata_json(args.wrapper_metadata_json)
+    except WrapperMetadataSecurityError as exc:
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=4,
+            message=str(exc),
+            payload=cli_failure_payload(
+                "privacy_security_failure",
+                error=str(exc),
+                details=exc.details,
+            ),
+            support=support,
+        )
+    preflight_payload = _preflight_payload(parser, args, support=support)
+    contract = _post_append_sync_contract_from_preflight(preflight_payload)
+    reason_code = _post_append_sync_contract_reason(contract)
+    if reason_code is not None:
+        message = (
+            "Preflight did not authorize post-append current-state summary sync "
+            f"for this sidecar state: {reason_code}."
+        )
+        payload = _post_append_sync_failure_payload(
+            args,
+            input_mode=input_mode,
+            message=message,
+            reason_code=reason_code,
+            contract=contract,
+        )
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=payload,
+            support=support,
+        )
+
+    assert contract is not None
+    payload = _run_helper_json(
+        parser,
+        helper_name="commit_context_file.py",
+        helper_args=_post_append_sync_commit_args(args, contract=contract),
+        json_mode_on_failure=args.json,
+        support=support,
+        package_support_on_failure=True,
+    )
+    result = {
+        **payload,
+        "schema_version": "1.1",
+        "command": POST_APPEND_SYNC_COMMAND,
+        "contract_type": POST_APPEND_SYNC_CONTRACT_TYPE,
+        "write_type": "current-state",
+        "file_key": "rolling_summary",
+        "input_mode": payload.get("input_mode", input_mode),
+        "input_format": "json",
+        "expected_file_revision": contract["expected_file_revision"],
+        "expected_workspace_revision": contract["expected_workspace_revision"],
+        "append_cursor": contract.get("append_cursor"),
+        "provenance_guard": contract.get("provenance_guard"),
+        "ordinary_write_gate_preserved": contract.get("ordinary_write_gate_preserved"),
+        "ordinary_write_gate": contract.get("ordinary_write_gate"),
+        "package_support": public_package_support_payload(support),
+    }
+    if wrapper_metadata is not None:
+        result["wrapper_metadata"] = wrapper_metadata
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"Synced rolling_summary after append to {result.get('target_path', '.recallloom/rolling_summary.md')}")
 
 
 def _resume_ready(payload: dict) -> bool:
@@ -1085,7 +1741,7 @@ def _resume_payload(payload: dict) -> dict:
 def _dispatcher_action_level(command: str) -> str:
     if command == "quick-summary":
         return "diagnostic"
-    if command in {"append", "write"}:
+    if command in {"append", "write", POST_APPEND_SYNC_COMMAND}:
         return "mutating"
     return action_level_for_dispatcher(command)
 
@@ -1121,6 +1777,13 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
     if workspace is None:
         payload = build_no_project_payload(start_path)
     else:
+        startup_residue_report = _exit_if_startup_scratch_residue_with_support(
+            parser,
+            json_mode=args.json,
+            project_root=workspace.project_root,
+            storage_root=workspace.storage_root,
+            support=support,
+        )
         try:
             summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
             if not summary_path.is_file():
@@ -1168,6 +1831,8 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
             summary_base_workspace_revision=summary_state.base_workspace_revision,
             state=state,
         )
+        if startup_residue_report is not None:
+            payload["startup_residue_report"] = startup_residue_report
 
     if args.json:
         payload["package_support"] = public_package_support_payload(support)
@@ -1233,6 +1898,7 @@ def _progressive_resume_read_plan(
     summary_text: str,
     context_brief_text: str = "",
     update_protocol_text: str = "",
+    update_protocol_available: bool = False,
 ) -> dict:
     state_rel = _project_relative_path(storage_root / FILE_KEYS["state"], project_root)
     summary_rel = _project_relative_path(storage_root / FILE_KEYS["rolling_summary"], project_root)
@@ -1243,15 +1909,17 @@ def _progressive_resume_read_plan(
     }
     if mode == "full":
         context_rel = _project_relative_path(storage_root / FILE_KEYS["context_brief"], project_root)
-        update_protocol_rel = _project_relative_path(storage_root / FILE_KEYS["update_protocol"], project_root)
-        files.extend([context_rel, update_protocol_rel])
+        files.append(context_rel)
         text_by_path[context_rel] = context_brief_text
-        text_by_path[update_protocol_rel] = update_protocol_text
+        if update_protocol_available:
+            update_protocol_rel = _project_relative_path(storage_root / FILE_KEYS["update_protocol"], project_root)
+            files.append(update_protocol_rel)
+            text_by_path[update_protocol_rel] = update_protocol_text
     reason = (
         "Fast bounded resume reads only state.json and rolling_summary.md for current-state orientation."
         if mode == "fast"
         else (
-            "Full bounded resume adds context_brief.md and update_protocol.md guidance; "
+            "Full bounded resume adds context_brief.md and any available update_protocol.md guidance; "
             "evidence expansion remains on demand."
         )
     )
@@ -1262,6 +1930,30 @@ def _progressive_resume_read_plan(
         "estimated_tokens": _estimated_tokens_for_texts(files, text_by_path),
         "bounded": True,
     }
+
+
+def _resume_trust_state(
+    *,
+    continuity_confidence: str,
+    continuity_state: str,
+    summary_stale: bool,
+    workspace_newer_than_summary: bool,
+) -> dict:
+    if continuity_state == "no_project":
+        return {
+            "sidecar_trust_state": "unknown",
+            "continuity_drift_risk_level": "none",
+            "allowed_operation_level": "none",
+            "read_confidence": "untrusted",
+            "read_trust_note": "No RecallLoom sidecar was found.",
+        }
+    return evaluate_trust_state(
+        continuity_confidence=continuity_confidence,
+        continuity_state=continuity_state,
+        summary_stale=summary_stale,
+        workspace_newer_than_summary=workspace_newer_than_summary,
+        conflict_state=None,
+    )
 
 
 def _resume_continuity_state(quick_payload: dict) -> str:
@@ -1318,6 +2010,12 @@ def _build_progressive_resume_payload(
     if workspace is None:
         quick_payload = build_no_project_payload(start_path)
         continuity_state = _resume_continuity_state(quick_payload)
+        trust_state = _resume_trust_state(
+            continuity_confidence="none",
+            continuity_state=continuity_state,
+            summary_stale=False,
+            workspace_newer_than_summary=False,
+        )
         payload = {
             "schema_version": "1.1",
             "ok": True,
@@ -1335,9 +2033,17 @@ def _build_progressive_resume_payload(
                 "continuity_state": continuity_state,
                 "summary_stale": False,
                 "resume_ready": False,
+                "sidecar_trust_state": trust_state["sidecar_trust_state"],
+                "allowed_operation_level": trust_state["allowed_operation_level"],
+                "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
+                "read_confidence": trust_state["read_confidence"],
+                "read_trust_note": trust_state["read_trust_note"],
             },
             "continuity_confidence": "none",
             "continuity_state": continuity_state,
+            "sidecar_trust_state": trust_state["sidecar_trust_state"],
+            "allowed_operation_level": trust_state["allowed_operation_level"],
+            "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
             "progressive_read_plan": {
                 "mode": mode,
                 "files": [],
@@ -1349,6 +2055,13 @@ def _build_progressive_resume_payload(
             "package_support": public_package_support_payload(support),
         }
         return payload
+    startup_residue_report = _exit_if_startup_scratch_residue_with_support(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        support=support,
+    )
 
     try:
         summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
@@ -1401,6 +2114,12 @@ def _build_progressive_resume_payload(
     )
     continuity_state = _resume_continuity_state(quick_payload)
     continuity_confidence = quick_payload["summary"]["confidence"]
+    trust_state = _resume_trust_state(
+        continuity_confidence=continuity_confidence,
+        continuity_state=continuity_state,
+        summary_stale=quick_payload["freshness"]["summary_stale"],
+        workspace_newer_than_summary=quick_payload["freshness"].get("workspace_newer_than_summary", False),
+    )
     base_payload = {
         "schema_version": "1.1",
         "ok": True,
@@ -1416,12 +2135,22 @@ def _build_progressive_resume_payload(
             "continuity_confidence": continuity_confidence,
             "continuity_state": continuity_state,
             "summary_stale": quick_payload["freshness"]["summary_stale"],
+            "sidecar_trust_state": trust_state["sidecar_trust_state"],
+            "allowed_operation_level": trust_state["allowed_operation_level"],
+            "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
+            "read_confidence": trust_state["read_confidence"],
+            "read_trust_note": trust_state["read_trust_note"],
         },
         "continuity_confidence": continuity_confidence,
         "continuity_state": continuity_state,
+        "sidecar_trust_state": trust_state["sidecar_trust_state"],
+        "allowed_operation_level": trust_state["allowed_operation_level"],
+        "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
         "next_actions": _resume_next_actions(mode=mode, quick_actions=quick_payload["next_actions"]),
         "package_support": public_package_support_payload(support),
     }
+    if startup_residue_report is not None:
+        base_payload["startup_residue_report"] = startup_residue_report
     base_payload["resume_ready"] = _resume_ready(base_payload)
     base_payload["trust"]["resume_ready"] = base_payload["resume_ready"]
 
@@ -1461,6 +2190,7 @@ def _build_progressive_resume_payload(
         summary_text=summary_text,
         context_brief_text=context_brief_text,
         update_protocol_text=update_protocol_text,
+        update_protocol_available=update_protocol_path.is_file(),
     )
     base_payload["expansion"] = {
         "reason": (
@@ -1628,10 +2358,26 @@ def _handle_init(parser, args: argparse.Namespace, *, support: dict) -> None:
 
 def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
     file_key, input_mode = _validate_write_args(parser, args, support=support)
+    try:
+        wrapper_metadata = normalize_wrapper_metadata_json(args.wrapper_metadata_json)
+    except WrapperMetadataSecurityError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=4,
+            message=str(exc),
+            payload=cli_failure_payload(
+                "privacy_security_failure",
+                error=str(exc),
+                details=exc.details,
+            ),
+        )
     preflight_payload = _preflight_payload(parser, args, support=support)
     _enforce_write_preflight_gate(
         parser,
         args,
+        file_key=file_key,
+        input_mode=input_mode,
         preflight_payload=preflight_payload,
         support=support,
     )
@@ -1659,6 +2405,8 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
             "expected_workspace_revision": write_context["expected_workspace_revision"],
             "package_support": public_package_support_payload(support),
         }
+        if wrapper_metadata is not None:
+            payload["wrapper_metadata"] = wrapper_metadata
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
@@ -1794,6 +2542,10 @@ def main() -> None:
 
     if args.command == "write":
         _handle_write(parser, args, support=support)
+        return
+
+    if args.command == POST_APPEND_SYNC_COMMAND:
+        _handle_post_append_summary_sync(parser, args, support=support)
         return
 
     if args.command == "bridge":

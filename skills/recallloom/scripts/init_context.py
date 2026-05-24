@@ -32,6 +32,7 @@ from _common import (
     DEFAULT_STORAGE_MODE,
     EnvironmentContractError,
     enforce_package_support_gate,
+    exit_if_startup_scratch_residue,
     exit_with_cli_error,
     LockBusyError,
     VISIBLE_STORAGE_MODE,
@@ -311,6 +312,7 @@ def existing_storage_issue(
 
 PROJECT_ROOT_SIGNAL_FILES = {
     "README.md",
+    "README.en.md",
     "README.zh-CN.md",
     "AGENTS.md",
     "CLAUDE.md",
@@ -465,6 +467,12 @@ def main() -> None:
 
     storage_mode = validate_storage_mode(args.storage_mode)
     workspace_language = validate_workspace_language(args.workspace_language)
+    startup_residue_report = exit_if_startup_scratch_residue(
+        parser,
+        json_mode=args.json,
+        project_root=project_root,
+        storage_root=storage_root_for_mode(project_root, storage_mode),
+    )
     try:
         tool_name = validate_tool_name(args.tool_name)
     except ConfigContractError as exc:
@@ -864,6 +872,8 @@ def main() -> None:
                 "continuity_state": continuity_state,
                 "continuity_seeded": continuity_seeded,
             }
+            if startup_residue_report is not None:
+                summary["startup_residue_report"] = startup_residue_report
     except LockBusyError as exc:
         exit_with_cli_error(
             parser,

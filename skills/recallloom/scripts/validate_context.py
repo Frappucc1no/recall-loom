@@ -43,6 +43,7 @@ from _common import (
     cli_failure_payload,
     cli_failure_payload_for_exception,
     enforce_package_support_gate,
+    exit_if_startup_scratch_residue,
     exit_with_cli_error,
     StorageResolutionError,
     ValidationFinding,
@@ -559,6 +560,42 @@ def validate_daily_logs(workspace, state: dict | None, findings: list[Validation
                         "Latest daily-log entry sequence does not match state.json",
                         log_path,
                     )
+                updated_at = daily_state.get("updated_at")
+                if updated_at is None:
+                    add_finding(
+                        findings,
+                        "warning",
+                        "legacy_optional_metadata_missing",
+                        (
+                            "state.json daily_logs.updated_at is absent; legacy protocol 1.0 "
+                            "sidecars may omit this optional freshness annotation."
+                        ),
+                        workspace.storage_root / FILE_KEYS["state"],
+                    )
+                elif isinstance(updated_at, str) and updated_at.strip():
+                    try:
+                        updated_at_dt = datetime.fromisoformat(updated_at)
+                        latest_entry_dt = datetime.fromisoformat(latest_entry.created_at)
+                    except ValueError:
+                        add_finding(
+                            findings,
+                            "warning",
+                            "invalid_daily_logs_updated_at_freshness",
+                            (
+                                "state.json daily_logs.updated_at or latest daily-log entry "
+                                "created-at is not ISO parseable."
+                            ),
+                            workspace.storage_root / FILE_KEYS["state"],
+                        )
+                    else:
+                        if updated_at_dt < latest_entry_dt:
+                            add_finding(
+                                findings,
+                                "warning",
+                                "daily_logs_updated_at_stale",
+                                "state.json daily_logs.updated_at is older than the latest daily-log entry.",
+                                workspace.storage_root / FILE_KEYS["state"],
+                            )
 
 
 def validate_unknown_storage_assets(workspace, findings: list[ValidationFinding]) -> None:
@@ -911,6 +948,12 @@ def main() -> None:
                 extra={"valid": False},
             ),
         )
+    startup_residue_report = exit_if_startup_scratch_residue(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
 
     findings: list[ValidationFinding] = []
     try:
@@ -963,6 +1006,8 @@ def main() -> None:
     }
 
     if args.json:
+        if startup_residue_report is not None:
+            payload["startup_residue_report"] = startup_residue_report
         public_payload = publicize_json_value(payload, project_root=workspace.project_root)
         print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:

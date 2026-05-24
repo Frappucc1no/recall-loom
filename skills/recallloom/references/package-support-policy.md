@@ -12,7 +12,7 @@ RecallLoom performs a lightweight package support check through helper startup.
 - cache scope is the installed package path
 - dispatcher checks may pass same-day support payloads to child helpers through `RECALLLOOM_SUPPORT_STATE_JSON`, but helpers still authorize from their own same-day cache or advisory read rather than trusting external env payloads alone
 - support state is stored in the user cache, not in project `.recallloom/`
-- network or advisory failures do not, by themselves, hard-block first use
+- network or advisory failures without a usable cache resolve to `unknown_offline`; diagnostic and read-only actions can continue, while mutating actions stay blocked until support can be verified
 - an advisory payload that is present but malformed is treated as invalid and reduced to diagnostic-only behavior until repaired
 
 The default advisory URL is read from `package-metadata.json` as `support_advisory_url`.
@@ -63,7 +63,7 @@ Helpers currently validate and gate behavior from the core support fields above,
 - `upgrade_recommended`: all actions are allowed, but diagnostics may surface upgrade guidance
 - `readonly_only`: diagnostic and read-only actions are allowed; mutating actions are blocked
 - `diagnostic_only`: only diagnostic actions are allowed
-- `unknown_offline`: no fresh advisory could be obtained and no usable cache exists; actions are allowed
+- `unknown_offline`: no fresh advisory could be obtained and no usable cache exists; diagnostic and read-only actions are allowed, while mutating actions are blocked
 
 ## Action Levels
 

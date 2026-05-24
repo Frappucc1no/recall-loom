@@ -1,366 +1,139 @@
+<!-- R1 image slot: docs/images/readme-product-identity.zh-CN.png -->
+
+<p align="center">
+  <img src="./docs/images/readme-product-identity.zh-CN.png" alt="RecallLoom 品牌主视觉：让项目自己记住自己" />
+</p>
+
 <div align="center">
 
-<h1>🧶 RecallLoom</h1>
+<h1>🧵 RecallLoom</h1>
 
-**Let the project remember itself.**
+<p><strong>让项目自己记住自己。</strong></p>
 
-**Built for projects that keep moving across agents, sessions, and models.**
+<p>把背景、进展、关键决策和下一步留在项目文件里。换会话、换模型、换工具，下一次 AI 协作也能接上当前状态。</p>
 
-[![Version](https://img.shields.io/badge/version-v0.3.5-6b7280)](./skills/recallloom/package-metadata.json)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)](./skills/recallloom/package-metadata.json)
+[![Release](https://img.shields.io/badge/release-v0.4.0-111827?style=flat-square)](./docs/releases/v0.4.0.md)
+[![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
+[![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![License](https://img.shields.io/badge/license-Apache--2.0-7c3aed?style=flat-square)](./LICENSE)
+[![Stars](https://img.shields.io/github/stars/Frappucc1no/recall-loom?style=flat-square&logo=github&label=stars)](https://github.com/Frappucc1no/recall-loom/stargazers)
 
-**English** · [简体中文](./README.zh-CN.md)
+[English](./README.en.md) · **简体中文**
 
 </div>
 
-<p align="center">
-  <img src="./docs/images/readme-topbanner.en.png" alt="RecallLoom top banner" />
-</p>
+> [!TIP]
+> 如果你已经被“隔一段时间回来又要复述十分钟”的重启税折磨过，RecallLoom 的目标很直接：让项目状态、关键决策和下一步留在项目里，让下一次 AI 协作接得上。
 
-If every time you switch to a supported coding agent, directory-based tool, or fresh session you spend ten minutes re-explaining the project, what is usually missing is not a smarter model. It is a layer of project continuity that does not disappear.
-
-RecallLoom keeps the project's why, what is true now, recent progress, and next move with the project itself instead of locking them inside one platform's private memory. It is not another dashboard, not a platform-bound memory silo, and not a black box that silently understands the whole repo for you. Its job is narrower: keep the project reality worth carrying forward inside the workspace so the next session can pick up where the last one left off.
-
-**Quick links:** [What problem it solves](#what-problem-it-solves) · [Who it fits best](#who-it-fits-best) · [Quick start](#quick-start) · [Built-in work modes](#built-in-work-modes) · [FAQ](#faq)
-
-<a id="what-problem-it-solves"></a>
-## 💥 What Problem It Solves
-
-If you already work across tools, models, and sessions, this probably feels familiar:
-
-- Every tool switch comes with another restart tax.
-- A fresh session can see what is in the repo, but not why it ended up this way.
-- A new agent can easily misread what is actually true right now.
-- As the project grows, old discussion and current conclusions start blurring together.
-
-What slows long-running AI work down is often not weak model quality. It is **broken project continuity**.
-
-RecallLoom is deliberately narrow. It does not try to understand everything from nothing. It keeps the project reality that has already been made explicit and is worth carrying forward.
-
-<p align="center">
-  <img src="./docs/images/readme-design-logic.en.png" alt="How project reality stays with the workspace" />
-</p>
-
-## 🧭 How It Works
-
-RecallLoom keeps a small, clear continuity structure inside the project. It does not pile every trace of history into one place. Instead, it separates the parts of project reality worth carrying forward into four pieces:
-
-- **Project background**: what this project is and why it is being done this way.
-- **Current state**: where things stand now and which judgments are still valid.
-- **Key progress**: what actually happened recently and which decisions are worth revisiting.
-- **Rules and boundaries**: what should be handled carefully and what should not be changed lightly.
-
-A new session does not need to ingest all prior history. Restore these four parts first, then decide what comes next. On first attach, RecallLoom does not hand the project to a silent black box and hope it "figures out" everything. The safer path is to restore these four layers of project reality and move forward from there.
-
-During initialization, restore, and writes, RecallLoom first checks whether the sidecar, runtime, and current state are trustworthy. When durable facts need to be captured, helper scripts use revision checks and freshness signals to make continuity updates safer.
-
-<p align="center">
-  <img src="./docs/images/readme-continuity-architecture-map.en.png" alt="RecallLoom continuity architecture map" />
-</p>
-
-<a id="who-it-fits-best"></a>
-## 🎯 Who It Fits Best
-
-RecallLoom is strongest for:
-
-- **People already using AI inside real projects**: especially solo builders and very small teams who keep handing the same project between different sessions, models, and agents.
-- **People who regularly switch between supported coding agents and directory-based tools**: and do not want to re-explain the project every time.
-- **Research writing, product docs, and software coordination work**: the kind of work where project intent, decisions, progress, and next steps are easy to lose.
-
-Typical high-value moments include:
-
-- **Coming back after time passes**: a day, a week, or longer later, without rebuilding the project from old chat history.
-- **Passing work across models or agents**: use Claude today, Codex, Gemini CLI, or another agent tomorrow, and keep the project state intact.
-- **Long-running research, PRD, or software coordination work**: work where current truth and historical logic are easy to lose.
-
-For one-off chats, disposable prompts, or work you never return to, RecallLoom will bring less benefit.
-
-<a id="built-in-work-modes"></a>
-## 🧩 Built-In Work Modes
-
-RecallLoom includes four built-in modes for four common project shapes. Research writing, product docs, and software coordination usually fit their matching modes. Mixed work, or work that still spans several shapes, falls back to General.
-
-| Mode | Best when | What it helps keep steady |
+| 记住什么 | 什么时候接力 | 记忆放在哪里 |
 |---|---|---|
-| General | The project mixes research, writing, product, code, or operations | The overall project reality, without narrowing the project too early |
-| Research | The work is driven by sources, claims, evidence, and long-form writing | Claims, evidence, and writing progress |
-| Product Docs | The work is driven by PRDs, RFCs, strategy docs, and stakeholder alignment | Scope, decisions, and open questions |
-| Software | The work is driven by engineering planning, repo execution, and implementation follow-through | Status, blockers, and next actions |
+| 背景、进展、关键决策、下一步 | 换会话、换模型、换工具、隔几天回来 | 项目内的 Markdown / JSON 文件 |
 
-Common prompts once the skill is installed:
+**快速跳转：** [为什么需要](#为什么需要-recallloom) · [30 秒开始](#30-秒开始) · [特性](#特性) · [核心能力](#核心能力) · [项目记忆循环](#项目记忆循环) · [适合与不适合](#适合与不适合) · [方案对比](#与常见方案对比) · [工程设计](#工程设计) · [版本迭代](#版本迭代) · [FAQ](#faq)
 
-- `continue this project`
-- `restore project context`
-- `pick up where we left off`
-- `record today's progress`
+## 🧭 为什么需要 RecallLoom
 
-## ✨ Why It Helps Without Becoming Heavy
+长期 AI 协作里，最耗人的常常是反复解释项目。
 
-RecallLoom is not trying to remember more. It is trying to keep the parts of project reality that actually matter over time, and to keep them separate instead of blending them into a longer and noisier note.
+你可能已经遇到过这些问题：
 
-| Part of the continuity structure | What it helps the next session recover |
-|---|---|
-| Project background | What this project is and how to approach it |
-| Current state | What is true right now |
-| Key progress | What actually happened, not just what was discussed |
-| Rules and boundaries | When to read carefully and when to write carefully |
+- 换会话、换模型，或隔几天回来，就要重新说明项目背景、当前进度和不能碰的边界。
+- 新 AI 工具能读到仓库里的文件，却不知道哪些事实已经过期、哪些结论仍然有效。
+- 平台记忆（memory）、聊天记录和项目文件分开存在，关键决策很难跟着项目一起走。
+- 项目一做久，“为什么这么做”“现在什么是真的”“下一步该接哪里”最容易丢。
 
-That gives the next session a smaller, steadier starting point instead of making it read everything first.
+RecallLoom 解决的是这层 **项目记忆** 和 **接力连续性**。
 
-## 🧱 These Choices Are Deliberate
+它把项目背景、当前状态、关键决策、最近进展和下一步，保存在项目旁边的受控文件里。下一次换会话、换模型、换工具，或隔几天回来时，新的 AI 工具可以先接上当前真相，再决定要不要深入历史材料。
 
-- **It does not pollute the project itself**: continuity state lives in a sidecar instead of being forced into your main code, docs, and repository structure.
-- **It does not pretend to understand the whole repo from zero**: it focuses on restoring project background, current state, key progress, and boundaries instead of acting like a universal repository reader.
-- **It defaults to the shortest trustworthy path**: reconnect the most important project reality first; only move to a heavier path when sources conflict, material is thin, risk is higher, or the user explicitly asks for a deeper review.
-- **Host memory is not a default source of truth**: if host-side memory is enabled, it still stays explicit, optional, and hint-only. It does not silently override what is in the workspace.
-- **It chooses clarity before automation**: it would rather make project reality explicit than hand the project over to a black box with blurry edges.
+这让“记忆”从聊天里的临时解释，变成项目里可读、可审、可继续维护的工程资产。
 
-<details>
-  <summary><strong>See how it maps into the project</strong></summary>
+这份 README 是 RecallLoom 的简明公开入口。安装和日常使用从这里开始；更细的命令用法见 [USAGE.md](./USAGE.md)，安装后的技能行为见 [skills/recallloom/SKILL.md](./skills/recallloom/SKILL.md)，完整仓库地图见 [INDEX.md](./INDEX.md)。
 
-| Plain-English layer | File in the project |
-|---|---|
-| Project background | `context_brief.md` |
-| Current state | `rolling_summary.md` |
-| Key progress | `daily_logs/YYYY-MM-DD.md` |
-| Rules and boundaries | `config.json`, `state.json`, optional `update_protocol.md` |
+## ⚡ 30 秒开始
 
-```text
-PROJECT_ROOT/
-├── your-project-files...
-└── .recallloom/                    # or recallloom/
-    ├── context_brief.md
-    ├── rolling_summary.md
-    ├── daily_logs/
-    ├── config.json
-    ├── state.json
-    ├── update_protocol.md          # optional
-    └── companion/                  # appears only when needed
-```
+目标很简单：安装一次，首次接入时初始化，之后在项目里直接说“继续这个项目”。
 
-</details>
+### 1. 安装 RecallLoom
 
-<a id="quick-start"></a>
-## 🚀 Quick Start
-
-On a first attach, you do not need to start from a special command. Four steps are enough:
-
-1. Install the skill locally.
-2. Explicitly invoke RecallLoom once in the conversation.
-3. If the project is not attached yet, confirm initialization; in hosts that expose the stable action name, you can also type `rl-init`.
-4. Continue the project normally.
-
-### Step 1: Install the skill package
-
-#### Option A: Skills CLI
-
-If your environment supports a Skills CLI such as [skills.sh](https://skills.sh/docs/cli), install directly from the repository:
+把下面命令复制到终端。如果你不想处理命令细节，可以把整行交给正在使用的 AI coding 工具执行：
 
 ```bash
 npx skills add https://github.com/Frappucc1no/recall-loom --skill recallloom
 ```
 
-v0.3.5 makes project resume faster, progress capture more structured, and managed updates easier to preview before they are applied.
-
-When you need to update installed skills later, use:
+之后需要更新已安装技能时：
 
 ```bash
 npx skills update
 ```
 
-#### Option B: Directory-based install
+### 2. 首次初始化（可选）
 
-If your tool uses a directory-based skills setup, install the whole package directory into the appropriate skills folder:
+如果这是第一次在当前项目使用 RecallLoom，需要先初始化项目记忆。已有 `.recallloom/` 的项目可以跳过这一步。
 
-```bash
-cp -R /path/to/recall-loom/skills/recallloom /path/to/<skills-dir>/recallloom
-
-# or
-ln -s /absolute/path/to/recall-loom/skills/recallloom /path/to/<skills-dir>/recallloom
-```
-
-### Step 2: Explicitly invoke RecallLoom once
-
-On first use, explicitly invoke RecallLoom in the conversation.
-
-Common ways to do that:
-
-- select `recallloom` from your host's skill picker
-- use `@recallloom`
-- or simply say: `Use RecallLoom for this project`
-
-### Step 3: Confirm first; use `rl-init` when needed
-
-If the agent determines that the project is not initialized yet, you only need to do one of two things:
-
-- confirm directly
-- or type `rl-init`
-
-It will initialize the sidecar, validate the workspace, and return a next-step suggestion.
-
-If the environment cannot provide a compatible Python `3.10+` runtime, the correct next move is to report that blocked state rather than hand-building `.recallloom/` or `recallloom/`.
-
-### Step 4: Continue the project normally
-
-After that, keep working as usual. Common prompts:
-
-| You can say | Best used when |
-|---|---|
-| `continue this project` | The project already has continuity files and you want to keep moving |
-| `restore project context` | You want to restore context first and decide what to do next |
-| `pick up where we left off` | You are returning to the same work after a previous session |
-| `record today's progress` | You want to capture meaningful progress in the continuity files |
-
-After a project is initialized, you can simply say `continue this project`, `restore project context`, or `pick up where we left off`. RecallLoom will read the existing continuity files first and restore the background, current state, and next step. A broader project review is only needed when the continuity files are missing, conflicting, clearly insufficient, or when you explicitly ask for a deeper review.
-
-If your tool exposes stable action names, you can also use `rl-resume` to trigger restore directly. Most of the time, natural language is enough.
-
-Generic prompts like `continue this project` only route directly when the host/router honors the RecallLoom restore contract. If your host does not give RecallLoom that first hop, explicitly invoke the skill once or use `rl-resume`.
-
-The more operator-oriented surface lives behind the same dispatcher: `quick-summary` for a low-latency restore snapshot, `append --entry-json` for structured daily-log appends, and `write --type ... --dry-run` for previewing safe managed writes before applying them. These are optional adoption paths for existing `v0.3.4` projects; the sidecar protocol stays `1.0`.
-
-For a more operator-oriented view of command entrypoints and helper flow, see [USAGE.md](./USAGE.md).
-
-## 📦 Package Structure
-
-<details>
-  <summary><strong>See the package shape</strong></summary>
+你可以用任意一种显式唤起方式：
 
 ```text
-recallloom/
-├── SKILL.md
-├── managed-assets.json
-├── profiles/
-├── references/
-├── scripts/
-├── native_commands/
-├── package-metadata.json
-└── ...
+@recallloom 初始化当前项目
+请用 RecallLoom 接管这个项目
+请用 RecallLoom 初始化这个项目
+rl-init
 ```
 
-| Part | Role |
-|---|---|
-| `SKILL.md` | Main entry file read by AI tools |
-| `managed-assets.json` | Required managed-asset registry used by packaged helpers |
-| `profiles/` | Default modes for different project shapes |
-| `references/` | Protocol details, file contracts, and operating notes |
-| `scripts/` | Helper scripts for the unified entrypoint, init, validation, status, bridge, and guarded writes |
-| `native_commands/` | Optional native command templates for supported hosts |
-| `package-metadata.json` | Version and capability metadata |
+也可以通过 AI 工具的技能选择器选择 `recallloom`，再说“初始化当前项目”。
 
-</details>
+> [!NOTE]
+> 首次接入会在项目旁边建立 RecallLoom 的项目记忆目录，用来保存背景、进展、关键决策和下一步。
+
+### 3. 日常使用：自然语言继续
+
+项目接入后，常用说法很自然：
+
+```text
+继续这个项目
+先帮我恢复项目上下文
+从上次停下的地方继续
+记录今天的关键进展
+```
+
+> [!TIP]
+> 在已接入的项目里，`继续这个项目` 会让 RecallLoom 先执行恢复步骤：先读取项目记忆，再进入具体任务。日常接力无需每次都写 `@recallloom`。
+
+### 4. 熟悉后可用短触发词
+
+这些词可以直接发给 AI 工具，作用类似更短的自然语言触发语：
+
+| 直接输入 | 你想做什么 |
+|---|---|
+| `rl-init` | **初始化项目记忆**，让 RecallLoom 接管当前项目 |
+| `rl-resume` | 恢复项目背景、当前状态和下一步 |
+| `rl-status` | 查看项目记忆是否完整、是否需要处理 |
+| `rl-validate` | 检查连续性文件有没有结构问题 |
+
+多数时候，说“继续这个项目”就够了；熟悉后再用短触发词提速。
 
 <details>
-  <summary><strong>See version info and runtime assumptions</strong></summary>
-
-### Version Info
+<summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.3.5`
-- protocol version: `1.0`
-- supported protocol versions:
+- 包版本：`0.4.0`
+- 协议版本：`1.0`
+- 当前支持的协议版本：
   - `1.0`
 <!-- RecallLoom metadata sync end: package-metadata -->
 
-### Release Notes
-
-<details>
-  <summary><strong>v0.3.5</strong></summary>
-
-- Resume existing projects faster with a compact current-state snapshot before deeper reading is needed.
-- Capture milestone progress through structured appends that keep daily-log entries ordered within each file.
-- Preview managed updates before applying them, so background, current-state, and daily-log writes stay deliberate.
-- Upgrade existing RecallLoom projects without a sidecar migration; protocol compatibility remains `1.0`.
-
 </details>
 
 <details>
-  <summary><strong>v0.3.4</strong></summary>
-
-- Better cross-day continuity: unfinished active work can carry into the next session more naturally, and read-side status guidance is more consistent.
-- Clearer trust and failure signals: structural trust, freshness, drift risk, workday state, and package-support state are kept separate instead of collapsed into one vague signal.
-- Lightweight package support checks: installed packages can read a daily support advisory; higher-risk actions are blocked when an upgrade is required, while ordinary network failure does not stop normal work by itself.
-- Stronger layered-write judgment: agents get clearer guidance on what belongs in project background, current state, daily progress, or nowhere, including safe outcomes such as wait, ask for confirmation, or split across layers.
-- Stronger time consistency: future dates, cross-day carryover, and manually selected dates now follow the same review rules, reducing the risk of polluted continuity timelines.
-
-</details>
-
-<details>
-  <summary><strong>v0.3.3</strong></summary>
-
-- Tightened first-initialization boundaries: initialization must go through the standard helper flow; missing runtime support is reported clearly instead of encouraging hand-built continuity files.
-- More reliable restore for initialized projects: continue / restore requests read existing continuity files first and avoid unnecessary broad exploration.
-- Reduced terminology in normal user-facing interactions, with more stable Chinese entry and cross-tool entry documentation.
-- Improved continuity writeback experience by reducing temporary handoff text the user has to manage.
-
-</details>
-
-<details>
-  <summary><strong>v0.3.2</strong></summary>
-
-- Added trusted cold start: when attaching to an existing project, RecallLoom can produce a reviewable project-reality proposal instead of treating empty templates as completion.
-- Moved protocol facts toward a single source of truth with a registry, schema, and documentation sync checks.
-- Split core module responsibilities so protocol, workspace runtime, freshness, and bridge-safety behavior are easier to maintain safely.
-- Closed public usability gaps around Chinese queries, path detection, wrapper paths, and first-use trust.
-
-</details>
-
-<details>
-  <summary><strong>v0.3.1</strong></summary>
-
-- Fixed `rl-init` as the standard first-attach action, combining initialization, validation, and next-step guidance into one entrypoint.
-- Added a unified dispatcher so agents and operators do not need to remember multiple lower-level scripts.
-- Added optional native command wrapper templates for hosts that can expose the same action semantics directly.
-- Shifted README, USAGE, SKILL, and adapter docs from script instructions toward a skill-package onboarding flow.
-
-</details>
-
-<details>
-  <summary><strong>v0.3.0</strong></summary>
-
-- Added read-only continuity query support for retrieving project background, current state, citations, freshness, and conflict signals by question.
-- Unified the read-side baseline across status, preflight, and query paths so new sessions start from the same project reality.
-- Fixed the safe commit path for project-local rules and established a minimal automated test baseline.
-- Added safety scanning before attached continuity text is bridged into host entry files.
-
-</details>
-
-<details>
-  <summary><strong>v0.2.2</strong></summary>
-
-- Completed the public brand cutover from the earlier ContextWeave line to RecallLoom.
-- Moved the installable skill package to `skills/recallloom/` and aligned public README, metadata, and install paths.
-- Changed the default continuity path to `.recallloom/`, aligning product name, package path, and runtime surface.
-
-</details>
-
-<details>
-  <summary><strong>0.2.1</strong></summary>
-
-- Strengthened the early public README, Chinese README, and install guidance.
-- Added the general project-continuity mode so mixed long-running projects did not have to be forced into research, product, or software too early.
-- Added early visual assets and clearer fit guidance for the package.
-
-</details>
-
-<details>
-  <summary><strong>0.1.0</strong></summary>
-
-- Established the earliest file-native continuity package: project background, current state, daily progress, configuration state, and local rules.
-- Added foundational helper scripts for initialization, validation, preflight checks, bridge management, archiving, write locks, and revision-aware writes.
-- Fixed the early protocol `1.0` file model and Python `3.10+` runtime assumptions.
-
-</details>
-
-### Runtime Assumptions
+<summary>使用环境与入口</summary>
 
 <!-- RecallLoom metadata sync start: runtime-assumptions -->
-- Python 3.10 or newer
-- supported workspace languages:
+- Python 版本要求：`3.10` 及以上
+- 支持的工作区语言：
   - `en`
   - `zh-CN`
-- supported bridge targets:
+- 支持的入口桥接文件：
   - `AGENTS.md`
   - `CLAUDE.md`
   - `GEMINI.md`
@@ -369,71 +142,183 @@ recallloom/
 
 </details>
 
-<details>
-  <summary><strong>See common install locations</strong></summary>
+## ✨ 特性
 
-| Environment | Recommended setup | Best when |
-|---|---|---|
-| Skills CLI ecosystem | Install with `npx skills add ... --skill recallloom`; update with `npx skills update` | You want one standard skill install and update flow |
-| Codex | Install into `.agents/skills/recallloom` | You want long-running project work inside a repo |
-| Supported directory-based coding agents | Install the whole directory into the agent's skills folder | You want user-level or project-level installation |
-| Other directory-based tools | Install the whole directory into that tool's skills folder | You want to reuse the same continuity files across tools |
+> [!TIP]
+> RecallLoom 的收益来自更短的恢复路径：少解释、少重读、少猜测，让 AI 工具先接上当前事实。
+
+| 特性 | 带来的价值 |
+|---|---|
+| **低重启税** | 换会话、换模型或隔几天回来时，先恢复项目状态 |
+| **更快接力** | 先看当前摘要、最近进展和下一步，快速进入状态 |
+| **更省上下文** | 先读小而准的项目记忆，深查只在需要时发生 |
+| **跨工具接力** | 换模型、换会话、换 AI 工具时，项目事实仍跟着工作区走 |
+| **写入更稳** | 进展记录、当前摘要和校验动作有明确路径，降低把过期事实写回项目记忆的风险 |
+| **文件化保存** | 记忆落在 Markdown / JSON 文件里，可读、可审、可迁移 |
+
+## 🧩 核心能力
+
+| 能力 | 对你意味着什么 |
+|---|---|
+| 恢复项目上下文 | 新的协作入口先接上当前事实，减少从零重建项目历史 |
+| 记录关键进展 | 把需要长期保留的进展、决策和下一步写回项目旁边 |
+| 校验连续性状态 | 在继续或写入前识别缺失、过期、冲突和需要人工确认的风险 |
+| 受控更新当前状态 | 写入前后保留修订、新鲜度和校验边界，降低误写旧事实的概率 |
+| 多工具接力 | Codex、Claude Code、Gemini 等工具都可以从同一套项目记忆继续 |
+
+这些能力连在一起，解决的是一个共同问题：下一次接手项目的 AI 工具，先知道当前真相，再开始行动。
+
+## 🔁 项目记忆循环
+
+RecallLoom 的核心模型可以概括成一个 **典型项目记忆循环**：
+
+<!-- R2 image slot: docs/images/readme-continuity-loop.zh-CN.png -->
+<p align="center">
+  <img src="./docs/images/readme-continuity-loop.zh-CN.png" alt="RecallLoom 项目记忆循环：恢复、推进、记录、校验、接力" />
+</p>
+
+```mermaid
+flowchart LR
+  A["恢复"] --> B["推进"]
+  B --> C["记录"]
+  C --> D["校验"]
+  D --> E["接力"]
+  E -. "下一次协作" .-> A
+```
+
+| 阶段 | 发生什么 |
+|---|---|
+| **恢复** | 新的协作入口先读取有限、当前、可信的项目事实 |
+| **推进** | AI 工具按恢复出的状态继续工作 |
+| **记录** | 把关键进展、决策和下一步写回项目记忆 |
+| **校验** | 检查连续性文件是否完整、过期或冲突 |
+| **接力** | 下一次会话从这些文件继续 |
+
+这套循环把“记忆”落成可检查的工程动作：先恢复可信事实，再推进工作，最后把新的关键事实写回项目。
+
+<details>
+<summary>项目记忆实际保存在哪里？</summary>
+
+循环背后对应几类文件：
+
+| 你关心的问题 | RecallLoom 保存在哪里 |
+|---|---|
+| 这个项目是什么，为什么这么做 | `context_brief.md` |
+| 当前进行到哪里，哪些事实仍然有效 | `rolling_summary.md` |
+| 最近真正发生了什么 | `daily_logs/YYYY-MM-DD.md` |
+| 哪些规则、边界和状态需要谨慎处理 | `config.json`、`state.json`、`update_protocol.md` |
 
 </details>
 
-<a id="faq"></a>
+## 🎯 适合与不适合
+
+RecallLoom 最适合这些场景：
+
+| 场景 | 价值 |
+|---|---|
+| 长期软件项目 | 让 AI 工具接上当前实现状态、关键决策、阻塞项和下一步 |
+| 产品 / PRD / RFC 写作 | 保留范围变化、决策原因、待定问题和协作脉络 |
+| 研究写作 | 维护论点、证据、来源边界和写作进度 |
+| 多 AI 工具接力 | 换模型、换工具、换会话时不丢项目现实 |
+| 私有或本地优先工作区 | 项目状态留在工作区内，更容易审计和迁移 |
+
+> [!IMPORTANT]
+> RecallLoom 专注项目连续性，不替代知识库、数据库、后台服务或自动执行框架。
+
+它不适合：
+
+- 一次性问答或临时聊天。
+- 只想要聊天记录摘要。
+- 需要工具自动整理整个仓库。
+- 需要完整知识库、后台服务或自动执行框架的系统。
+- 希望工具未经确认就自动抽取、自动合并、自动改写长期事实。
+
+## 🆚 与常见方案对比
+
+以下对照基于公开资料和常见使用方式，只比较相邻方案的定位边界，不做产品排名。很多方案可以和 RecallLoom 并存；当问题从“让工具按规则工作”升级为“让项目跨会话、跨工具持续接得上”时，RecallLoom 的价值更明显。
+
+| 类似方案 | 代表对象 | 更适合什么 | RecallLoom 的不同 |
+|---|---|---|---|
+| Agent 指令 / 规则文件 | `CLAUDE.md`、`AGENTS.md`、Cursor Rules、Continue rules | 保存编码规范、测试命令、项目约束和工具行为规则 | 保存项目当前事实、近期进展、关键决策和下一步，不只告诉 agent 怎么做 |
+| 平台内记忆 | Claude Code auto memory、ChatGPT Memory | 个人偏好、常用习惯和单一宿主内的连续体验 | 把可读上下文留在项目文件里，跟随工作区跨工具接力 |
+| 代码库上下文 / 检索 | Aider repo map、Continue context providers | 帮 agent 找到相关代码、文件、符号和外部资料 | 让 agent 先知道项目现在走到哪，再决定要深入哪些材料 |
+| 结构化 AI 项目记忆 | Cline Memory Bank、`project-brain` | 用 Markdown 显式保存项目 brief、active context、progress 和交接信息 | 保留文件化交接思路，同时提供可安装技能、明确桥接目标、状态检查、校验和受控更新路径 |
+| 人用知识库 / 团队 Wiki | Obsidian、Logseq、Notion | 研究笔记、链接知识、团队文档和长期检索 | 面向 AI 会话恢复，提供更短的当前状态恢复路径 |
+| 手工交接 | `HANDOFF.md`、session summary、README TODO、issue 记录 | 暂停一次、交接一次或记录任务列表 | 把一次性总结变成可持续维护、可审阅、可校验的项目记忆循环 |
+
+简化判断：rules 管“怎么做”，检索工具帮“看见什么”，知识库存“知道什么”；RecallLoom 更关注“项目现在在哪、下一步接哪里”。
+
+## 🏗️ 工程设计
+
+RecallLoom 的工程原则很简单：项目事实留在项目里，AI 工具只是进入项目的入口。
+
+<!-- R3 image slot: docs/images/readme-architecture-boundary.zh-CN.png -->
+<p align="center">
+  <img src="./docs/images/readme-architecture-boundary.zh-CN.png" alt="RecallLoom 工程边界：项目事实留在项目里，AI 工具只是入口" />
+</p>
+
+| 设计 | 含义 |
+|---|---|
+| 项目旁边的记忆目录 | `.recallloom/` 跟着工作区走，项目换工具时仍能恢复 |
+| 普通文件承载事实 | 关键状态写在可读的 Markdown / JSON 文件里，便于审阅、回退和迁移 |
+| 先当前，后历史 | 先读当前状态和关键事实，必要时再进入更深历史材料 |
+| 写入保护 | 更新长期事实前后检查修订、新鲜度和结构，降低把过期事实写回项目记忆的风险 |
+| 工具只负责接入 | Codex、Claude Code、Gemini 等工具负责唤起；项目事实由 RecallLoom 文件承载 |
+
+更细的脚本入口、协议和文件契约，放在 [`USAGE.md`](./USAGE.md) 与 [`skills/recallloom/references/`](./skills/recallloom/references/)。
+
+## 🕰️ 版本迭代
+
+| 版本 | 重点更新 | 对用户的价值 |
+|---|---|---|
+| `v0.4.0` | 更准确的恢复路径、更低摩擦的进展更新、更清楚的写入保护和工具边界 | 多会话、多模型、多工具接力更稳；记录进展后更容易知道下一步该同步什么 |
+| `v0.3.5` | 更快恢复、结构化进展记录、写入前预览、支持状态校验 | 当前项目更容易从已有项目记忆接上，写入前能看到风险提示 |
+| `v0.3.4` | 安装/更新状态检查、初始化隐私边界和安全写入基础 | 让更新状态和本地项目记忆更可控 |
+| `v0.3.x` | 用普通文件保存项目状态、统一入口、查询、每日记录、当前摘要的早期能力 | 建立 RecallLoom 的基础项目记忆模型 |
+
+## 🗺️ 文档入口
+
+| 你想做什么 | 去哪里 |
+|---|---|
+| 判断 RecallLoom 是否适合你 | 本 README |
+| 快速安装和恢复项目 | 本 README 的 30 秒开始 |
+| 查看脚本和操作细节 | [`USAGE.md`](./USAGE.md) |
+| 查看 AI 工具读取的技能说明 | [`skills/recallloom/SKILL.md`](./skills/recallloom/SKILL.md) |
+| 查看协议、文件契约和桥接细节 | [`skills/recallloom/references/`](./skills/recallloom/references/) |
+| 查看版本发布记录 | [GitHub Releases](https://github.com/Frappucc1no/recall-loom/releases) |
+
 ## ❓ FAQ
 
-<details>
-  <summary><strong>Will it automatically edit my project code?</strong></summary>
-  <p>No. Its primary concern is the continuity layer itself. Formal writes are meant to happen through explicit triggers and safer update paths.</p>
-</details>
+### RecallLoom 会自动改我的代码吗？
 
-<details>
-  <summary><strong>If there is barely any chat history or captured project state, will it still understand the whole project automatically?</strong></summary>
-  <p>No. RecallLoom is not a zero-context full-repo understanding engine. It works best when project background, current state, key progress, and boundaries have already been captured in a form the next session can restore. If those signals barely exist yet, it cannot magically invent a complete project reality.</p>
-</details>
+RecallLoom 的默认工作对象是项目连续性文件。业务代码仍由你和 AI 工具按正常流程修改；需要沉淀长期事实时，再通过受控脚本写入项目记忆。
 
-<details>
-  <summary><strong>Does it run silently in the background all the time?</strong></summary>
-  <p>No. It is not a background service. It is most useful at clear checkpoints: when you continue work, restore context, finish an important step, prepare a handoff, or capture meaningful progress.</p>
-</details>
+### 它和平台记忆是什么关系？
 
-<details>
-  <summary><strong>Can I attach it to a project that is already in progress?</strong></summary>
-  <p>Yes. In fact, many people first use it on a project that is already underway. Add stable background, current state, and important progress, and future sessions can continue more easily.</p>
-</details>
+平台记忆可以作为辅助提示。RecallLoom 的事实落点在项目旁边的记忆目录里，项目状态、关键决策和下一步保存在项目文件中。
 
-<details>
-  <summary><strong>Is it only for coding projects?</strong></summary>
-  <p>No. It also works well for research writing, product document collaboration, software project coordination, and mixed long-running projects. If a project does not clearly fit a specialized mode yet, General is the best place to start.</p>
-</details>
+### 它需要数据库、后台服务或 RAG 吗？
 
-<details>
-  <summary><strong>Do I need to maintain a lot of files every day?</strong></summary>
-  <p>No. The goal is a minimum useful continuity set, not turning every session into documentation work. Only durable project state that is actually worth keeping should be recorded.</p>
-</details>
+默认不需要。RecallLoom 用项目里的可读文本文件保存连续性事实，便于审阅、回退和迁移。
 
-<details>
-  <summary><strong>Why use a sidecar instead of writing directly into the main project files?</strong></summary>
-  <p>Because the separation matters. A sidecar lets continuity state stay next to the project and travel with it, while reducing noise in the project's primary code, docs, and repository structure.</p>
-</details>
+### 它适合非代码项目吗？
 
-If RecallLoom helps your work, a Star or a share helps more people who need this kind of continuity discover it.
+适合，只要这个项目需要跨天、跨会话、跨工具继续。研究写作、产品文档、RFC、课程项目和工程协调都可以受益。
 
-## 🙏 Acknowledgements
+### 已经存在的项目能接入吗？
 
-Thanks to the [Linux.do](https://linux.do) community, and you're welcome to share usage notes and ideas there too.
+可以。首次接入时，RecallLoom 会建立项目记忆目录，并把当前项目状态整理成后续可恢复的起点。它不会要求你把原项目目录结构改成某种专用格式。
 
-## 📚 Further Reading
+### 为什么不直接让 AI 工具读完整个仓库？
 
-- [SKILL.md](./skills/recallloom/SKILL.md)
-- [USAGE.md](./USAGE.md)
-- [profiles/](./skills/recallloom/profiles/)
-- [file-contracts.md](./skills/recallloom/references/file-contracts.md)
-- [package-support-policy.md](./skills/recallloom/references/package-support-policy.md)
-- [protocol.md](./skills/recallloom/references/protocol.md)
+完整仓库读取成本高，也不一定能判断哪些历史事实仍然有效。RecallLoom 先给 AI 工具一个更小、更可信的恢复入口，再在需要时进入更深材料。
+
+## 🙏 致谢
+
+感谢 [Linux.do 社区](https://linux.do/) 的讨论、反馈与支持。
 
 ## 📄 License
 
-This project is released under Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+Apache-2.0. See [`LICENSE`](./LICENSE).
+
+---
