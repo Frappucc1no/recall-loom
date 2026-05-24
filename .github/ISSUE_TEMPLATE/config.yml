@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reports / 安全报告
+    url: https://github.com/Frappucc1no/recall-loom/blob/main/SECURITY.md
+    about: Please do not open public issues for security vulnerabilities. / 请不要用公开 issue 报告安全漏洞。
+  - name: Documentation and support / 文档与支持
+    url: https://github.com/Frappucc1no/recall-loom/blob/main/SUPPORT.md
+    about: Check where to ask for help before opening an issue. / 开 issue 前请先查看支持说明。

@@ -1,0 +1,62 @@
+name: Question or support / 问题与支持
+description: Ask a focused usage, setup, or troubleshooting question. / 提出聚焦的使用、安装或排障问题。
+title: "question: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please ask a focused RecallLoom question. If you are reporting a
+        reproducible bug, use the bug report template instead.
+
+        请提出聚焦的 RecallLoom 问题。如果你要报告可复现 bug，请使用 bug 报告模板。
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic / 主题
+      options:
+        - install or update / 安装或更新
+        - first project setup / 首次项目接入
+        - restore project context / 恢复项目上下文
+        - record progress / 记录进展
+        - native commands / 原生命令
+        - documentation / 文档
+        - other / 其他
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: RecallLoom version / RecallLoom 版本
+      placeholder: "0.4.0"
+
+  - type: input
+    id: host
+    attributes:
+      label: Host tool, if relevant / 相关宿主工具
+      placeholder: "Codex, Claude Code, Gemini CLI, OpenCode, or another tool"
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question / 问题
+      description: What are you trying to understand or do? / 你想了解什么，或想完成什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant context / 相关背景
+      description: Include only redacted details that help answer the question. / 只提供有助于回答问题且已脱敏的信息。
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check / 隐私检查
+      options:
+        - label: I removed secrets, sensitive paths, personal context, and token-like values. / 我已移除密钥、敏感路径、个人上下文和形似 token 的值。
+          required: true

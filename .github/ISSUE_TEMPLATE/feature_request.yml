@@ -1,0 +1,71 @@
+name: Feature request / 功能建议
+description: Suggest a focused RecallLoom improvement. / 提出聚焦的 RecallLoom 改进建议。
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the workflow problem first. The most useful feature
+        requests explain what a user is trying to do and where RecallLoom gets
+        in the way.
+
+        请先描述工作流问题。最有价值的功能建议会说明用户想完成什么，以及 RecallLoom 当前卡在哪里。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Workflow problem / 工作流问题
+      description: What are you trying to do? / 你想完成什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / 期望行为
+      description: What should RecallLoom do differently? / 你希望 RecallLoom 怎么改？
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / 领域
+      options:
+        - install or update / 安装或更新
+        - restore project context / 恢复项目上下文
+        - record progress / 记录进展
+        - validate project memory / 校验项目记忆
+        - native commands / 原生命令
+        - documentation / 文档
+        - other / 其他
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host tool, if relevant / 相关宿主工具
+      placeholder: "Codex, Claude Code, Gemini CLI, OpenCode, or another tool"
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / 已考虑的替代方案
+      description: What workaround are you using today? / 你现在用什么方式绕过这个问题？
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Safety or privacy considerations / 安全或隐私考虑
+      description: Could this change affect local files, personal context, or helper output? / 这个变化会影响本地文件、个人上下文或 helper 输出吗？
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check / 范围检查
+      options:
+        - label: This request is about RecallLoom behavior, documentation, packaging, or supported host integration. / 这个请求与 RecallLoom 行为、文档、打包或宿主工具集成有关。
+          required: true

@@ -1,0 +1,96 @@
+name: Bug report / Bug 报告
+description: Report a reproducible RecallLoom problem. / 报告可复现的 RecallLoom 问题。
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please redact sensitive paths, secrets,
+        token-like values, and personal project memory before submitting.
+
+        感谢你报告问题。提交前请先移除敏感路径、密钥、形似 token 的值和个人项目记忆。
+
+  - type: input
+    id: version
+    attributes:
+      label: RecallLoom version / RecallLoom 版本
+      description: Example / 示例：0.4.0
+      placeholder: "0.4.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method / 安装方式
+      options:
+        - npx skills add
+        - npx skills update
+        - directory copy / 目录复制
+        - other / 其他
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host tool / 宿主工具
+      description: Codex, Claude Code, Gemini CLI, OpenCode, or another tool. / Codex、Claude Code、Gemini CLI、OpenCode 或其他工具。
+      placeholder: "Codex"
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment / 环境
+      description: Operating system and Python version. / 操作系统和 Python 版本。
+      placeholder: "macOS 15, Python 3.12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or prompt / 命令或提示语
+      description: What did you run or ask the AI tool to do? / 你运行了什么命令，或让 AI 工具做了什么？
+      placeholder: "rl-status"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 预期行为
+      description: What did you expect to happen? / 你预期会发生什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / 实际行为
+      description: What happened instead? / 实际发生了什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction / 最小复现
+      description: Provide the smallest safe example that reproduces the issue. / 请提供能复现问题的最小安全示例。
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Redacted output / 已脱敏输出
+      description: Paste only the relevant redacted output or error message. / 只粘贴相关且已脱敏的输出或错误信息。
+      render: text
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check / 隐私检查
+      options:
+        - label: I removed secrets, sensitive paths, personal context, and token-like values. / 我已移除密钥、敏感路径、个人上下文和形似 token 的值。
+          required: true
