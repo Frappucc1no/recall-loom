@@ -10,10 +10,11 @@
 
 <p><strong>Keep project context intact across AI sessions.</strong></p>
 
-<p>RecallLoom stores background, progress, key decisions, and next steps in project files, so the next AI session can continue from the current state.</p>
+<p>RecallLoom is a file-based project memory layer for AI collaboration. It stores background, progress, key decisions, and next steps in Markdown / JSON files beside or inside the project, with no database, RAG layer, or background service required; the next session, model, or tool can more easily start from the current state.</p>
 
 [![Release](https://img.shields.io/badge/release-v0.4.0-111827?style=flat-square)](./docs/releases/v0.4.0.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
+[![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-7c3aed?style=flat-square)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Frappucc1no/recall-loom?style=flat-square&logo=github&label=stars)](https://github.com/Frappucc1no/recall-loom/stargazers)
@@ -25,11 +26,9 @@
 > [!TIP]
 > If returning to a project means spending ten minutes re-explaining where everything stands, RecallLoom reduces that restart tax with a smaller, current, project-owned starting point.
 
-| What it keeps | When it helps | Where it lives |
-|---|---|---|
-| Background, progress, key decisions, next step | New session, new model, new tool, or coming back later | Markdown / JSON files in your project |
+**Quick links:** [Why](#why-recallloom) · [Start](#30-second-start) · [Features](#features) · [Loop](#project-memory-loop) · [Fit](#fit) · [Compare](#common-alternatives) · [Docs](#documentation-map) · [FAQ](#faq)
 
-**Quick links:** [Why](#why-recallloom) · [Start](#30-second-start) · [Features](#features) · [Core Capabilities](#core-capabilities) · [Project Memory Loop](#project-memory-loop) · [Fit](#fit) · [Compare](#common-alternatives) · [Design](#engineering-design) · [Version History](#version-history) · [Documentation Map](#documentation-map) · [FAQ](#faq)
+<a id="why-recallloom"></a>
 
 ## 🧭 Why RecallLoom
 
@@ -50,9 +49,15 @@ That turns memory from temporary chat context into a readable, reviewable, proje
 
 This README is the concise public entry point. Start here for setup and daily use; read [USAGE.md](./USAGE.md) for detailed commands, [skills/recallloom/SKILL.md](./skills/recallloom/SKILL.md) for installed skill behavior, and [INDEX.md](./INDEX.md) for the full repository map.
 
+<a id="30-second-start"></a>
+
 ## ⚡ 30-Second Start
 
-Install once. Initialize the project only when needed. After that, continue with plain language.
+Install once. Initialize the project only when needed. After that, in a host with the skill available, continue with plain language.
+
+Prerequisites: Node/npm/npx, Python `3.10+`, and an AI coding host that can install/read skills.
+
+Capability note: skills installation makes RecallLoom readable by the tool; `@recallloom` is a bridge/skill invocation; native `rl-*` shortcuts are host-dependent.
 
 ### 1. Install RecallLoom
 
@@ -68,11 +73,11 @@ To update installed skills later:
 npx skills update
 ```
 
-### 2. First-Time Initialization (Optional)
+### 2. Initialize If Not Attached
 
-If this is the first time RecallLoom is used in the current project, initialize project memory first. If the project already has a valid `.recallloom/` directory, you can skip this step.
+If this is the first time RecallLoom is used in the current project, initialize project memory first. If the project already has a valid `.recallloom/` or `recallloom/` directory, you can skip this step; if both exist, stop and inspect the project state first.
 
-Any of these explicit invocations can work:
+Any of these explicit invocations can work (`@recallloom` only works when the current host supports @ skill mentions; otherwise use plain language or the skill picker):
 
 ```text
 @recallloom initialize this project
@@ -102,7 +107,7 @@ record today's key progress
 
 ### 4. Short Triggers for Familiar Users
 
-These can be typed directly into an AI tool as shorter action phrases:
+In supported hosts, these can be typed directly into an AI tool as shorter action phrases:
 
 | Direct input | What you want |
 |---|---|
@@ -111,7 +116,9 @@ These can be typed directly into an AI tool as shorter action phrases:
 | `rl-status` | Check whether project memory is complete and ready |
 | `rl-validate` | Check continuity files for structural issues |
 
-Most of the time, `continue this project` is enough. Use short triggers when you want a faster operator-style path.
+If your current host does not recognize `rl-*`, use the plain-language prompts above.
+
+Most of the time, `continue this project` is enough. Use short triggers when you want a shorter path.
 
 <details>
 <summary>Version and compatibility</summary>
@@ -142,6 +149,8 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 
 </details>
 
+<a id="features"></a>
+
 ## ✨ Features
 
 > [!TIP]
@@ -153,8 +162,10 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 | **Faster handoffs** | Start from the current summary, recent progress, and next step |
 | **Context-efficient restore** | Read small, focused project memory first; go deeper only when needed |
 | **Cross-tool continuity** | Keep project state with the workspace across models, sessions, and AI tools |
-| **Controlled memory updates** | Use clear paths for progress records, current summaries, and validation |
+| **Controlled memory updates** | Use clear paths for progress records, current summaries, and validation, reducing the risk of writing stale facts back into project memory |
 | **Plain files** | Store memory in Markdown / JSON files that are readable, reviewable, and portable |
+
+<a id="core-capabilities"></a>
 
 ## 🧩 Core Capabilities
 
@@ -164,9 +175,19 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 | Record key progress | Durable progress, decisions, and next steps are written back next to the project |
 | Validate continuity state | Missing, stale, conflicting, or risky continuity files are easier to spot |
 | Guard current-state updates | Revision and freshness checks reduce accidental stale writes |
-| Handoff across tools | Keep handoff files readable across AI tool workflows such as Codex, Claude Code, Gemini, and others |
+| Handoff across tools | Keep handoff files readable across AI tool workflows such as Codex, Claude Code, Gemini, and others when the relevant entry files are available |
 
 Together, these capabilities solve one problem: the next AI session should know the current project state before it starts acting.
+
+<a id="design-principles"></a>
+
+## 🧱 Design Principles
+
+- **The project owns its memory.** Key state lives in plain files beside or inside the project, not only in one chat or one platform memory.
+- **Current before complete.** Restore current facts, recent progress, and the next step first; go deeper into history only when needed.
+- **AI coding hosts are entry points.** When a host supports skills or the relevant entry files, it can read or invoke RecallLoom; durable facts stay in RecallLoom files for review and movement.
+
+<a id="project-memory-loop"></a>
 
 ## 🔁 Project Memory Loop
 
@@ -199,14 +220,18 @@ The loop makes memory inspectable: restore trusted current facts, do the work, t
 <details>
 <summary>Where is project memory stored?</summary>
 
+Behind the loop are a few file types:
+
 | Question | RecallLoom file |
 |---|---|
 | What is this project and why is it shaped this way? | `context_brief.md` |
-| Where does the project stand now? | `rolling_summary.md` |
+| Where does the project stand now, and which facts are still valid? | `rolling_summary.md` |
 | What actually happened recently? | `daily_logs/YYYY-MM-DD.md` |
 | Which rules, boundaries, and state need care? | `config.json`, `state.json`, `update_protocol.md` |
 
 </details>
+
+<a id="fit"></a>
 
 ## 🎯 Fit
 
@@ -217,34 +242,40 @@ RecallLoom is a good fit for:
 | Long-running software projects | Keep implementation state, decisions, blockers, and next steps recoverable |
 | Product docs / PRDs / RFCs | Preserve scope changes, decision reasons, open questions, and collaboration context |
 | Research writing | Track claims, evidence, source boundaries, and writing progress |
-| Multi-tool AI work | Move across models, tools, and sessions without losing the current project state |
-| Private or local-first workspaces | Keep project state inside the workspace, easier to review and move |
+| Multi-tool AI work | Move across models, tools, and sessions while reducing loss of current project state |
+| Private or local-first workspaces | Keep project state inside the workspace for easier review and movement; privacy still depends on your sync and hosting setup |
 
 > [!IMPORTANT]
-> RecallLoom focuses on project continuity. It does not replace a knowledge base, database, backend service, or autonomous agent framework.
+> RecallLoom focuses on project continuity. It does not replace a knowledge base, database, backend service, or automation / execution framework.
 
 It is not meant for:
 
 - One-off questions or disposable chats.
 - Chat-history summaries only.
 - Automatic whole-repo organization.
-- Full knowledge-base, backend-service, or autonomous-agent systems.
+- Task orchestration, step scheduling, or multi-agent execution; RecallLoom only maintains project-continuity state.
+- Full knowledge-base, backend-service, or automation / execution-framework systems.
 - Silent extraction, merging, or rewriting of long-term facts without confirmation.
+
+<a id="common-alternatives"></a>
 
 ## 🆚 Common Alternatives
 
-This comparison is based on public docs and common usage patterns. It is not a ranking: most of these approaches can live alongside RecallLoom. The difference matters when the problem is no longer only "make the tool follow rules", but "let a project resume across sessions, tools, and collaborators."
+This comparison is based on public docs and common usage patterns. It is not a ranking: most of these approaches can live alongside RecallLoom. The useful question is whether you need to guide how a tool works, help it find relevant material, move tasks or execution forward, or give the next session a reliable place to resume.
 
-| Adjacent approach | Representative examples | Best for | Where RecallLoom is different |
-|---|---|---|---|
-| Agent instructions / rules | `CLAUDE.md`, `AGENTS.md`, Cursor Rules, Continue rules | Coding conventions, test commands, project constraints, and tool behavior | Keeps current facts, recent progress, decisions, and the next step, not only behavior rules |
-| Platform memory | Claude Code auto memory, ChatGPT Memory | Preferences, habits, and continuity inside one host tool | Keeps readable context in project files so handoffs can move with the workspace |
-| Codebase context / retrieval | Aider repo map, Continue context providers | Finding relevant code, files, symbols, and external context | Helps a new session understand where the project stands before going deeper |
-| Structured AI project memory | Cline Memory Bank, `project-brain` | Explicit Markdown project brief, active context, progress, and handoff state | Keeps the file-based handoff model, while packaging it as an installable skill with explicit bridge targets, status checks, validation, and guarded update paths |
-| Human knowledge bases / team wiki | Obsidian, Logseq, Notion | Research notes, linked knowledge, team docs, and long-term lookup | Gives AI sessions a shorter current-state restore path instead of a broad knowledge library |
-| Manual handoff | `HANDOFF.md`, session summary, README TODOs, issue notes | One-time pause points, task lists, or end-of-session summaries | Turns handoff notes into a maintainable, reviewable, checkable project-memory loop |
+| What You Are Choosing | Representative Options | Main Use | When It Is Enough | What RecallLoom Adds |
+|---|---|---|---|---|
+| Agent rules / instruction files | [`AGENTS.md`](https://agents.md/), `CLAUDE.md`, `GEMINI.md`, [Cursor Rules](https://cursor.com/docs/rules) | Tell AI tools coding conventions, test commands, project constraints, and working style | The main problem is "the agent is not following this repo's rules" | Rules guide how to work; RecallLoom keeps where the project stands, why, and where to resume |
+| Host built-in memory | [Claude Code memory](https://code.claude.com/docs/en/memory), Cursor Memories, ChatGPT Memory, Gemini CLI memory | Keep preferences, habits, and some cross-chat context inside one host | You mostly stay in one host and mainly need preferences or long-term habits remembered | Puts project continuity into readable, reviewable files that can move with the project |
+| Project memory / AI coding harness | [Trellis](https://github.com/mindfold-ai/Trellis) and similar tools | A broader team AI coding harness: specs, workflows, task context, memory, and multi-platform access | You need a team AI coding workbench, not only a handoff memory layer | RecallLoom is narrower: project continuity through current state, decisions, recent progress, and a restore entry point |
+| Task graph / issue memory | [Beads](https://github.com/steveyegge/beads), git-backed issue/task graphs | Maintain structured tasks, dependencies, status, and issue relationships | You need to manage a task graph, priorities, dependencies, or issue flow | RecallLoom is not an issue tracker; it maintains current state, decisions, recent progress, and handoff summaries |
+| Workflow orchestrators | [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) and similar frameworks | Orchestrate agent / workflow execution state, persistence, and recovery | You need to resume program execution, node state, or a runtime workflow | RecallLoom restores human-and-AI project collaboration context; it does not replace a runtime or orchestrator |
+| RAG / vector databases | LangChain RAG, [Chroma](https://docs.trychroma.com/docs/embeddings/embedding-functions), [Qdrant](https://qdrant.tech/documentation/) | Retrieve relevant chunks, documents, or semantic context from large material sets | The problem is "there is a lot of material, and I need the relevant parts" | Maintains a small, trusted project restore point; it does not replace a knowledge base, RAG, or vector database |
+| Handwritten README / docs / handoff notes | `HANDOFF.md`, README TODOs, session summaries, team wikis | Leave human-readable notes, task lists, or one-time pause points | The project is short, or you only need one manual handoff | Turns handoff notes into a repeatable, reviewable, checkable recovery loop |
 
-Simple rule: rules guide how to work; retrieval shows what to inspect; knowledge bases store what people know; RecallLoom keeps where the project stands and where to resume.
+Simple rule: rules guide how to work; retrieval shows what to inspect; harnesses, issue tools, and orchestrators manage tasks or execution; knowledge bases store long-term material. RecallLoom focuses on where the project stands, where to resume, and how those facts can be restored by the next AI session.
+
+<a id="engineering-design"></a>
 
 ## 🏗️ Engineering Design
 
@@ -261,9 +292,18 @@ RecallLoom follows a simple engineering rule: project facts stay with the projec
 | Plain files for durable facts | Key state lives in readable Markdown / JSON files that can be reviewed, rolled back, and moved |
 | Current before history | Read current state and key facts first; go deeper only when needed |
 | Write guards | Check revisions, freshness, and structure before updating long-term project facts |
-| Tools as entry points | AI tools invoke RecallLoom; RecallLoom files carry the project state |
+| Tools as entry points | AI tools can invoke RecallLoom when supported; RecallLoom files carry the project state |
 
 Detailed script entrypoints, protocol notes, and file contracts live in [`USAGE.md`](./USAGE.md) and [`skills/recallloom/references/`](./skills/recallloom/references/).
+
+### Safety and Trust
+
+- Project memory is stored as plain files near the workspace by default, so changes can be reviewed, diffed, rolled back, and moved.
+- RecallLoom does not require a database, RAG layer, or background service.
+- Diagnostic, read, and write paths have clear boundaries; long-term fact updates check revision, freshness, and structure.
+- Privacy depends on how you sync, commit, host, or share these project files.
+
+<a id="version-history"></a>
 
 ## 🕰️ Version History
 
@@ -274,6 +314,8 @@ Detailed script entrypoints, protocol notes, and file contracts live in [`USAGE.
 | `v0.3.4` | Install/update status checks, initialization privacy boundaries, safer write foundations | Update state and local project memory are easier to control |
 | `v0.3.x` | Plain-file project state, unified entrypoints, query support, daily logs, and current summaries | The base project-memory model for RecallLoom |
 
+<a id="documentation-map"></a>
+
 ## 🗺️ Documentation Map
 
 | Goal | Start here |
@@ -283,37 +325,64 @@ Detailed script entrypoints, protocol notes, and file contracts live in [`USAGE.
 | See script and command details | [`USAGE.md`](./USAGE.md) |
 | See the skill entry read by AI tools | [`skills/recallloom/SKILL.md`](./skills/recallloom/SKILL.md) |
 | See protocol, file contracts, and bridge details | [`skills/recallloom/references/`](./skills/recallloom/references/) |
+| Contribute changes or improvements | [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
+| Get support or report usage issues | [`SUPPORT.md`](./SUPPORT.md) |
+| Report a security issue | [`SECURITY.md`](./SECURITY.md) |
 | See release history | [GitHub Releases](https://github.com/Frappucc1no/recall-loom/releases) |
+
+<a id="faq"></a>
 
 ## ❓ FAQ
 
-### Will RecallLoom automatically edit my code?
+<details>
+<summary>Will RecallLoom automatically edit my code?</summary>
 
 No. RecallLoom's default working surface is the project-continuity files. Product code, docs, and other project files are still changed through your normal workflow. Durable facts are written back through controlled project-memory paths when needed.
 
-### How is this different from platform memory?
+</details>
+
+<details>
+<summary>How is this different from platform memory?</summary>
 
 Platform memory can be useful as a hint. RecallLoom keeps the durable project state next to the project itself: current state, key decisions, progress, and next steps live in project files.
 
-### Does it require a database, backend service, or RAG?
+</details>
 
-No by default. RecallLoom uses a plain-file model: readable, reviewable, rollback-friendly text files hold the continuity state.
+<details>
+<summary>Does it require a database, backend service, or RAG?</summary>
 
-### Does it work for non-code projects?
+No. RecallLoom is not a database, vector store/RAG layer, or background service. It uses readable project text files to hold continuity state, so the state stays reviewable, rollback-friendly, and portable.
+
+</details>
+
+<details>
+<summary>Does it work for non-code projects?</summary>
 
 Yes. It fits any project that spans days, sessions, models, or tools. Research writing, product docs, RFCs, course projects, and engineering coordination can all benefit.
 
-### Can I attach it to an existing project?
+</details>
+
+<details>
+<summary>Can I attach it to an existing project?</summary>
 
 Yes. On first attach, RecallLoom creates project memory and turns the current project state into a recoverable starting point. It does not require you to reshape the project into a special directory layout.
 
-### Why not just ask the AI tool to read the whole repo?
+</details>
+
+<details>
+<summary>Why not just ask the AI tool to read the whole repo?</summary>
 
 Reading the whole repo costs more and still does not tell the tool which old facts are stale or which decisions are current. RecallLoom gives the tool a smaller, more trusted restore point first, then deeper material can be read when needed.
+
+</details>
+
+<a id="acknowledgements"></a>
 
 ## 🙏 Acknowledgements
 
 Thanks to the [Linux.do community](https://linux.do/) for discussion, feedback, and support.
+
+<a id="license"></a>
 
 ## 📄 License
 
