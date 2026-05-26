@@ -12,7 +12,7 @@
 
 <p>RecallLoom 是给 AI 协作使用的文件化项目记忆层：把背景、进展、关键决策和下一步保存到项目旁边/项目内的 Markdown / JSON 文件里，不需要数据库、RAG 或后台服务。换会话、换模型、换工具，下一次 AI 协作更容易接上当前状态。</p>
 
-[![Release](https://img.shields.io/badge/release-v0.4.0-111827?style=flat-square)](./docs/releases/v0.4.0.md)
+[![Version](https://img.shields.io/badge/version-v0.4.1-111827?style=flat-square)](./docs/releases/v0.4.1.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- 包版本：`0.4.0`
+- 包版本：`0.4.1`
 - 协议版本：`1.0`
 - 当前支持的协议版本：
   - `1.0`
@@ -309,6 +309,7 @@ RecallLoom 的工程原则很简单：项目事实留在项目里，AI 工具只
 
 | 版本 | 重点更新 | 对用户的价值 |
 |---|---|---|
+| `v0.4.1` | 后续安全加固、恢复来源输入加固、离线支持状态的写入保护、公开失败路径脱敏和恢复目录边界收紧 | 在保持协议兼容的同时，降低异常输入、陈旧支持状态和本地路径暴露带来的操作风险 |
 | `v0.4.0` | 更准确的恢复路径、更低摩擦的进展更新、更清楚的写入保护和工具边界 | 多会话、多模型、多工具接力更稳；记录进展后更容易知道下一步该同步什么 |
 | `v0.3.5` | 更快恢复、结构化进展记录、写入前预览、支持状态校验 | 当前项目更容易从已有项目记忆接上，写入前能看到风险提示 |
 | `v0.3.4` | 安装/更新状态检查、初始化隐私边界和安全写入基础 | 让更新状态和本地项目记忆更可控 |

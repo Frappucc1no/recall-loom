@@ -15,6 +15,11 @@ from core.coldstart.structured import (
     detect_source_tiers,
     extract_structured_sections,
 )
+from core.safety.prepared_input import (
+    PreparedInputSafetyError,
+    read_prepared_input_source_text,
+    validate_prepared_input_source_path,
+)
 
 from _common import (
     cli_failure_payload,
@@ -22,14 +27,20 @@ from _common import (
     ConfigContractError,
     EnvironmentContractError,
     enforce_package_support_gate,
+    ensure_managed_directory_chain,
     ensure_supported_python_version,
+    exit_if_startup_scratch_residue_for_sources,
     exit_with_cli_error,
+    exit_with_failure_contract,
     find_recallloom_root,
     LockBusyError,
+    ManagedDirectorySafetyError,
     now_iso_timestamp,
+    public_project_path,
+    publicize_text_paths,
     public_json_payload,
-    read_text,
     StorageResolutionError,
+    scan_auto_attached_context_text,
     text_digest,
     validate_recovery_proposal_text,
     workspace_write_lock,
@@ -39,6 +50,7 @@ from _common import (
 
 FILENAME_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{6}$")
 SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
+DEFAULT_MAX_INPUT_BYTES = 4 * 1024 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +88,79 @@ def resolve_filename_stamp(raw_value: str | None) -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d-%H%M%S")
 
 
+def exit_prepared_input_safety_error(
+    parser,
+    *,
+    json_mode: bool,
+    error: PreparedInputSafetyError,
+) -> None:
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=error.message,
+        reason="invalid_prepared_input",
+        details=error.details,
+    )
+
+
+def read_recovery_source_file(
+    parser,
+    *,
+    json_mode: bool,
+    raw_source_file: str,
+    project_root: Path,
+    storage_root: Path,
+) -> tuple[Path, str]:
+    try:
+        source = validate_prepared_input_source_path(
+            raw_source_file,
+            project_root=project_root,
+            storage_root=storage_root,
+            input_role="source-file",
+            label="source",
+        )
+        body_text = read_prepared_input_source_text(
+            source,
+            max_input_bytes=DEFAULT_MAX_INPUT_BYTES,
+            label="source",
+        )
+    except PreparedInputSafetyError as exc:
+        exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
+    if not body_text.strip():
+        message = "Source file is empty."
+        exit_with_cli_error(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "invalid_prepared_input",
+                error=message,
+                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
+            ),
+        )
+    attach_scan = scan_auto_attached_context_text(body_text)
+    if attach_scan["blocked"]:
+        message = (
+            "Refusing to stage recovery proposal because the prepared source failed "
+            "the attached-text safety scan: "
+            + ", ".join(attach_scan["hard_block_reasons"])
+        )
+        exit_with_cli_error(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "attach_scan_blocked",
+                error=message,
+                details={"hard_block_reasons": attach_scan["hard_block_reasons"]},
+            ),
+        )
+    return source.path, body_text
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -91,53 +176,39 @@ def main() -> None:
         )
     enforce_package_support_gate(parser, json_mode=args.json)
 
-    source_path = Path(args.source_file).expanduser().resolve()
-    if not source_path.is_file():
-        message = "Source file does not exist or is not a regular file."
+    try:
+        workspace = find_recallloom_root(args.path)
+    except (StorageResolutionError, ConfigContractError) as exc:
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
-            ),
+            message=str(exc),
+            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+        )
+    if workspace is None:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=1,
+            message="No RecallLoom project root found.",
+            payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
         )
 
-    try:
-        body_text = read_text(source_path)
-    except (OSError, UnicodeDecodeError) as exc:
-        message = "Source file could not be read."
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={
-                    "source_file_ref": "provided_source_file",
-                    "side_effect": "none",
-                    "error_type": type(exc).__name__,
-                },
-            ),
-        )
-    if not body_text.strip():
-        message = "Source file is empty."
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
-            ),
-        )
+    exit_if_startup_scratch_residue_for_sources(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        source_paths=[args.source_file],
+    )
+    source_path, body_text = read_recovery_source_file(
+        parser,
+        json_mode=args.json,
+        raw_source_file=args.source_file,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
     proposal_errors = validate_recovery_proposal_text(body_text)
     if proposal_errors:
         message = "Invalid recovery proposal content:\n- " + "\n- ".join(proposal_errors)
@@ -165,37 +236,35 @@ def main() -> None:
             payload=cli_failure_payload("invalid_prepared_input", error=str(exc)),
         )
 
-    try:
-        workspace = find_recallloom_root(args.path)
-    except (StorageResolutionError, ConfigContractError) as exc:
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
-        )
-    if workspace is None:
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=1,
-            message="No RecallLoom project root found.",
-            payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
-        )
-
     proposals_dir = workspace.storage_root / "companion" / "recovery" / "proposals"
-    review_log_dir = workspace.storage_root / "companion" / "recovery" / "review_log"
-    archive_dir = workspace.storage_root / "companion" / "recovery" / "archive"
     target_path = proposals_dir / f"{filename_stamp}-{proposal_id}.md"
 
     try:
         with workspace_write_lock(workspace.project_root, "stage_recovery_proposal.py"):
-            proposals_dir.mkdir(parents=True, exist_ok=True)
-            review_log_dir.mkdir(parents=True, exist_ok=True)
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            if target_path.exists():
-                message = f"Refusing to overwrite an existing recovery proposal: {target_path}"
+            proposals_dir = ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "proposals"),
+                project_root=workspace.project_root,
+            )
+            ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "review_log"),
+                project_root=workspace.project_root,
+            )
+            ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "archive"),
+                project_root=workspace.project_root,
+            )
+            target_path = proposals_dir / f"{filename_stamp}-{proposal_id}.md"
+            try:
+                target_path.lstat()
+                target_exists = True
+            except FileNotFoundError:
+                target_exists = False
+            if target_exists:
+                public_target = public_project_path(target_path, project_root=workspace.project_root) or target_path.name
+                message = f"Refusing to overwrite an existing recovery proposal: {public_target}"
                 exit_with_cli_error(
                     parser,
                     json_mode=args.json,
@@ -207,23 +276,49 @@ def main() -> None:
                         details={"proposal_path": str(target_path)},
                     ),
                 )
+            ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "proposals"),
+                project_root=workspace.project_root,
+                create=False,
+                )
             write_text(target_path, body_text.rstrip("\n") + "\n")
     except LockBusyError as exc:
+        public_message = publicize_text_paths(
+            str(exc),
+            project_root=workspace.project_root,
+        ) or "Refusing to continue because another RecallLoom mutating operation appears to be running."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=3,
-            message=str(exc),
-            payload=cli_failure_payload("write_lock_busy", error=str(exc)),
+            message=public_message,
+            payload=cli_failure_payload("write_lock_busy", error=public_message),
+        )
+    except ManagedDirectorySafetyError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=exc.message,
+            payload=cli_failure_payload(
+                exc.failure_reason,
+                error=exc.message,
+                details=exc.details,
+            ),
         )
     except (OSError, UnicodeDecodeError) as exc:
-        message = f"Filesystem error: {exc}"
+        message = "Filesystem error while writing recovery proposal."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=2,
             message=message,
-            payload=cli_failure_payload("damaged_sidecar", error=message),
+            payload=cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                details={"error_type": type(exc).__name__},
+            ),
         )
 
     payload = {
@@ -247,7 +342,8 @@ def main() -> None:
             )
         )
     else:
-        print(f"Staged recovery proposal: {target_path}")
+        public_target = public_project_path(target_path, project_root=workspace.project_root) or target_path.name
+        print(f"Staged recovery proposal: {public_target}")
 
 
 if __name__ == "__main__":

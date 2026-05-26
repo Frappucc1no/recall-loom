@@ -12,6 +12,11 @@ from core.coldstart.structured import (
     classify_review_action,
     extract_structured_sections,
 )
+from core.safety.prepared_input import (
+    PreparedInputSafetyError,
+    read_prepared_input_source_text,
+    validate_prepared_input_source_path,
+)
 
 from _common import (
     cli_failure_payload,
@@ -19,20 +24,29 @@ from _common import (
     ConfigContractError,
     EnvironmentContractError,
     enforce_package_support_gate,
+    ensure_managed_directory_chain,
     ensure_supported_python_version,
+    exit_if_startup_scratch_residue_for_sources,
     exit_with_cli_error,
+    exit_with_failure_contract,
     find_recallloom_root,
     LockBusyError,
+    ManagedDirectorySafetyError,
     now_iso_timestamp,
+    public_project_path,
+    publicize_text_paths,
     public_json_payload,
     read_text,
     RECOVERY_PROPOSAL_FILE_RE,
     StorageResolutionError,
+    scan_auto_attached_context_text,
     text_digest,
     validate_recovery_review_text,
     workspace_write_lock,
     write_text,
 )
+
+DEFAULT_MAX_INPUT_BYTES = 4 * 1024 * 1024
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +62,79 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-file", required=True, help="Path to prepared review markdown content.")
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
+
+
+def exit_prepared_input_safety_error(
+    parser,
+    *,
+    json_mode: bool,
+    error: PreparedInputSafetyError,
+) -> None:
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=error.message,
+        reason="invalid_prepared_input",
+        details=error.details,
+    )
+
+
+def read_recovery_source_file(
+    parser,
+    *,
+    json_mode: bool,
+    raw_source_file: str,
+    project_root: Path,
+    storage_root: Path,
+) -> tuple[Path, str]:
+    try:
+        source = validate_prepared_input_source_path(
+            raw_source_file,
+            project_root=project_root,
+            storage_root=storage_root,
+            input_role="source-file",
+            label="source",
+        )
+        body_text = read_prepared_input_source_text(
+            source,
+            max_input_bytes=DEFAULT_MAX_INPUT_BYTES,
+            label="source",
+        )
+    except PreparedInputSafetyError as exc:
+        exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
+    if not body_text.strip():
+        message = "Source file is empty."
+        exit_with_cli_error(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "invalid_prepared_input",
+                error=message,
+                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
+            ),
+        )
+    attach_scan = scan_auto_attached_context_text(body_text)
+    if attach_scan["blocked"]:
+        message = (
+            "Refusing to record recovery review because the prepared source failed "
+            "the attached-text safety scan: "
+            + ", ".join(attach_scan["hard_block_reasons"])
+        )
+        exit_with_cli_error(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "attach_scan_blocked",
+                error=message,
+                details={"hard_block_reasons": attach_scan["hard_block_reasons"]},
+            ),
+        )
+    return source.path, body_text
 
 
 def resolve_proposal_path(raw_value: str, proposals_dir: Path, project_root: Path) -> Path:
@@ -78,67 +165,6 @@ def main() -> None:
         )
     enforce_package_support_gate(parser, json_mode=args.json)
 
-    source_path = Path(args.source_file).expanduser().resolve()
-    if not source_path.is_file():
-        message = "Source file does not exist or is not a regular file."
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
-            ),
-        )
-    try:
-        body_text = read_text(source_path)
-    except (OSError, UnicodeDecodeError) as exc:
-        message = "Source file could not be read."
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={
-                    "source_file_ref": "provided_source_file",
-                    "side_effect": "none",
-                    "error_type": type(exc).__name__,
-                },
-            ),
-        )
-    if not body_text.strip():
-        message = "Source file is empty."
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
-            ),
-        )
-    review_errors = validate_recovery_review_text(body_text)
-    if review_errors:
-        message = "Invalid recovery review content:\n- " + "\n- ".join(review_errors)
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "invalid_prepared_input",
-                error=message,
-                details={"review_errors": review_errors},
-            ),
-        )
-
     try:
         workspace = find_recallloom_root(args.path)
     except (StorageResolutionError, ConfigContractError) as exc:
@@ -158,13 +184,60 @@ def main() -> None:
             payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
         )
 
-    proposals_dir = workspace.storage_root / "companion" / "recovery" / "proposals"
+    exit_if_startup_scratch_residue_for_sources(
+        parser,
+        json_mode=args.json,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        source_paths=[args.source_file],
+    )
+    source_path, body_text = read_recovery_source_file(
+        parser,
+        json_mode=args.json,
+        raw_source_file=args.source_file,
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
+    review_errors = validate_recovery_review_text(body_text)
+    if review_errors:
+        message = "Invalid recovery review content:\n- " + "\n- ".join(review_errors)
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "invalid_prepared_input",
+                error=message,
+                details={"review_errors": review_errors},
+            ),
+        )
+
+    try:
+        proposals_dir = ensure_managed_directory_chain(
+            workspace.storage_root,
+            ("companion", "recovery", "proposals"),
+            project_root=workspace.project_root,
+            create=False,
+        )
+    except ManagedDirectorySafetyError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=exc.message,
+            payload=cli_failure_payload(
+                exc.failure_reason,
+                error=exc.message,
+                details=exc.details,
+            ),
+        )
     review_log_dir = workspace.storage_root / "companion" / "recovery" / "review_log"
-    archive_dir = workspace.storage_root / "companion" / "recovery" / "archive"
 
     proposal_path = resolve_proposal_path(args.proposal_file, proposals_dir, workspace.project_root)
     if not proposal_path.is_file():
-        message = f"Proposal file does not exist: {proposal_path}"
+        public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
+        message = f"Proposal file does not exist: {public_proposal}"
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -177,9 +250,10 @@ def main() -> None:
             ),
         )
     if proposal_path.parent != proposals_dir.resolve():
+        public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
         message = (
             "Proposal file must live under companion/recovery/proposals/: "
-            f"{proposal_path}"
+            f"{public_proposal}"
         )
         exit_with_cli_error(
             parser,
@@ -213,10 +287,48 @@ def main() -> None:
 
     try:
         with workspace_write_lock(workspace.project_root, "record_recovery_review.py"):
-            review_log_dir.mkdir(parents=True, exist_ok=True)
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            if review_path.exists():
-                message = f"Refusing to overwrite an existing recovery review: {review_path}"
+            proposals_dir = ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "proposals"),
+                project_root=workspace.project_root,
+                create=False,
+            )
+            if proposal_path.parent != proposals_dir.resolve():
+                public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
+                message = (
+                    "Proposal file must live under companion/recovery/proposals/: "
+                    f"{public_proposal}"
+                )
+                exit_with_cli_error(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=2,
+                    message=message,
+                    payload=cli_failure_payload(
+                        "invalid_prepared_input",
+                        error=message,
+                        details={"proposal_file": str(proposal_path)},
+                    ),
+                )
+            review_log_dir = ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "review_log"),
+                project_root=workspace.project_root,
+            )
+            ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "archive"),
+                project_root=workspace.project_root,
+            )
+            review_path = review_log_dir / f"{proposal_path.stem}.review.md"
+            try:
+                review_path.lstat()
+                review_exists = True
+            except FileNotFoundError:
+                review_exists = False
+            if review_exists:
+                public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
+                message = f"Refusing to overwrite an existing recovery review: {public_review}"
                 exit_with_cli_error(
                     parser,
                     json_mode=args.json,
@@ -228,23 +340,49 @@ def main() -> None:
                         details={"review_path": str(review_path)},
                     ),
                 )
+            ensure_managed_directory_chain(
+                workspace.storage_root,
+                ("companion", "recovery", "review_log"),
+                project_root=workspace.project_root,
+                create=False,
+                )
             write_text(review_path, body_text.rstrip("\n") + "\n")
     except LockBusyError as exc:
+        public_message = publicize_text_paths(
+            str(exc),
+            project_root=workspace.project_root,
+        ) or "Refusing to continue because another RecallLoom mutating operation appears to be running."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=3,
-            message=str(exc),
-            payload=cli_failure_payload("write_lock_busy", error=str(exc)),
+            message=public_message,
+            payload=cli_failure_payload("write_lock_busy", error=public_message),
+        )
+    except ManagedDirectorySafetyError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=exc.message,
+            payload=cli_failure_payload(
+                exc.failure_reason,
+                error=exc.message,
+                details=exc.details,
+            ),
         )
     except (OSError, UnicodeDecodeError) as exc:
-        message = f"Filesystem error: {exc}"
+        message = "Filesystem error while recording recovery review."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=2,
             message=message,
-            payload=cli_failure_payload("damaged_sidecar", error=message),
+            payload=cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                details={"error_type": type(exc).__name__},
+            ),
         )
 
     payload = {
@@ -266,7 +404,8 @@ def main() -> None:
             )
         )
     else:
-        print(f"Recorded recovery review: {review_path}")
+        public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
+        print(f"Recorded recovery review: {public_review}")
 
 
 if __name__ == "__main__":

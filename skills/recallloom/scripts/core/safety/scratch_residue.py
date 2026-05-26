@@ -169,11 +169,7 @@ def _scan_areas(
     return _dedupe_scan_areas(areas)
 
 
-def _iter_scan_area_entries(
-    area: _ScanArea,
-    *,
-    explicit_root_keys: set[str],
-) -> Iterable[tuple[str, Path]]:
+def _iter_scan_area_entries(area: _ScanArea) -> Iterable[tuple[str, Path]]:
     root = area.root
     try:
         root_stat = root.lstat()
@@ -202,9 +198,6 @@ def _iter_scan_area_entries(
             except OSError:
                 continue
             if stat.S_ISLNK(child_stat.st_mode):
-                if _raw_scan_key(child) in explicit_root_keys:
-                    continue
-                yield "scratch_scan_child_symlink", child
                 continue
             if stat.S_ISDIR(child_stat.st_mode):
                 stack.append((child, depth + 1))
@@ -522,7 +515,6 @@ def scan_startup_scratch_residue(
         storage_root=storage,
         external_roots=external_roots,
     )
-    explicit_root_keys = {_raw_scan_key(area.root) for area in scan_areas}
     for area in scan_areas:
         root_finding = _scan_area_root_finding(
             area,
@@ -535,10 +527,7 @@ def scan_startup_scratch_residue(
             else:
                 report_only.append(root_finding)
             continue
-        for entry_kind, entry_path in _iter_scan_area_entries(
-            area,
-            explicit_root_keys=explicit_root_keys,
-        ):
+        for entry_kind, entry_path in _iter_scan_area_entries(area):
             if entry_kind != "marker":
                 finding = _suspicious_scan_path_finding(
                     entry_path,

@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from typing import Iterable
@@ -53,6 +54,8 @@ from core.output.privacy import (
     public_project_path as shared_public_project_path,
     public_project_root_label as shared_public_project_root_label,
     publicize_json_value,
+    redact_public_text as shared_redact_public_text,
+    publicize_text_paths as shared_publicize_text_paths,
 )
 from core.safety.scratch_residue import (
     ScratchResidueReport,
@@ -1262,6 +1265,158 @@ EnvironmentContractError = core_errors.EnvironmentContractError
 LockBusyError = core_errors.LockBusyError
 
 
+class ManagedDirectorySafetyError(Exception):
+    """Public-safe failure for managed directory boundary checks."""
+
+    failure_reason = "malformed_managed_file"
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        managed_directory: str,
+        path: Path,
+        project_root: Path,
+    ) -> None:
+        self.reason_code = reason_code
+        self.managed_directory = managed_directory
+        self.path = path
+        self.project_root = project_root
+        public_path = public_project_path(path, project_root=project_root) or managed_directory
+        self.message = (
+            "Managed recovery directory boundary check failed "
+            f"(reason_code={reason_code}, path={public_path})."
+        )
+        super().__init__(self.message)
+
+    @property
+    def details(self) -> dict[str, object]:
+        return {
+            "reason_code": self.reason_code,
+            "managed_directory": self.managed_directory,
+            "path": str(self.path),
+            "side_effect": "none",
+        }
+
+
+def _is_relative_to_path(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def ensure_managed_directory_chain(
+    storage_root: Path,
+    rel_parts: Iterable[str],
+    *,
+    project_root: Path,
+    create: bool = True,
+) -> Path:
+    """Ensure a managed directory chain has no symlink or non-directory component."""
+
+    rel_tuple = tuple(rel_parts)
+    rel_label = "/".join(rel_tuple) or "managed_directory"
+    if not rel_tuple or any(
+        not part or part in {".", ".."} or "/" in part or "\\" in part for part in rel_tuple
+    ):
+        raise ManagedDirectorySafetyError(
+            reason_code="invalid_managed_directory_name",
+            managed_directory=rel_label,
+            path=storage_root,
+            project_root=project_root,
+        )
+
+    try:
+        storage_resolved = storage_root.resolve(strict=True)
+    except OSError as exc:
+        raise ManagedDirectorySafetyError(
+            reason_code="storage_root_unavailable",
+            managed_directory=rel_label,
+            path=storage_root,
+            project_root=project_root,
+        ) from exc
+
+    current = storage_root
+    for part in rel_tuple:
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            if not create:
+                raise ManagedDirectorySafetyError(
+                    reason_code="managed_directory_missing",
+                    managed_directory=rel_label,
+                    path=current,
+                    project_root=project_root,
+                )
+            try:
+                current.mkdir()
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ManagedDirectorySafetyError(
+                    reason_code="managed_directory_create_failed",
+                    managed_directory=rel_label,
+                    path=current,
+                    project_root=project_root,
+                ) from exc
+            try:
+                current_stat = current.lstat()
+            except OSError as exc:
+                raise ManagedDirectorySafetyError(
+                    reason_code="managed_directory_inspect_failed",
+                    managed_directory=rel_label,
+                    path=current,
+                    project_root=project_root,
+                ) from exc
+        except OSError as exc:
+            raise ManagedDirectorySafetyError(
+                reason_code="managed_directory_inspect_failed",
+                managed_directory=rel_label,
+                path=current,
+                project_root=project_root,
+            ) from exc
+
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ManagedDirectorySafetyError(
+                reason_code="managed_directory_symlink",
+                managed_directory=rel_label,
+                path=current,
+                project_root=project_root,
+            )
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise ManagedDirectorySafetyError(
+                reason_code="managed_directory_not_directory",
+                managed_directory=rel_label,
+                path=current,
+                project_root=project_root,
+            )
+
+        try:
+            current_resolved = current.resolve(strict=True)
+        except OSError as exc:
+            raise ManagedDirectorySafetyError(
+                reason_code="managed_directory_realpath_failed",
+                managed_directory=rel_label,
+                path=current,
+                project_root=project_root,
+            ) from exc
+        if current_resolved != storage_resolved and not _is_relative_to_path(
+            current_resolved,
+            storage_resolved,
+        ):
+            raise ManagedDirectorySafetyError(
+                reason_code="managed_directory_escape",
+                managed_directory=rel_label,
+                path=current,
+                project_root=project_root,
+            )
+
+    return current
+
+
 def normalize_start_path(raw_path: str | Path) -> Path:
     return workspace_runtime.normalize_start_path(raw_path)
 
@@ -1345,7 +1500,8 @@ def exit_with_cli_error(
             body.update(payload)
         print(json.dumps(body, ensure_ascii=False, indent=2))
         raise SystemExit(exit_code)
-    parser.exit(exit_code, message + "\n")
+    public_message = shared_redact_public_text(message, project_root=None) or message
+    parser.exit(exit_code, public_message + "\n")
 
 
 def cli_failure_payload(
@@ -1405,6 +1561,14 @@ def display_project_path(
     project_root: str | Path,
 ) -> str | None:
     return shared_display_project_path(path, project_root=project_root)
+
+
+def publicize_text_paths(
+    text: str | None,
+    *,
+    project_root: str | Path | None,
+) -> str | None:
+    return shared_publicize_text_paths(text, project_root=project_root)
 
 
 def public_json_payload(
@@ -1618,7 +1782,7 @@ def exit_if_startup_scratch_residue(
                 "startup_residue_detected",
                 error=message,
                 details={
-                    "project_root": str(project_root),
+                    "project_root": "project_root",
                     "startup_residue_report": public_report,
                 },
                 findings=public_report["findings"],

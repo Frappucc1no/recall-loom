@@ -1,5 +1,5 @@
 {
-  "latest_version": "0.4.0",
+  "latest_version": "0.4.1",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
   "advisory_level": "supported",

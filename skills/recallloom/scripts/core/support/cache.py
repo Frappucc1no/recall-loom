@@ -322,7 +322,11 @@ def package_support_result(
             if advisory is None and fetch_error is None and source == "no_advisory_config":
                 fetch_error = source
             if advisory is None and fetch_error and cached is not None:
-                stale_advisory = advisory_from_cached_support(cached)
+                stale_advisory = (
+                    None
+                    if action_level == "mutating"
+                    else advisory_from_cached_support(cached)
+                )
                 result = result_from_advisory(
                     package_root=package_root,
                     package_version=package_version,

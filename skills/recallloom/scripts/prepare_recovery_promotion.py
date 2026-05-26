@@ -26,12 +26,15 @@ from _common import (
     DAILY_LOGS_DIRNAME,
     EnvironmentContractError,
     enforce_package_support_gate,
+    ensure_managed_directory_chain,
     ensure_supported_python_version,
     exit_with_cli_error,
     find_recallloom_root,
+    ManagedDirectorySafetyError,
     latest_active_daily_log,
     load_workspace_state,
     parse_daily_log_entry_line,
+    public_project_path,
     public_json_payload,
     read_text,
     RECOVERY_PROPOSAL_FILE_RE,
@@ -122,12 +125,36 @@ def main() -> None:
             payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
         )
 
-    proposals_dir = (workspace.storage_root / "companion" / "recovery" / "proposals").resolve()
-    review_log_dir = (workspace.storage_root / "companion" / "recovery" / "review_log").resolve()
+    try:
+        proposals_dir = ensure_managed_directory_chain(
+            workspace.storage_root,
+            ("companion", "recovery", "proposals"),
+            project_root=workspace.project_root,
+            create=False,
+        ).resolve()
+        review_log_dir = ensure_managed_directory_chain(
+            workspace.storage_root,
+            ("companion", "recovery", "review_log"),
+            project_root=workspace.project_root,
+            create=False,
+        ).resolve()
+    except ManagedDirectorySafetyError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=exc.message,
+            payload=cli_failure_payload(
+                exc.failure_reason,
+                error=exc.message,
+                details=exc.details,
+            ),
+        )
 
     proposal_path = resolve_candidate_path(args.proposal_file, proposals_dir, workspace.project_root)
     if not proposal_path.is_file():
-        message = f"Proposal file does not exist: {proposal_path}"
+        public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
+        message = f"Proposal file does not exist: {public_proposal}"
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -140,9 +167,10 @@ def main() -> None:
             ),
         )
     if proposal_path.parent != proposals_dir:
+        public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
         message = (
             "Proposal file must live under companion/recovery/proposals/: "
-            f"{proposal_path}"
+            f"{public_proposal}"
         )
         exit_with_cli_error(
             parser,
@@ -175,7 +203,8 @@ def main() -> None:
     review_name = args.review_file or f"{proposal_path.stem}.review.md"
     review_path = resolve_candidate_path(review_name, review_log_dir, workspace.project_root)
     if not review_path.is_file():
-        message = f"Review file does not exist: {review_path}"
+        public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
+        message = f"Review file does not exist: {public_review}"
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -188,9 +217,10 @@ def main() -> None:
             ),
         )
     if review_path.parent != review_log_dir:
+        public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
         message = (
             "Review file must live under companion/recovery/review_log/: "
-            f"{review_path}"
+            f"{public_review}"
         )
         exit_with_cli_error(
             parser,
@@ -244,16 +274,21 @@ def main() -> None:
         proposal_text = read_text(proposal_path)
         review_text = read_text(review_path)
     except (OSError, UnicodeDecodeError) as exc:
-        message = f"Filesystem error: {exc}"
+        message = "Filesystem error while reading recovery proposal or review."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=2,
             message=message,
-            payload=cli_failure_payload("damaged_sidecar", error=message),
+            payload=cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                details={"error_type": type(exc).__name__},
+            ),
         )
     if not proposal_text.strip():
-        message = f"Proposal file is empty: {proposal_path}"
+        public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
+        message = f"Proposal file is empty: {public_proposal}"
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -266,7 +301,8 @@ def main() -> None:
             ),
         )
     if not review_text.strip():
-        message = f"Review file is empty: {review_path}"
+        public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
+        message = f"Review file is empty: {public_review}"
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -320,7 +356,8 @@ def main() -> None:
         summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
         context_brief_path = workspace.storage_root / FILE_KEYS["context_brief"]
         if not summary_path.is_file():
-            message = f"Missing required file: {summary_path}"
+            public_summary = public_project_path(summary_path, project_root=workspace.project_root) or summary_path.name
+            message = f"Missing required file: {public_summary}"
             exit_with_cli_error(
                 parser,
                 json_mode=args.json,
@@ -334,7 +371,8 @@ def main() -> None:
             )
         summary_state = parse_file_state_marker(read_text(summary_path))
         if summary_state is None:
-            message = f"Missing required file-state metadata marker: {summary_path}"
+            public_summary = public_project_path(summary_path, project_root=workspace.project_root) or summary_path.name
+            message = f"Missing required file-state metadata marker: {public_summary}"
             exit_with_cli_error(
                 parser,
                 json_mode=args.json,
@@ -347,7 +385,8 @@ def main() -> None:
                 ),
             )
         if not context_brief_path.is_file():
-            message = f"Missing required file: {context_brief_path}"
+            public_context = public_project_path(context_brief_path, project_root=workspace.project_root) or context_brief_path.name
+            message = f"Missing required file: {public_context}"
             exit_with_cli_error(
                 parser,
                 json_mode=args.json,
@@ -361,7 +400,8 @@ def main() -> None:
             )
         context_brief_state = parse_file_state_marker(read_text(context_brief_path))
         if context_brief_state is None:
-            message = f"Missing required file-state metadata marker: {context_brief_path}"
+            public_context = public_project_path(context_brief_path, project_root=workspace.project_root) or context_brief_path.name
+            message = f"Missing required file-state metadata marker: {public_context}"
             exit_with_cli_error(
                 parser,
                 json_mode=args.json,
@@ -384,13 +424,17 @@ def main() -> None:
             payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
         )
     except (OSError, UnicodeDecodeError) as exc:
-        message = f"Filesystem error: {exc}"
+        message = "Filesystem error while preparing recovery promotion context."
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=2,
             message=message,
-            payload=cli_failure_payload("damaged_sidecar", error=message),
+            payload=cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                details={"error_type": type(exc).__name__},
+            ),
         )
 
     payload = {
@@ -451,8 +495,10 @@ def main() -> None:
             )
         )
     else:
-        print(f"Prepared recovery promotion context for: {proposal_path}")
-        print(f"Review record: {review_path}")
+        public_proposal = public_project_path(proposal_path, project_root=workspace.project_root) or proposal_path.name
+        public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
+        print(f"Prepared recovery promotion context for: {public_proposal}")
+        print(f"Review record: {public_review}")
         print("Use the returned safe_write_context with the normal write helpers after content review.")
 
 

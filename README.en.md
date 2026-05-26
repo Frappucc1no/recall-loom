@@ -12,7 +12,7 @@
 
 <p>RecallLoom is a file-based project memory layer for AI collaboration. It stores background, progress, key decisions, and next steps in Markdown / JSON files beside or inside the project, with no database, RAG layer, or background service required; the next session, model, or tool can more easily start from the current state.</p>
 
-[![Release](https://img.shields.io/badge/release-v0.4.0-111827?style=flat-square)](./docs/releases/v0.4.0.md)
+[![Version](https://img.shields.io/badge/version-v0.4.1-111827?style=flat-square)](./docs/releases/v0.4.1.md)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 <summary>Version and compatibility</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.0`
+- package version: `0.4.1`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -309,6 +309,7 @@ Detailed script entrypoints, protocol notes, and file contracts live in [`USAGE.
 
 | Version | Highlights | User value |
 |---|---|---|
+| `v0.4.1` | Follow-up security hardening, recovery-source input hardening, mutating write protection for stale/offline support state, public failure path redaction, and recovery-directory boundary tightening | Reduces operational risk from unexpected inputs, stale support state, and local path exposure while keeping protocol compatibility |
 | `v0.4.0` | More accurate restore paths, lower-friction progress updates, clearer write guards and tool boundaries | More reliable handoff across sessions, models, and tools; easier to know what should be synced after progress is recorded |
 | `v0.3.5` | Faster restore, structured progress records, write previews, support-state checks | Existing projects are easier to resume, and write risks are visible before changes are applied |
 | `v0.3.4` | Install/update status checks, initialization privacy boundaries, safer write foundations | Update state and local project memory are easier to control |
