@@ -28,6 +28,9 @@ on:
       - "skills/recallloom/scripts/sync_contract_docs.py"
       - "USAGE.md"
 
+permissions:
+  contents: read
+
 jobs:
   contract-doc-sync:
     runs-on: ubuntu-latest
