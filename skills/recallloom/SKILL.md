@@ -40,7 +40,7 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.2`
+- package version: `0.4.3`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -87,7 +87,7 @@ RecallLoom package support is separate from project sidecar protocol compatibili
 - `ask` is for legacy review / repair import or reviewed imported baseline actions and requires explicit operator confirmation before higher-risk writes.
 - `block` is non-waivable for forged markers, detected receipt/store inconsistency, direct `state.json` / `config.json` edits, privacy violations, and any state classified as `inconsistent_or_tampered_evidence`.
 - Do not present remote services, host memory, plugins, MCP, hooks, or wrappers as authority for local helper evidence.
-- v0.4.2 receipt-backed mutation is limited to dispatcher-issued managed-file writes, daily-log appends to the current latest cursor, and post-append summary sync. Archive apply and bridge apply remain preview-only until those surfaces gain their own receipt support.
+- Receipt-backed mutation is limited to dispatcher-issued managed-file writes, daily-log appends to the current latest cursor, and post-append summary sync. Archive apply and bridge apply remain preview-only until those surfaces gain their own receipt support.
 
 ## Write Protocol Red Lines
 

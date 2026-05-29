@@ -7,6 +7,7 @@ import argparse
 from contextlib import suppress
 import json
 from pathlib import Path
+import sys
 
 from core.coldstart.structured import (
     REVIEW_SECTION_ALIASES,
@@ -64,7 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Proposal filename or path. Relative values are resolved against companion/recovery/proposals/ first.",
     )
-    parser.add_argument("--source-file", required=True, help="Path to prepared review markdown content.")
+    parser.add_argument("--source-file", help="Path to prepared review markdown content.")
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read prepared review markdown content from UTF-8 stdin.",
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
 
@@ -85,31 +91,111 @@ def exit_prepared_input_safety_error(
     )
 
 
-def read_recovery_source_file(
+def read_recovery_source(
     parser,
     *,
     json_mode: bool,
-    raw_source_file: str,
+    raw_source_file: str | None,
+    use_stdin: bool,
     project_root: Path,
     storage_root: Path,
-) -> tuple[Path, str]:
-    try:
-        source = validate_prepared_input_source_path(
-            raw_source_file,
-            project_root=project_root,
-            storage_root=storage_root,
-            input_role="source-file",
-            label="source",
+) -> tuple[Path | None, str, str]:
+    if bool(raw_source_file) == bool(use_stdin):
+        message = "Provide prepared review content with exactly one of --source-file or --stdin."
+        if raw_source_file and use_stdin:
+            message = "Use exactly one prepared review input: --source-file or --stdin."
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=message,
+            reason="invalid_prepared_input",
+            details={"side_effect": "none"},
         )
-        body_text = read_prepared_input_source_text(
-            source,
-            max_input_bytes=DEFAULT_MAX_INPUT_BYTES,
-            label="source",
-        )
-    except PreparedInputSafetyError as exc:
-        exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
+
+    source_path: Path | None = None
+    input_mode = "stdin" if use_stdin else "file"
+    if raw_source_file:
+        try:
+            source = validate_prepared_input_source_path(
+                raw_source_file,
+                project_root=project_root,
+                storage_root=storage_root,
+                input_role="source-file",
+                label="source",
+            )
+            body_text = read_prepared_input_source_text(
+                source,
+                max_input_bytes=DEFAULT_MAX_INPUT_BYTES,
+                label="source",
+            )
+        except PreparedInputSafetyError as exc:
+            exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
+        source_path = source.path
+    else:
+        if sys.stdin.isatty():
+            exit_with_failure_contract(
+                parser,
+                json_mode=json_mode,
+                exit_code=2,
+                message="No prepared review content was provided on stdin.",
+                reason="invalid_prepared_input",
+                details={"input_mode": "stdin", "side_effect": "none"},
+            )
+        try:
+            raw_bytes = sys.stdin.buffer.read(DEFAULT_MAX_INPUT_BYTES + 1)
+        except OSError as exc:
+            exit_with_failure_contract(
+                parser,
+                json_mode=json_mode,
+                exit_code=2,
+                message=f"Failed to read prepared review stdin input: {exc}",
+                reason="invalid_prepared_input",
+                details={
+                    "input_mode": "stdin",
+                    "reason_code": "stdin_read_failed",
+                    "error_type": type(exc).__name__,
+                    "side_effect": "none",
+                },
+            )
+        if len(raw_bytes) > DEFAULT_MAX_INPUT_BYTES:
+            exit_with_failure_contract(
+                parser,
+                json_mode=json_mode,
+                exit_code=2,
+                message=(
+                    "Prepared review stdin input exceeds the maximum size "
+                    f"({len(raw_bytes)} > {DEFAULT_MAX_INPUT_BYTES})."
+                ),
+                reason="invalid_prepared_input",
+                details={
+                    "input_mode": "stdin",
+                    "size": len(raw_bytes),
+                    "max_input_bytes": DEFAULT_MAX_INPUT_BYTES,
+                    "side_effect": "none",
+                },
+            )
+        try:
+            body_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            exit_with_failure_contract(
+                parser,
+                json_mode=json_mode,
+                exit_code=2,
+                message="Prepared review stdin input must be valid UTF-8.",
+                reason="invalid_prepared_input",
+                details={
+                    "input_mode": "stdin",
+                    "reason_code": "stdin_decode_failed",
+                    "error_type": type(exc).__name__,
+                    "side_effect": "none",
+                },
+            )
+
     if not body_text.strip():
         message = "Source file is empty."
+        if use_stdin:
+            message = "Prepared review stdin input is empty."
         exit_with_cli_error(
             parser,
             json_mode=json_mode,
@@ -118,7 +204,11 @@ def read_recovery_source_file(
             payload=cli_failure_payload(
                 "invalid_prepared_input",
                 error=message,
-                details={"source_file_ref": "provided_source_file", "side_effect": "none"},
+                details={
+                    "input_mode": input_mode,
+                    "source_file_ref": "provided_source_file" if source_path else None,
+                    "side_effect": "none",
+                },
             ),
         )
     attach_scan = scan_auto_attached_context_text(body_text)
@@ -139,7 +229,7 @@ def read_recovery_source_file(
                 details={"hard_block_reasons": attach_scan["hard_block_reasons"]},
             ),
         )
-    return source.path, body_text
+    return source_path, body_text, input_mode
 
 
 def resolve_proposal_path(raw_value: str, proposals_dir: Path, project_root: Path) -> Path:
@@ -189,17 +279,19 @@ def main() -> None:
             payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
         )
 
+    source_paths = [args.source_file] if args.source_file else []
     exit_if_startup_scratch_residue_for_sources(
         parser,
         json_mode=args.json,
         project_root=workspace.project_root,
         storage_root=workspace.storage_root,
-        source_paths=[args.source_file],
+        source_paths=source_paths,
     )
-    source_path, body_text = read_recovery_source_file(
+    source_path, body_text, input_mode = read_recovery_source(
         parser,
         json_mode=args.json,
         raw_source_file=args.source_file,
+        use_stdin=args.stdin,
         project_root=workspace.project_root,
         storage_root=workspace.storage_root,
     )
@@ -425,7 +517,8 @@ def main() -> None:
         "ok": True,
         "proposal_path": str(proposal_path),
         "review_path": str(review_path),
-        "source_file": str(source_path),
+        "input_mode": input_mode,
+        "source_file": str(source_path) if source_path is not None else None,
         "source_digest": text_digest(body_text),
         "review_sections_present": sorted(review_sections.keys()),
         "review_action": review_action,
