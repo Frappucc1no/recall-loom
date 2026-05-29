@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 .internal/
+
+# Keep generated, private, and workspace-specific material out of the package.
+/.recallloom/
+/recallloom/
+/artifacts/
+/tmp/

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,20 @@ from core.protocol.sections import (
     missing_section_keys,
     unknown_section_keys,
 )
+from core.provenance.bindings import (
+    PreflightBindingLeaseError,
+    verify_preflight_binding_lease,
+)
+from core.provenance.receipts import RECEIPT_SCHEMA_VERSION, assert_public_safe_json, public_receipt_claim
+from core.provenance.state import (
+    helper_evidenced_metadata,
+    helper_write_gate_from_state,
+    inconsistent_evidence_metadata,
+    provenance_contract_identity,
+    preflight_write_binding_hash,
+    unproven_sidecar_metadata,
+)
+from core.provenance.store import ReceiptStoreError, finalize_receipt_in_store, receipt_store_summary
 from core.safety.attached_text import scan_auto_attached_context_text
 from core.safety.prepared_input import (
     PreparedInputSafetyError,
@@ -56,7 +71,9 @@ from _common import (
     load_workspace_state,
     normalize_wrapper_metadata_json,
     now_iso_timestamp,
+    PACKAGE_VERSION,
     public_json_payload,
+    public_project_path,
     read_text,
     resolve_writer_attribution,
     restore_text_snapshot,
@@ -100,6 +117,45 @@ ROLLING_SUMMARY_JSON_ACCEPTED_SHAPES = (
 ROLLING_SUMMARY_JSON_RETRY_PAYLOAD_SHAPE = {
     key: "non-empty string | list[non-empty string] | [] | 'not_provided'"
     for key in ROLLING_SUMMARY_JSON_KEYS
+}
+PREFLIGHT_BINDING_TYPE = "recallloom.preflight_write_binding"
+PREFLIGHT_BINDING_VERSION = "0.1"
+REVIEW_IMPORTED_BASELINE_CONFIRMATION = "review_imported_baseline_confirmed"
+PREFLIGHT_BINDING_ALLOWED_KEYS = {
+    "binding_type",
+    "binding_version",
+    "operation_class",
+    "file_key",
+    "write_type",
+    "contract_type",
+    "expected_file_revision",
+    "expected_workspace_revision",
+    "expected_revisions",
+    "preflight_contract_identity",
+    "preflight_contract_hash",
+    "provenance_state",
+    "write_readiness_label",
+    "ux_gate",
+    "ux_gate_requires_confirmation",
+    "ux_gate_confirmation",
+    "ux_gate_reason",
+}
+PREFLIGHT_BINDING_REQUIRED_KEYS = {
+    "binding_type",
+    "binding_version",
+    "operation_class",
+    "file_key",
+    "write_type",
+    "expected_file_revision",
+    "expected_workspace_revision",
+    "preflight_contract_identity",
+    "preflight_contract_hash",
+}
+RECEIPT_OPERATION_CLASSES = {"managed_file_commit", "post_append_summary_sync"}
+PREFLIGHT_WRITE_READINESS_LABELS = {
+    "structural_only_ready_after_preflight",
+    "helper_evidenced_ready_after_preflight",
+    "review_imported_baseline_ready_after_preflight",
 }
 
 
@@ -149,6 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Optional wrapper metadata JSON object for additive public output. "
             "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
         ),
+    )
+    parser.add_argument(
+        "--preflight-binding-json",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
@@ -932,6 +992,535 @@ def build_managed_text(
     return "\n".join(parts) + "\n"
 
 
+def sha256_text_digest(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def expected_state_json_text(state: dict) -> str:
+    return json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+
+
+def preflight_binding_failure(
+    parser,
+    *,
+    json_mode: bool,
+    message: str,
+    reason_code: str,
+    field_path: str = "$",
+    extra: dict | None = None,
+) -> None:
+    details = {
+        "reason_code": reason_code,
+        "field_path": field_path,
+        "side_effect": "none",
+        **(extra or {}),
+    }
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=message,
+        reason="invalid_prepared_input",
+        details=details,
+    )
+
+
+def normalize_preflight_binding(
+    parser,
+    *,
+    json_mode: bool,
+    raw: str | None,
+    project_root: Path,
+    file_key: str,
+    expected_file_revision: int,
+    expected_workspace_revision: int,
+) -> dict | None:
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message=f"--preflight-binding-json must be valid JSON: {exc.msg}.",
+            reason_code="malformed_preflight_binding_json",
+        )
+    if not isinstance(payload, dict):
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="--preflight-binding-json must be a JSON object.",
+            reason_code="preflight_binding_not_object",
+        )
+    unknown = sorted(set(payload).difference(PREFLIGHT_BINDING_ALLOWED_KEYS))
+    if unknown:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding contains unsupported keys.",
+            reason_code="preflight_binding_unknown_key",
+            field_path=",".join(unknown),
+        )
+    missing = sorted(PREFLIGHT_BINDING_REQUIRED_KEYS.difference(payload))
+    if missing:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding is missing required fields.",
+            reason_code="preflight_binding_missing_required_key",
+            field_path=",".join(missing),
+        )
+    if payload.get("binding_type") != PREFLIGHT_BINDING_TYPE:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding type does not match this helper.",
+            reason_code="preflight_binding_type_mismatch",
+            field_path="$.binding_type",
+        )
+    if payload.get("binding_version") != PREFLIGHT_BINDING_VERSION:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding version does not match this helper.",
+            reason_code="preflight_binding_version_mismatch",
+            field_path="$.binding_version",
+        )
+    operation_class = payload.get("operation_class")
+    if operation_class not in RECEIPT_OPERATION_CLASSES:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding operation_class is not supported.",
+            reason_code="preflight_binding_operation_class_invalid",
+            field_path="$.operation_class",
+        )
+    if payload.get("file_key") != file_key:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding file_key does not match this write.",
+            reason_code="preflight_binding_file_key_mismatch",
+            field_path="$.file_key",
+        )
+    if payload.get("expected_file_revision") != expected_file_revision:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding expected_file_revision does not match this write.",
+            reason_code="preflight_binding_file_revision_mismatch",
+            field_path="$.expected_file_revision",
+        )
+    if payload.get("expected_workspace_revision") != expected_workspace_revision:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding expected_workspace_revision does not match this write.",
+            reason_code="preflight_binding_workspace_revision_mismatch",
+            field_path="$.expected_workspace_revision",
+        )
+    expected_preflight_identity = provenance_contract_identity()
+    if payload.get("preflight_contract_identity") != expected_preflight_identity:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding contract identity does not match the active provenance contract.",
+            reason_code="preflight_binding_contract_identity_mismatch",
+            field_path="$.preflight_contract_identity",
+            extra={"expected_preflight_contract_identity": expected_preflight_identity},
+        )
+    expected_binding_hash = preflight_write_binding_hash(payload)
+    if payload.get("preflight_contract_hash") != expected_binding_hash:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding hash does not match the canonical binding payload.",
+            reason_code="preflight_binding_hash_mismatch",
+            field_path="$.preflight_contract_hash",
+            extra={"expected_preflight_contract_hash": expected_binding_hash},
+        )
+    try:
+        assert_public_safe_json(payload, project_root=str(project_root))
+    except ValueError as exc:
+        details = getattr(exc, "details", {})
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding is not public-safe.",
+            reason_code=str(details.get("reason_code") or "preflight_binding_privacy_violation"),
+            field_path=str(details.get("field_path") or "$"),
+        )
+    return payload
+
+
+def enforce_provenance_write_gate(
+    parser,
+    *,
+    json_mode: bool,
+    state: dict,
+    preflight_binding: dict | None,
+) -> dict:
+    gate = helper_write_gate_from_state(
+        state,
+        helper_name="commit_context_file.py",
+        operation_class=(
+            str(preflight_binding.get("operation_class"))
+            if isinstance(preflight_binding, dict)
+            else "managed_file_commit"
+        ),
+        preflight_binding_present=preflight_binding is not None,
+        require_preflight_for_review_imported_baseline=True,
+    )
+    if preflight_binding is not None:
+        binding_state = preflight_binding.get("provenance_state")
+        if isinstance(binding_state, str) and binding_state != gate["provenance_state"]:
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message="Preflight binding provenance_state does not match current sidecar provenance.",
+                reason_code="preflight_binding_provenance_state_mismatch",
+                field_path="$.provenance_state",
+                extra={
+                    "current_provenance_state": gate["provenance_state"],
+                    "binding_provenance_state": binding_state,
+                },
+            )
+        readiness_label = preflight_binding.get("write_readiness_label")
+        if readiness_label not in PREFLIGHT_WRITE_READINESS_LABELS:
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message="Preflight binding does not authorize a revision-checked helper write.",
+                reason_code="preflight_binding_write_readiness_not_authorized",
+                field_path="$.write_readiness_label",
+                extra={
+                    "write_readiness_label": readiness_label,
+                    "allowed_write_readiness_labels": sorted(PREFLIGHT_WRITE_READINESS_LABELS),
+                },
+            )
+        if gate["provenance_state"] == "review_imported_baseline":
+            if preflight_binding.get("ux_gate") != "ask":
+                preflight_binding_failure(
+                    parser,
+                    json_mode=json_mode,
+                    message="Review-imported baseline writes require an ask UX gate.",
+                    reason_code="preflight_binding_ux_gate_mismatch",
+                    field_path="$.ux_gate",
+                    extra={"required_ux_gate": "ask"},
+                )
+            if preflight_binding.get("ux_gate_requires_confirmation") is not True:
+                preflight_binding_failure(
+                    parser,
+                    json_mode=json_mode,
+                    message="Review-imported baseline writes require explicit confirmation.",
+                    reason_code="preflight_binding_confirmation_required",
+                    field_path="$.ux_gate_requires_confirmation",
+                )
+            if preflight_binding.get("ux_gate_confirmation") != REVIEW_IMPORTED_BASELINE_CONFIRMATION:
+                preflight_binding_failure(
+                    parser,
+                    json_mode=json_mode,
+                    message="Review-imported baseline write confirmation is missing.",
+                    reason_code="preflight_binding_confirmation_missing",
+                    field_path="$.ux_gate_confirmation",
+                    extra={"required_confirmation": REVIEW_IMPORTED_BASELINE_CONFIRMATION},
+                )
+    if gate["allowed"]:
+        return gate
+
+    reason = (
+        "stale_write_context"
+        if gate["blocked_reason_code"] == "preflight_required_for_review_imported_baseline"
+        else "trust_review_required"
+    )
+    message = (
+        "Refusing to commit because this RecallLoom sidecar requires provenance review "
+        "or a fresh preflight binding before a mutating helper write."
+    )
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=message,
+        reason=reason,
+        details={
+            "reason_code": gate["blocked_reason_code"],
+            "helper_name": gate["helper_name"],
+            "operation_class": gate["operation_class"],
+            "provenance_state": gate["provenance_state"],
+            "provenance_metadata_status": gate["provenance_metadata_status"],
+            "write_readiness": gate["write_readiness"],
+            "preflight_binding_present": gate["preflight_binding_present"],
+            "side_effect": "none",
+            "next_actions": [
+                "stage_recovery_proposal.py",
+                "record_recovery_review.py",
+                "prepare_recovery_promotion.py",
+                "preflight_context_check.py",
+            ],
+        },
+    )
+
+
+def enforce_preflight_binding_lease(
+    parser,
+    *,
+    json_mode: bool,
+    storage_root: Path,
+    project_root: Path,
+    preflight_binding: dict | None,
+) -> None:
+    if preflight_binding is None:
+        return
+    try:
+        verify_preflight_binding_lease(
+            storage_root=storage_root,
+            project_root=project_root,
+            binding=preflight_binding,
+        )
+    except PreflightBindingLeaseError as exc:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message=str(exc),
+            reason_code=exc.reason_code,
+            field_path=exc.field_path,
+            extra={
+                "lease_store": "derived/preflight-bindings.json",
+                "side_effect": "none",
+            },
+        )
+
+
+def restore_provenance_after_receipt_failure(
+    parser,
+    *,
+    json_mode: bool,
+    state_path: Path,
+    state: dict,
+    previous_provenance: object,
+    failure_message: str,
+    reason_code: str,
+) -> None:
+    previous_state_label = (
+        previous_provenance.get("state_label")
+        if isinstance(previous_provenance, dict)
+        else None
+    )
+    state["provenance"] = unproven_sidecar_metadata(
+        timestamp=now_iso_timestamp(),
+        reason_code=reason_code,
+        previous_state_label=previous_state_label if isinstance(previous_state_label, str) else None,
+    )
+    try:
+        dump_json(state_path, state)
+    except OSError as rollback_exc:
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=(
+                f"{failure_message}. Also failed to restore provenance metadata after "
+                f"receipt finalization failure: {rollback_exc}"
+            ),
+            reason="damaged_sidecar",
+            details={
+                "reason_code": "receipt_failure_provenance_restore_failed",
+                "side_effect": "target_and_state_written_receipt_not_stored",
+            },
+        )
+
+
+def receipt_failure_reason(reason_code: str) -> str:
+    if reason_code in {
+        "prohibited_field",
+        "value_requires_redaction",
+        "non_string_key",
+        "unsupported_value_type",
+    }:
+        return "privacy_security_failure"
+    return "damaged_sidecar"
+
+
+def exit_receipt_finalization_failure(
+    parser,
+    *,
+    json_mode: bool,
+    message: str,
+    reason_code: str,
+    side_effect: str,
+    file_key: str,
+    new_file_revision: int,
+    new_workspace_revision: int,
+    extra: dict | None = None,
+) -> None:
+    details = {
+        "reason_code": reason_code,
+        "side_effect": side_effect,
+        "file_key": file_key,
+        "new_file_revision": new_file_revision,
+        "new_workspace_revision": new_workspace_revision,
+        "receipt_finalization_status": "failed",
+        "receipt_store_file": "derived/helper-receipts.json",
+        "next_action": "review_or_repair_receipt_store_before_claiming_helper_evidenced",
+        **(extra or {}),
+    }
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=message,
+        reason=receipt_failure_reason(reason_code),
+        details=details,
+    )
+
+
+def prevalidate_receipt_store_before_write(
+    parser,
+    *,
+    json_mode: bool,
+    storage_root: Path,
+    project_root: Path,
+    preflight_binding: dict | None,
+    file_key: str,
+    new_file_revision: int,
+    new_workspace_revision: int,
+) -> None:
+    if preflight_binding is None:
+        return
+    try:
+        receipt_store_summary(
+            storage_root=storage_root,
+            project_root=project_root,
+            require_exists=False,
+        )
+    except ReceiptStoreError as exc:
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message=str(exc),
+            reason_code=exc.reason_code,
+            side_effect="none",
+            file_key=file_key,
+            new_file_revision=new_file_revision,
+            new_workspace_revision=new_workspace_revision,
+            extra={
+                **exc.details,
+                "side_effect": "none",
+                "receipt_finalization_status": "blocked_before_write",
+                "receipt_precheck": True,
+            },
+        )
+
+
+def verify_post_write_hashes(
+    parser,
+    *,
+    json_mode: bool,
+    target_path: Path,
+    state_path: Path,
+    expected_target_text: str,
+    expected_state_text: str,
+    file_key: str,
+    new_file_revision: int,
+    new_workspace_revision: int,
+    state: dict,
+    previous_provenance: object,
+) -> tuple[str, str]:
+    def downgrade_before_exit(reason_code: str) -> None:
+        previous_state_label = (
+            previous_provenance.get("state_label")
+            if isinstance(previous_provenance, dict)
+            else None
+        )
+        state["provenance"] = inconsistent_evidence_metadata(
+            timestamp=now_iso_timestamp(),
+            reason_code=reason_code,
+            previous_state_label=previous_state_label if isinstance(previous_state_label, str) else None,
+        )
+        try:
+            dump_json(state_path, state)
+        except OSError:
+            pass
+
+    try:
+        post_target_text = read_text(target_path)
+        post_state_text = read_text(state_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        downgrade_before_exit("post_hash_read_failed")
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message=f"Could not re-read post-write target/state for receipt finalization: {exc}",
+            reason_code="post_hash_read_failed",
+            side_effect="target_and_state_written_receipt_not_stored",
+            file_key=file_key,
+            new_file_revision=new_file_revision,
+            new_workspace_revision=new_workspace_revision,
+        )
+    target_digest = sha256_text_digest(post_target_text)
+    state_digest = sha256_text_digest(post_state_text)
+    if post_target_text != expected_target_text or post_state_text != expected_state_text:
+        downgrade_before_exit("post_hash_mismatch")
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message="Post-write hash check failed; receipt finalization was not stored.",
+            reason_code="post_hash_mismatch",
+            side_effect="target_and_state_written_receipt_not_stored",
+            file_key=file_key,
+            new_file_revision=new_file_revision,
+            new_workspace_revision=new_workspace_revision,
+            extra={
+                "target_digest": target_digest,
+                "state_digest": state_digest,
+                "expected_target_digest": sha256_text_digest(expected_target_text),
+                "expected_state_digest": sha256_text_digest(expected_state_text),
+            },
+        )
+    return target_digest, state_digest
+
+
+def build_receipt_seed(
+    *,
+    args: argparse.Namespace,
+    preflight_binding: dict,
+    timestamp: str,
+    target_digest: str,
+    state_digest: str,
+    new_file_revision: int,
+    new_workspace_revision: int,
+) -> dict:
+    operation_class = str(preflight_binding["operation_class"])
+    operation = (
+        "post_append_summary_sync"
+        if operation_class == "post_append_summary_sync"
+        else str(preflight_binding.get("write_type") or WRITE_TYPE_BY_FILE_KEY.get(args.file_key))
+    )
+    return {
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "receipt_type": "helper_write",
+        "helper_name": "commit_context_file.py",
+        "helper_version": PACKAGE_VERSION,
+        "operation": operation,
+        "operation_class": operation_class,
+        "side_effect": "target_and_state_written",
+        "result": "ok",
+        "state_label_before": preflight_binding.get("provenance_state") or "structurally_valid",
+        "state_label_after": "helper_evidenced",
+        "target_file_key": args.file_key,
+        "target_digest": target_digest,
+        "state_digest": state_digest,
+        "preflight_contract_identity": preflight_binding["preflight_contract_identity"],
+        "expected_workspace_revision": args.expected_workspace_revision,
+        "result_workspace_revision": new_workspace_revision,
+        "expected_file_revision": args.expected_file_revision,
+        "result_file_revision": new_file_revision,
+        "created_at": timestamp,
+    }
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -977,6 +1566,22 @@ def main() -> None:
             message="No RecallLoom project root found.",
             reason="no_project_root",
         )
+    preflight_binding = normalize_preflight_binding(
+        parser,
+        json_mode=args.json,
+        raw=args.preflight_binding_json,
+        project_root=workspace.project_root,
+        file_key=args.file_key,
+        expected_file_revision=args.expected_file_revision,
+        expected_workspace_revision=args.expected_workspace_revision,
+    )
+    enforce_preflight_binding_lease(
+        parser,
+        json_mode=args.json,
+        storage_root=workspace.storage_root,
+        project_root=workspace.project_root,
+        preflight_binding=preflight_binding,
+    )
     startup_residue_report = exit_if_startup_scratch_residue_for_sources(
         parser,
         json_mode=args.json,
@@ -1006,6 +1611,7 @@ def main() -> None:
             details={"path": str(target_path)},
         )
 
+    receipt_finalization = None
     try:
         with workspace_write_lock(workspace.project_root, "commit_context_file.py"):
             try:
@@ -1030,6 +1636,12 @@ def main() -> None:
 
             state_path = workspace.storage_root / FILE_KEYS["state"]
             state = load_workspace_state(state_path)
+            enforce_provenance_write_gate(
+                parser,
+                json_mode=args.json,
+                state=state,
+                preflight_binding=preflight_binding,
+            )
             if state["workspace_revision"] != args.expected_workspace_revision:
                 exit_with_cli_error(
                     parser,
@@ -1230,6 +1842,16 @@ def main() -> None:
                         extra={"unknown_section_keys": unknown_keys},
                     ),
                 )
+            prevalidate_receipt_store_before_write(
+                parser,
+                json_mode=args.json,
+                storage_root=workspace.storage_root,
+                project_root=workspace.project_root,
+                preflight_binding=preflight_binding,
+                file_key=args.file_key,
+                new_file_revision=new_file_revision,
+                new_workspace_revision=new_workspace_revision,
+            )
             new_text = build_managed_text(
                 file_key=args.file_key,
                 body_text=body_text,
@@ -1250,6 +1872,12 @@ def main() -> None:
                     reason="damaged_sidecar",
                 )
 
+            previous_provenance = state.get("provenance")
+            previous_state_label = (
+                previous_provenance.get("state_label")
+                if isinstance(previous_provenance, dict)
+                else None
+            )
             state["workspace_revision"] = new_workspace_revision
             state["files"][args.file_key] = {
                 "file_revision": new_file_revision,
@@ -1259,6 +1887,14 @@ def main() -> None:
             }
             if args.file_key == "update_protocol":
                 state["update_protocol_revision"] = new_file_revision
+            if preflight_binding is not None:
+                state["provenance"] = helper_evidenced_metadata(
+                    timestamp=timestamp,
+                    previous_state_label=(
+                        previous_state_label if isinstance(previous_state_label, str) else None
+                    ),
+                )
+            expected_state_text = expected_state_json_text(state)
             try:
                 dump_json(state_path, state)
             except OSError as exc:
@@ -1285,6 +1921,56 @@ def main() -> None:
                     ),
                     reason="damaged_sidecar",
                 )
+            if preflight_binding is not None:
+                target_digest, state_digest = verify_post_write_hashes(
+                    parser,
+                    json_mode=args.json,
+                    target_path=target_path,
+                    state_path=state_path,
+                    expected_target_text=new_text,
+                    expected_state_text=expected_state_text,
+                    file_key=args.file_key,
+                    new_file_revision=new_file_revision,
+                    new_workspace_revision=new_workspace_revision,
+                    state=state,
+                    previous_provenance=previous_provenance,
+                )
+                receipt_seed = build_receipt_seed(
+                    args=args,
+                    preflight_binding=preflight_binding,
+                    timestamp=timestamp,
+                    target_digest=target_digest,
+                    state_digest=state_digest,
+                    new_file_revision=new_file_revision,
+                    new_workspace_revision=new_workspace_revision,
+                )
+                try:
+                    receipt_finalization = finalize_receipt_in_store(
+                        storage_root=workspace.storage_root,
+                        receipt=receipt_seed,
+                        project_root=workspace.project_root,
+                    )
+                except ReceiptStoreError as exc:
+                    restore_provenance_after_receipt_failure(
+                        parser,
+                        json_mode=args.json,
+                        state_path=state_path,
+                        state=state,
+                        previous_provenance=previous_provenance,
+                        failure_message=str(exc),
+                        reason_code=exc.reason_code,
+                    )
+                    exit_receipt_finalization_failure(
+                        parser,
+                        json_mode=args.json,
+                        message=str(exc),
+                        reason_code=exc.reason_code,
+                        side_effect=exc.side_effect,
+                        file_key=args.file_key,
+                        new_file_revision=new_file_revision,
+                        new_workspace_revision=new_workspace_revision,
+                        extra=exc.details,
+                    )
     except LockBusyError as exc:
         exit_with_failure_contract(
             parser,
@@ -1322,6 +2008,26 @@ def main() -> None:
         **attribution.public_fields(),
         "ok": True,
     }
+    if receipt_finalization is not None:
+        receipt = receipt_finalization["receipt"]
+        payload.update(
+            {
+                "provenance_state": "helper_evidenced",
+                "provenance_result": {
+                    "state_label": "helper_evidenced",
+                    "receipt_backed": True,
+                    "receipt_finalization_status": "finalized",
+                    "receipt_store_available": True,
+                    "receipt_digest": receipt_finalization["receipt_digest"],
+                    "store_binding": receipt_finalization["store_binding"],
+                    "redaction_policy_version": receipt.get("redaction_policy_version"),
+                },
+                "public_receipt_claim": public_receipt_claim(
+                    receipt,
+                    project_root=str(workspace.project_root),
+                ),
+            }
+        )
     if wrapper_metadata is not None:
         payload["wrapper_metadata"] = wrapper_metadata
     if args.json:
@@ -1335,7 +2041,8 @@ def main() -> None:
             )
         )
     else:
-        print(f"Committed {args.file_key} to {target_path}")
+        public_target = public_project_path(target_path, project_root=workspace.project_root)
+        print(f"Committed {args.file_key} to {public_target or args.file_key}")
 
 
 if __name__ == "__main__":

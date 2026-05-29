@@ -115,6 +115,18 @@ _exit_if_runtime_unsupported()
 from core.continuity.quick_summary import build_no_project_payload, build_quick_summary_payload
 from core.continuity.workday import RECOMMENDATION_TYPES, describe_workday_guidance
 from core.failure.contracts import failure_payload, preferred_failure_language
+from core.output.privacy import redact_public_text
+from core.provenance.bindings import (
+    PreflightBindingLeaseError,
+    write_preflight_binding_lease,
+)
+from core.provenance.state import (
+    build_provenance_report,
+    expected_revisions_payload,
+    provenance_facts_from_state,
+    provenance_contract_identity,
+    preflight_write_binding_hash,
+)
 from core.protocol.contracts import FILE_KEYS, ROOT_ENTRY_CANDIDATES
 from core.protocol.markers import parse_file_state_marker
 from core.support.policy import action_level_for_dispatcher
@@ -237,6 +249,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Project path or a descendant path. Defaults to the current working directory.",
     )
     validate_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+    validate_parser.add_argument(
+        "--require-provenance",
+        action="store_true",
+        help="Require explicit helper receipt evidence in addition to structural validation.",
+    )
+    validate_scope = validate_parser.add_mutually_exclusive_group()
+    validate_scope.add_argument(
+        "--changed-only",
+        action="store_true",
+        help="With --require-provenance, verify bounded current receipt-store evidence.",
+    )
+    validate_scope.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "With --require-provenance, run the bounded current receipt-store audit. "
+            "This MVP does not perform historical receipt-chain validation."
+        ),
+    )
 
     resume_parser = subparsers.add_parser(
         "resume",
@@ -317,6 +348,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(RECOMMENDATION_TYPES),
         help="Optional explicit session-intent hint using one of the recommendation types.",
     )
+    status_parser.add_argument(
+        "--expanded",
+        action="store_true",
+        help=(
+            "Opt into the expanded status lane that may inspect context_brief.md, "
+            "update_protocol.md, and latest daily-log content."
+        ),
+    )
     status_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
     quick_summary_parser = subparsers.add_parser(
@@ -381,6 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require explicit --date and --expected-workspace-revision instead of helper auto-detect.",
     )
     append_parser.add_argument(
+        "--confirm-review-imported-baseline",
+        action="store_true",
+        help=(
+            "Confirm a review_imported_baseline ask gate before a mutating daily-log append. "
+            "Only use after reviewing the preflight readiness output."
+        ),
+    )
+    append_parser.add_argument(
         "--writer-id",
         help="Override the writer ID for appended daily-log entries.",
     )
@@ -437,6 +484,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run preflight and report the target/revisions without writing sidecar state or files.",
     )
     write_parser.add_argument(
+        "--confirm-review-imported-baseline",
+        action="store_true",
+        help=(
+            "Confirm a review_imported_baseline ask gate before a mutating current-state write. "
+            "Only use after reviewing the preflight readiness output."
+        ),
+    )
+    write_parser.add_argument(
         "--writer-id",
         help="Override the writer ID used by commit_context_file.py.",
     )
@@ -482,6 +537,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-input-bytes",
         type=positive_int,
         help="Maximum reviewed-summary input size in bytes forwarded to commit_context_file.py.",
+    )
+    post_append_sync_parser.add_argument(
+        "--confirm-review-imported-baseline",
+        action="store_true",
+        help=(
+            "Confirm a review_imported_baseline ask gate before a post-append current-state sync. "
+            "Only use after reviewing the preflight post_append_summary_sync contract."
+        ),
     )
     post_append_sync_parser.add_argument(
         "--writer-id",
@@ -880,10 +943,82 @@ def _status_like_helper_args(args: argparse.Namespace) -> list[str]:
         helper_args.extend(["--preferred-date", args.preferred_date])
     if args.session_intent:
         helper_args.extend(["--session-intent", args.session_intent])
+    if getattr(args, "expanded", False):
+        helper_args.append("--expanded")
     return helper_args
 
 
-def _append_helper_args(args: argparse.Namespace) -> list[str]:
+def _validate_helper_args(args: argparse.Namespace) -> list[str]:
+    helper_args = [args.target]
+    if args.require_provenance:
+        helper_args.append("--require-provenance")
+    if args.changed_only:
+        helper_args.append("--changed-only")
+    if args.full:
+        helper_args.append("--full")
+    return helper_args
+
+
+def _validate_provenance_scope_failure_payload(message: str, *, reason_code: str) -> dict:
+    return cli_failure_payload(
+        "invalid_prepared_input",
+        error=message,
+        details={"reason_code": reason_code},
+        extra={
+            "next_actions": ["choose_validate_provenance_scope", "retry_validate"],
+            "suggestion": (
+                "Use --require-provenance with exactly one scope flag: --changed-only "
+                "or --full. Omit all provenance flags for structural-only validation."
+            ),
+            "recovery_command": (
+                "recallloom.py validate <project-path> --require-provenance "
+                "--changed-only --json"
+            ),
+            "operator_note": (
+                "Explicit provenance validation requires --require-provenance plus "
+                "exactly one scope flag."
+            ),
+        },
+    )
+
+
+def _validate_provenance_scope_args(parser, args: argparse.Namespace) -> None:
+    scope_count = int(bool(args.changed_only)) + int(bool(args.full))
+    if args.require_provenance:
+        if scope_count != 1:
+            message = "--require-provenance requires exactly one scope flag: --changed-only or --full."
+            exit_with_cli_error(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=message,
+                payload=_validate_provenance_scope_failure_payload(
+                    message,
+                    reason_code="provenance_scope_required",
+                ),
+            )
+        return
+    if scope_count:
+        message = "--changed-only and --full require --require-provenance."
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=_validate_provenance_scope_failure_payload(
+                message,
+                reason_code="provenance_scope_without_requirement",
+            ),
+        )
+
+
+def _append_helper_args(
+    parser,
+    args: argparse.Namespace,
+    *,
+    preflight_payload: dict,
+    support: dict,
+) -> list[str]:
     helper_args = [args.target]
     if args.entry_json is not None:
         helper_args.extend(["--entry-json", args.entry_json])
@@ -905,8 +1040,34 @@ def _append_helper_args(args: argparse.Namespace) -> list[str]:
         helper_args.extend(["--writer-id", args.writer_id])
     if args.wrapper_metadata_json is not None:
         helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
-    if args.expected_workspace_revision is not None:
-        helper_args.extend(["--expected-workspace-revision", str(args.expected_workspace_revision)])
+    expected_workspace_revision = (
+        args.expected_workspace_revision
+        if args.expected_workspace_revision is not None
+        else _append_expected_workspace_revision(preflight_payload)
+    )
+    helper_args.extend(["--expected-workspace-revision", str(expected_workspace_revision)])
+    if _write_readiness_label(preflight_payload) in {
+        "structural_only_ready_after_preflight",
+        "helper_evidenced_ready_after_preflight",
+        "review_imported_baseline_ready_after_preflight",
+    }:
+        helper_args.extend(
+            [
+                "--preflight-binding-json",
+                _issue_preflight_binding_json(
+                    parser,
+                    args,
+                    preflight_payload=preflight_payload,
+                    binding_json=_append_preflight_binding_json(
+                        expected_workspace_revision=expected_workspace_revision,
+                        preflight_payload=preflight_payload,
+                        target_date=args.date,
+                        confirm_review_imported_baseline=args.confirm_review_imported_baseline,
+                    ),
+                    support=support,
+                ),
+            ]
+        )
     return helper_args
 
 
@@ -1060,6 +1221,86 @@ def _preflight_payload(parser, args: argparse.Namespace, *, support: dict) -> di
     )
 
 
+def _issue_preflight_binding_json(
+    parser,
+    args: argparse.Namespace,
+    *,
+    preflight_payload: dict,
+    binding_json: str,
+    support: dict,
+) -> str:
+    try:
+        binding = json.loads(binding_json)
+    except json.JSONDecodeError as exc:
+        message = f"Dispatcher generated an invalid preflight binding: {exc.msg}."
+        _exit_with_support(
+            parser,
+            json_mode=getattr(args, "json", False),
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload("registry_contract_invalid", error=message),
+            support=support,
+        )
+    if not isinstance(binding, dict):
+        message = "Dispatcher generated a non-object preflight binding."
+        _exit_with_support(
+            parser,
+            json_mode=getattr(args, "json", False),
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload("registry_contract_invalid", error=message),
+            support=support,
+        )
+    try:
+        workspace = find_recallloom_root(args.target)
+    except (StorageResolutionError, ConfigContractError) as exc:
+        _exit_with_support(
+            parser,
+            json_mode=getattr(args, "json", False),
+            exit_code=2,
+            message=str(exc),
+            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+            support=support,
+        )
+    if workspace is None:
+        message = "Preflight binding target is no longer attached to RecallLoom."
+        _exit_with_support(
+            parser,
+            json_mode=getattr(args, "json", False),
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload("no_project_root", error=message),
+            support=support,
+        )
+    try:
+        write_preflight_binding_lease(
+            storage_root=workspace.storage_root,
+            project_root=workspace.project_root,
+            binding=binding,
+            preflight_payload=preflight_payload,
+            issued_by="recallloom.py",
+        )
+    except PreflightBindingLeaseError as exc:
+        message = str(exc)
+        _exit_with_support(
+            parser,
+            json_mode=getattr(args, "json", False),
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                details={
+                    **exc.details,
+                    "side_effect": "none",
+                    "lease_store": "derived/preflight-bindings.json",
+                },
+            ),
+            support=support,
+        )
+    return binding_json
+
+
 def _preflight_gate_details(preflight_payload: dict) -> dict:
     detail_keys = (
         "allowed_operation_level",
@@ -1069,6 +1310,10 @@ def _preflight_gate_details(preflight_payload: dict) -> dict:
         "recommended_actions",
         "continuity_confidence",
         "continuity_state",
+        "provenance_state",
+        "write_readiness",
+        "expected_revisions",
+        "preflight_contract_identity",
         "workspace_newer_than_summary",
         "summary_revision_stale",
     )
@@ -1080,6 +1325,8 @@ def _write_retry_payload(
     *,
     file_key: str,
     input_mode: str,
+    extra_args: list[str] | None = None,
+    requires_repair_command_first: bool = True,
 ) -> dict:
     writer_args: list[str] = []
     writer_fields: dict[str, str | bool] = {}
@@ -1123,9 +1370,10 @@ def _write_retry_payload(
             args.write_type,
             *input_args,
             *writer_args,
+            *(extra_args or []),
             "--json",
         ],
-        "requires_repair_command_first": True,
+        "requires_repair_command_first": requires_repair_command_first,
         "side_effect": "none_until_retry",
         **writer_fields,
     }
@@ -1138,16 +1386,19 @@ def _write_preflight_failure_payload(
     input_mode: str,
     message: str,
     details: dict,
+    reason: str = "stale_write_context",
+    retry_extra_args: list[str] | None = None,
+    retry_requires_repair: bool = True,
 ) -> dict:
     # Keep repair_command tied to the public failure contract while letting
     # retry_payload pass through the contract's final publicization step.
     base_payload = cli_failure_payload(
-        "stale_write_context",
+        reason,
         error=message,
         details=details,
     )
     return cli_failure_payload(
-        "stale_write_context",
+        reason,
         error=message,
         details=details,
         extra={
@@ -1156,6 +1407,8 @@ def _write_preflight_failure_payload(
                 args,
                 file_key=file_key,
                 input_mode=input_mode,
+                extra_args=retry_extra_args,
+                requires_repair_command_first=retry_requires_repair,
             ),
         },
     )
@@ -1172,12 +1425,66 @@ def _enforce_write_preflight_gate(
 ) -> None:
     allowed_operation_level = preflight_payload.get("allowed_operation_level")
     summary_stale = preflight_payload.get("summary_stale")
-    if allowed_operation_level == "write_current_state_after_preflight" and summary_stale is False:
+    readiness_label = _write_readiness_label(preflight_payload)
+    allowed_readiness = {
+        "structural_only_ready_after_preflight",
+        "helper_evidenced_ready_after_preflight",
+        "review_imported_baseline_ready_after_preflight",
+    }
+    current_state_refresh_allowed = _current_state_refresh_allowed(
+        file_key=file_key,
+        write_type=args.write_type,
+        preflight_payload=preflight_payload,
+    )
+    if (
+        allowed_operation_level == "write_current_state_after_preflight"
+        and summary_stale is False
+        and readiness_label in allowed_readiness
+    ) or current_state_refresh_allowed:
+        if (
+            _binding_write_readiness_label(
+                file_key=file_key,
+                write_type=args.write_type,
+                preflight_payload=preflight_payload,
+            )
+            == "review_imported_baseline_ready_after_preflight"
+            and not args.dry_run
+            and not getattr(args, "confirm_review_imported_baseline", False)
+        ):
+            message = (
+                "Preflight returned an ask gate for review_imported_baseline. "
+                "Review the readiness output and rerun with --confirm-review-imported-baseline "
+                "to confirm this mutating write."
+            )
+            payload = _write_preflight_failure_payload(
+                args,
+                file_key=file_key,
+                input_mode=input_mode,
+                message=message,
+                reason="review_imported_baseline_confirmation_required",
+                retry_extra_args=["--confirm-review-imported-baseline"],
+                retry_requires_repair=False,
+                details={
+                    **_preflight_gate_details(preflight_payload),
+                    "reason_code": "review_imported_baseline_confirmation_required",
+                    "side_effect": "none",
+                    "required_flag": "--confirm-review-imported-baseline",
+                },
+            )
+            _exit_with_support(
+                parser,
+                json_mode=args.json,
+                exit_code=3,
+                message=message,
+                payload=payload,
+                support=support,
+            )
         return
 
     message = (
         "Preflight requires review before write. recallloom.py write only proceeds when "
-        "allowed_operation_level is write_current_state_after_preflight and summary_stale is false."
+        "allowed_operation_level is write_current_state_after_preflight, summary_stale is false, "
+        "and provenance write_readiness allows a revision-checked helper write."
     )
     payload = _write_preflight_failure_payload(
         args,
@@ -1185,6 +1492,150 @@ def _enforce_write_preflight_gate(
         input_mode=input_mode,
         message=message,
         details=_preflight_gate_details(preflight_payload),
+    )
+    _exit_with_support(
+        parser,
+        json_mode=args.json,
+        exit_code=3,
+        message=message,
+        payload=payload,
+        support=support,
+    )
+
+
+def _enforce_append_preflight_gate(
+    parser,
+    args: argparse.Namespace,
+    *,
+    preflight_payload: dict,
+    support: dict,
+) -> None:
+    provenance_state = preflight_payload.get("provenance_state")
+    readiness_label = _write_readiness_label(preflight_payload)
+    if provenance_state == "review_imported_baseline":
+        if readiness_label != "review_imported_baseline_ready_after_preflight":
+            message = (
+                "Preflight did not authorize a revision-checked append for "
+                "review_imported_baseline. Rerun preflight after resolving freshness or "
+                "continuity review warnings."
+            )
+            payload = cli_failure_payload(
+                "stale_write_context",
+                error=message,
+                details={
+                    **_preflight_gate_details(preflight_payload),
+                    "reason_code": "review_imported_baseline_append_not_authorized",
+                    "command": "append",
+                    "side_effect": "none",
+                },
+            )
+            _exit_with_support(
+                parser,
+                json_mode=args.json,
+                exit_code=3,
+                message=message,
+                payload=payload,
+                support=support,
+            )
+        if not getattr(args, "confirm_review_imported_baseline", False):
+            message = (
+                "Preflight returned an ask gate for review_imported_baseline. "
+                "Review the readiness output and rerun with --confirm-review-imported-baseline "
+                "to confirm this mutating append."
+            )
+            payload = cli_failure_payload(
+                "review_imported_baseline_confirmation_required",
+                error=message,
+                details={
+                    **_preflight_gate_details(preflight_payload),
+                    "reason_code": "review_imported_baseline_confirmation_required",
+                    "command": "append",
+                    "side_effect": "none",
+                    "required_flag": "--confirm-review-imported-baseline",
+                },
+                extra={
+                    "retry_payload": {
+                        "command": "recallloom.py append",
+                        "project_ref": "same_project",
+                        "input_ref": (
+                            "same_prepared_entry_file"
+                            if args.entry_file is not None
+                            else "resubmit_same_stdin_payload"
+                            if args.stdin
+                            else "same_entry_json_payload"
+                        ),
+                        "argv_template": [
+                            "recallloom.py",
+                            "append",
+                            "same_project",
+                            "--confirm-review-imported-baseline",
+                            "--json",
+                        ],
+                        "requires_repair_command_first": False,
+                        "side_effect": "none_until_retry",
+                    },
+                },
+            )
+            _exit_with_support(
+                parser,
+                json_mode=args.json,
+                exit_code=3,
+                message=message,
+                payload=payload,
+                support=support,
+            )
+        return
+    if readiness_label in {
+        "structural_only_ready_after_preflight",
+        "helper_evidenced_ready_after_preflight",
+    }:
+        return
+
+    if provenance_state not in {"review_required", "structurally_valid_legacy"} and (
+        readiness_label not in {"review_required", "readable_legacy", "blocked"}
+    ):
+        message = (
+            "Preflight did not authorize a revision-checked append. Refresh current "
+            "state or resolve the write-readiness warning before appending."
+        )
+        payload = cli_failure_payload(
+            "stale_write_context",
+            error=message,
+            details={
+                **_preflight_gate_details(preflight_payload),
+                "reason_code": "append_write_readiness_not_authorized",
+                "command": "append",
+                "side_effect": "none",
+            },
+        )
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=payload,
+            support=support,
+        )
+
+    message = (
+        "Preflight requires provenance review before append. recallloom.py append only "
+        "delegates to append_daily_log_entry.py when the sidecar is not in a legacy "
+        "review-required state."
+    )
+    payload = cli_failure_payload(
+        "trust_review_required",
+        error=message,
+        details={
+            **_preflight_gate_details(preflight_payload),
+            "command": "append",
+            "side_effect": "none",
+            "next_actions": [
+                "stage_recovery_proposal.py",
+                "record_recovery_review.py",
+                "prepare_recovery_promotion.py",
+                "preflight_context_check.py",
+            ],
+        },
     )
     _exit_with_support(
         parser,
@@ -1283,11 +1734,207 @@ def _write_context_from_preflight(
     }
 
 
+def _write_readiness_label(preflight_payload: dict) -> str | None:
+    write_readiness = preflight_payload.get("write_readiness")
+    if isinstance(write_readiness, dict):
+        readiness = write_readiness.get("readiness")
+        return readiness if isinstance(readiness, str) else None
+    return None
+
+
+def _is_ready_after_preflight_label(label: str | None) -> bool:
+    return label in {
+        "structural_only_ready_after_preflight",
+        "helper_evidenced_ready_after_preflight",
+        "review_imported_baseline_ready_after_preflight",
+    }
+
+
+def _ready_after_preflight_label_for_provenance(provenance_state: object) -> str | None:
+    if provenance_state == "structurally_valid":
+        return "structural_only_ready_after_preflight"
+    if provenance_state == "helper_evidenced":
+        return "helper_evidenced_ready_after_preflight"
+    if provenance_state == "review_imported_baseline":
+        return "review_imported_baseline_ready_after_preflight"
+    return None
+
+
+def _current_state_refresh_allowed(
+    *,
+    file_key: str,
+    write_type: str,
+    preflight_payload: dict,
+) -> bool:
+    if file_key != "rolling_summary" or write_type != "current-state":
+        return False
+    if preflight_payload.get("summary_stale") is not True:
+        return False
+    if preflight_payload.get("workspace_newer_than_summary") is not True:
+        return False
+    if preflight_payload.get("write_context_authorized") is False:
+        return False
+    if "update_rolling_summary" not in preflight_payload.get("recommended_actions", []):
+        return False
+    if _ready_after_preflight_label_for_provenance(preflight_payload.get("provenance_state")) is None:
+        return False
+    safe_write_context = preflight_payload.get("safe_write_context")
+    commit_contexts = (
+        safe_write_context.get("commit_context_file")
+        if isinstance(safe_write_context, dict)
+        else None
+    )
+    rolling_summary_context = (
+        commit_contexts.get("rolling_summary")
+        if isinstance(commit_contexts, dict)
+        else None
+    )
+    return (
+        isinstance(rolling_summary_context, dict)
+        and isinstance(rolling_summary_context.get("expected_file_revision"), int)
+        and isinstance(rolling_summary_context.get("expected_workspace_revision"), int)
+    )
+
+
+def _binding_write_readiness_label(
+    *,
+    file_key: str,
+    write_type: str,
+    preflight_payload: dict,
+) -> str | None:
+    readiness_label = _write_readiness_label(preflight_payload)
+    if _is_ready_after_preflight_label(readiness_label):
+        return readiness_label
+    if _current_state_refresh_allowed(
+        file_key=file_key,
+        write_type=write_type,
+        preflight_payload=preflight_payload,
+    ):
+        return _ready_after_preflight_label_for_provenance(
+            preflight_payload.get("provenance_state")
+        )
+    return readiness_label
+
+
+def _append_expected_workspace_revision(preflight_payload: dict) -> int:
+    safe_write_context = preflight_payload.get("safe_write_context")
+    if isinstance(safe_write_context, dict):
+        append_context = safe_write_context.get("append_daily_log_entry")
+        if isinstance(append_context, dict):
+            revision = append_context.get("expected_workspace_revision")
+            if isinstance(revision, int):
+                return revision
+    expected_revisions = preflight_payload.get("expected_revisions")
+    if isinstance(expected_revisions, dict):
+        revision = expected_revisions.get("workspace_revision")
+        if isinstance(revision, int):
+            return revision
+    revision = preflight_payload.get("workspace_revision")
+    if isinstance(revision, int):
+        return revision
+    raise ConfigContractError("Preflight payload is missing append expected_workspace_revision.")
+
+
+def _append_preflight_binding_json(
+    *,
+    expected_workspace_revision: int,
+    preflight_payload: dict,
+    target_date: str | None,
+    confirm_review_imported_baseline: bool = False,
+) -> str:
+    write_readiness = preflight_payload.get("write_readiness")
+    safe_write_context = preflight_payload.get("safe_write_context")
+    append_context = (
+        safe_write_context.get("append_daily_log_entry")
+        if isinstance(safe_write_context, dict)
+        else {}
+    )
+    if not isinstance(append_context, dict):
+        append_context = {}
+    binding = {
+        "binding_type": "recallloom.preflight_write_binding",
+        "binding_version": "0.1",
+        "operation_class": "daily_log_append",
+        "file_key": "daily_log",
+        "write_type": "milestone_evidence",
+        "target_date": target_date or append_context.get("suggested_date"),
+        "latest_file": append_context.get("latest_file"),
+        "latest_entry_id": append_context.get("latest_entry_id"),
+        "latest_entry_seq": append_context.get("latest_entry_seq"),
+        "entry_count": append_context.get("entry_count"),
+        "latest_file_digest": append_context.get("latest_file_digest"),
+        "expected_workspace_revision": expected_workspace_revision,
+        "preflight_contract_identity": (
+            preflight_payload.get("preflight_contract_identity")
+            or provenance_contract_identity()
+        ),
+        "provenance_state": preflight_payload.get("provenance_state"),
+        "write_readiness_label": _write_readiness_label(preflight_payload),
+    }
+    if isinstance(write_readiness, dict):
+        for key in ("ux_gate", "ux_gate_requires_confirmation", "ux_gate_reason"):
+            if key in write_readiness:
+                binding[key] = write_readiness[key]
+    if confirm_review_imported_baseline:
+        binding["ux_gate_confirmation"] = "review_imported_baseline_confirmed"
+    expected_revisions = preflight_payload.get("expected_revisions")
+    if isinstance(expected_revisions, dict):
+        binding["expected_revisions"] = expected_revisions
+    binding["preflight_contract_hash"] = preflight_write_binding_hash(binding)
+    return json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _preflight_write_binding_json(
+    *,
+    file_key: str,
+    write_type: str,
+    operation_class: str,
+    expected_file_revision: int,
+    expected_workspace_revision: int,
+    preflight_payload: dict,
+    contract_type: str | None = None,
+    confirm_review_imported_baseline: bool = False,
+    write_readiness_label: str | None = None,
+) -> str:
+    write_readiness = preflight_payload.get("write_readiness")
+    binding = {
+        "binding_type": "recallloom.preflight_write_binding",
+        "binding_version": "0.1",
+        "operation_class": operation_class,
+        "file_key": file_key,
+        "write_type": write_type,
+        "expected_file_revision": expected_file_revision,
+        "expected_workspace_revision": expected_workspace_revision,
+        "preflight_contract_identity": (
+            preflight_payload.get("preflight_contract_identity")
+            or provenance_contract_identity()
+        ),
+        "provenance_state": preflight_payload.get("provenance_state"),
+        "write_readiness_label": write_readiness_label or _write_readiness_label(preflight_payload),
+    }
+    if isinstance(write_readiness, dict):
+        for key in ("ux_gate", "ux_gate_requires_confirmation", "ux_gate_reason"):
+            if key in write_readiness:
+                binding[key] = write_readiness[key]
+    if confirm_review_imported_baseline:
+        binding["ux_gate_confirmation"] = "review_imported_baseline_confirmed"
+    expected_revisions = preflight_payload.get("expected_revisions")
+    if isinstance(expected_revisions, dict):
+        binding["expected_revisions"] = expected_revisions
+    if contract_type is not None:
+        binding["contract_type"] = contract_type
+    binding["preflight_contract_hash"] = preflight_write_binding_hash(binding)
+    return json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _commit_context_file_args(
+    parser,
     args: argparse.Namespace,
     *,
     file_key: str,
     write_context: dict,
+    preflight_payload: dict,
+    support: dict,
 ) -> list[str]:
     helper_args = [
         args.target,
@@ -1310,6 +1957,31 @@ def _commit_context_file_args(
         helper_args.extend(["--writer-id", args.writer_id])
     if args.wrapper_metadata_json is not None:
         helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
+    helper_args.extend(
+        [
+            "--preflight-binding-json",
+            _issue_preflight_binding_json(
+                parser,
+                args,
+                preflight_payload=preflight_payload,
+                binding_json=_preflight_write_binding_json(
+                    file_key=file_key,
+                    write_type=args.write_type,
+                    operation_class="managed_file_commit",
+                    expected_file_revision=write_context["expected_file_revision"],
+                    expected_workspace_revision=write_context["expected_workspace_revision"],
+                    preflight_payload=preflight_payload,
+                    confirm_review_imported_baseline=args.confirm_review_imported_baseline,
+                    write_readiness_label=_binding_write_readiness_label(
+                        file_key=file_key,
+                        write_type=args.write_type,
+                        preflight_payload=preflight_payload,
+                    ),
+                ),
+                support=support,
+            ),
+        ]
+    )
     return helper_args
 
 
@@ -1340,6 +2012,8 @@ def _post_append_sync_retry_payload(
     input_args = ["--stdin"]
     if args.max_input_bytes is not None:
         input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    if getattr(args, "confirm_review_imported_baseline", False):
+        input_args.append("--confirm-review-imported-baseline")
     return {
         "command": f"recallloom.py {POST_APPEND_SYNC_COMMAND}",
         "project_ref": "same_project",
@@ -1411,6 +2085,36 @@ def _post_append_sync_failure_payload(
         "ordinary_write_gate": ordinary_write_gate if isinstance(ordinary_write_gate, dict) else None,
         "retry_payload": _post_append_sync_retry_payload(args, input_mode=input_mode),
     }
+
+
+def _post_append_sync_confirmation_payload(
+    args: argparse.Namespace,
+    *,
+    input_mode: str,
+    preflight_payload: dict,
+) -> dict:
+    retry_payload = _post_append_sync_retry_payload(args, input_mode=input_mode)
+    argv_template = retry_payload.get("argv_template")
+    if isinstance(argv_template, list) and "--confirm-review-imported-baseline" not in argv_template:
+        insert_at = len(argv_template) - 1 if argv_template and argv_template[-1] == "--json" else len(argv_template)
+        argv_template.insert(insert_at, "--confirm-review-imported-baseline")
+    retry_payload["requires_repair_command_first"] = False
+    return cli_failure_payload(
+        "review_imported_baseline_confirmation_required",
+        error=(
+            "Preflight returned an ask gate for review_imported_baseline. "
+            "Review the post_append_summary_sync contract and rerun with "
+            "--confirm-review-imported-baseline to confirm this current-state sync."
+        ),
+        details={
+            **_preflight_gate_details(preflight_payload),
+            "reason_code": "review_imported_baseline_confirmation_required",
+            "command": POST_APPEND_SYNC_COMMAND,
+            "side_effect": "none",
+            "required_flag": "--confirm-review-imported-baseline",
+        },
+        extra={"retry_payload": retry_payload},
+    )
 
 
 def _post_append_sync_invalid_input_payload(
@@ -1618,7 +2322,14 @@ def _post_append_sync_contract_from_preflight(preflight_payload: dict) -> dict |
     return contract if isinstance(contract, dict) else None
 
 
-def _post_append_sync_commit_args(args: argparse.Namespace, *, contract: dict) -> list[str]:
+def _post_append_sync_commit_args(
+    parser,
+    args: argparse.Namespace,
+    *,
+    contract: dict,
+    preflight_payload: dict,
+    support: dict,
+) -> list[str]:
     helper_args = [
         args.target,
         "--file-key",
@@ -1640,6 +2351,30 @@ def _post_append_sync_commit_args(args: argparse.Namespace, *, contract: dict) -
         helper_args.extend(["--writer-id", safe_writer_id])
     if args.wrapper_metadata_json is not None:
         helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
+    helper_args.extend(
+        [
+            "--preflight-binding-json",
+            _issue_preflight_binding_json(
+                parser,
+                args,
+                preflight_payload=preflight_payload,
+                binding_json=_preflight_write_binding_json(
+                    file_key="rolling_summary",
+                    write_type="current-state",
+                    operation_class="post_append_summary_sync",
+                    expected_file_revision=contract["expected_file_revision"],
+                    expected_workspace_revision=contract["expected_workspace_revision"],
+                    preflight_payload=preflight_payload,
+                    contract_type=POST_APPEND_SYNC_CONTRACT_TYPE,
+                    confirm_review_imported_baseline=args.confirm_review_imported_baseline,
+                    write_readiness_label=_ready_after_preflight_label_for_provenance(
+                        preflight_payload.get("provenance_state")
+                    ),
+                ),
+                support=support,
+            ),
+        ]
+    )
     return helper_args
 
 
@@ -1686,10 +2421,37 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
         )
 
     assert contract is not None
+    if (
+        preflight_payload.get("provenance_state") == "review_imported_baseline"
+        and not args.confirm_review_imported_baseline
+    ):
+        message = (
+            "Preflight returned an ask gate for review_imported_baseline. "
+            "Review the post_append_summary_sync contract and rerun with "
+            "--confirm-review-imported-baseline to confirm this current-state sync."
+        )
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=_post_append_sync_confirmation_payload(
+                args,
+                input_mode=input_mode,
+                preflight_payload=preflight_payload,
+            ),
+            support=support,
+        )
     payload = _run_helper_json(
         parser,
         helper_name="commit_context_file.py",
-        helper_args=_post_append_sync_commit_args(args, contract=contract),
+        helper_args=_post_append_sync_commit_args(
+            parser,
+            args,
+            contract=contract,
+            preflight_payload=preflight_payload,
+            support=support,
+        ),
         json_mode_on_failure=args.json,
         support=support,
         package_support_on_failure=True,
@@ -1864,7 +2626,12 @@ def _project_relative_path(path: Path, project_root: Path) -> str:
     return path.relative_to(project_root).as_posix()
 
 
-def _compact_guidance(text: str, *, max_chars: int = 360) -> str | None:
+def _compact_guidance(
+    text: str,
+    *,
+    project_root: Path | None = None,
+    max_chars: int = 360,
+) -> str | None:
     lines: list[str] = []
     for raw in text.splitlines():
         stripped = raw.strip()
@@ -1872,7 +2639,7 @@ def _compact_guidance(text: str, *, max_chars: int = 360) -> str | None:
             continue
         stripped = stripped.lstrip("#-* ").strip()
         if stripped:
-            lines.append(stripped)
+            lines.append(redact_public_text(stripped, project_root=project_root) or "redacted")
     compacted = " ".join(lines)
     if not compacted:
         return None
@@ -1938,6 +2705,7 @@ def _resume_trust_state(
     continuity_state: str,
     summary_stale: bool,
     workspace_newer_than_summary: bool,
+    provenance_facts: dict | None = None,
 ) -> dict:
     if continuity_state == "no_project":
         return {
@@ -1947,12 +2715,18 @@ def _resume_trust_state(
             "read_confidence": "untrusted",
             "read_trust_note": "No RecallLoom sidecar was found.",
         }
+    facts = provenance_facts or {}
     return evaluate_trust_state(
         continuity_confidence=continuity_confidence,
         continuity_state=continuity_state,
         summary_stale=summary_stale,
         workspace_newer_than_summary=workspace_newer_than_summary,
         conflict_state=None,
+        legacy_sidecar=bool(facts.get("legacy_sidecar")),
+        legacy_review_required=bool(facts.get("review_required")),
+        review_imported_baseline=bool(facts.get("review_imported_baseline")),
+        helper_evidenced=bool(facts.get("helper_evidenced")),
+        inconsistent_evidence=bool(facts.get("inconsistent_evidence")),
     )
 
 
@@ -2016,12 +2790,34 @@ def _build_progressive_resume_payload(
             summary_stale=False,
             workspace_newer_than_summary=False,
         )
+        expected_revisions = expected_revisions_payload(
+            workspace_revision=None,
+            rolling_summary_revision=None,
+        )
+        provenance = build_provenance_report(
+            sidecar_trust_state=trust_state["sidecar_trust_state"],
+            continuity_state=continuity_state,
+            allowed_operation_level=trust_state["allowed_operation_level"],
+            summary_stale=False,
+            expected_revisions=expected_revisions,
+            receipt_chain_verified=False,
+        )
         payload = {
             "schema_version": "1.1",
             "ok": True,
             "command": "resume",
             "routing_target": "rl-resume",
             "resume_mode": mode,
+            "fast_lane_contract": {
+                "read_only": True,
+                "attach_safe": True,
+                "receipt_store_audit_performed": False,
+                "receipt_chain_scan_performed": False,
+                "daily_log_content_read": False,
+                "context_brief_read": False,
+                "update_protocol_read": False,
+                "startup_scratch_scan_performed": False,
+            },
             "resume_ready": False,
             "project_root": public_project_root_label(start_path),
             "storage_root": None,
@@ -2034,6 +2830,8 @@ def _build_progressive_resume_payload(
                 "summary_stale": False,
                 "resume_ready": False,
                 "sidecar_trust_state": trust_state["sidecar_trust_state"],
+                "provenance_state": provenance["state_label"],
+                "write_readiness": provenance["write_readiness"],
                 "allowed_operation_level": trust_state["allowed_operation_level"],
                 "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
                 "read_confidence": trust_state["read_confidence"],
@@ -2042,6 +2840,11 @@ def _build_progressive_resume_payload(
             "continuity_confidence": "none",
             "continuity_state": continuity_state,
             "sidecar_trust_state": trust_state["sidecar_trust_state"],
+            "provenance_state": provenance["state_label"],
+            "provenance_contract": provenance["contract_identity"],
+            "preflight_contract_identity": provenance_contract_identity(),
+            "expected_revisions": expected_revisions,
+            "write_readiness": provenance["write_readiness"],
             "allowed_operation_level": trust_state["allowed_operation_level"],
             "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
             "progressive_read_plan": {
@@ -2055,13 +2858,7 @@ def _build_progressive_resume_payload(
             "package_support": public_package_support_payload(support),
         }
         return payload
-    startup_residue_report = _exit_if_startup_scratch_residue_with_support(
-        parser,
-        json_mode=args.json,
-        project_root=workspace.project_root,
-        storage_root=workspace.storage_root,
-        support=support,
-    )
+    startup_residue_report = None
 
     try:
         summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
@@ -2114,11 +2911,30 @@ def _build_progressive_resume_payload(
     )
     continuity_state = _resume_continuity_state(quick_payload)
     continuity_confidence = quick_payload["summary"]["confidence"]
+    provenance_facts = provenance_facts_from_state(state, review_intent=False)
     trust_state = _resume_trust_state(
         continuity_confidence=continuity_confidence,
         continuity_state=continuity_state,
         summary_stale=quick_payload["freshness"]["summary_stale"],
         workspace_newer_than_summary=quick_payload["freshness"].get("workspace_newer_than_summary", False),
+        provenance_facts=provenance_facts,
+    )
+    expected_revisions = expected_revisions_payload(
+        workspace_revision=state["workspace_revision"],
+        rolling_summary_revision=summary_state.revision,
+    )
+    provenance = build_provenance_report(
+        sidecar_trust_state=trust_state["sidecar_trust_state"],
+        continuity_state=continuity_state,
+        allowed_operation_level=trust_state["allowed_operation_level"],
+        summary_stale=quick_payload["freshness"]["summary_stale"],
+        expected_revisions=expected_revisions,
+        receipt_chain_verified=False,
+        legacy_sidecar=provenance_facts["legacy_sidecar"],
+        review_required=provenance_facts["review_required"],
+        review_imported_baseline=provenance_facts["review_imported_baseline"],
+        helper_evidenced_baseline=provenance_facts["helper_evidenced"],
+        metadata_status=provenance_facts["metadata_status"],
     )
     base_payload = {
         "schema_version": "1.1",
@@ -2126,6 +2942,16 @@ def _build_progressive_resume_payload(
         "command": "resume",
         "routing_target": "rl-resume",
         "resume_mode": mode,
+        "fast_lane_contract": {
+            "read_only": True,
+            "attach_safe": True,
+            "receipt_store_audit_performed": False,
+            "receipt_chain_scan_performed": False,
+            "daily_log_content_read": False,
+            "context_brief_read": mode == "full",
+            "update_protocol_read": mode == "full",
+            "startup_scratch_scan_performed": False,
+        },
         "project_root": public_project_root_label(workspace.project_root),
         "storage_root": public_project_path(workspace.storage_root, project_root=workspace.project_root),
         "current_state": quick_payload["summary"],
@@ -2136,6 +2962,9 @@ def _build_progressive_resume_payload(
             "continuity_state": continuity_state,
             "summary_stale": quick_payload["freshness"]["summary_stale"],
             "sidecar_trust_state": trust_state["sidecar_trust_state"],
+            "provenance_state": provenance["state_label"],
+            "provenance_metadata_status": provenance["metadata_status"],
+            "write_readiness": provenance["write_readiness"],
             "allowed_operation_level": trust_state["allowed_operation_level"],
             "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
             "read_confidence": trust_state["read_confidence"],
@@ -2144,6 +2973,12 @@ def _build_progressive_resume_payload(
         "continuity_confidence": continuity_confidence,
         "continuity_state": continuity_state,
         "sidecar_trust_state": trust_state["sidecar_trust_state"],
+        "provenance_state": provenance["state_label"],
+        "provenance_metadata_status": provenance["metadata_status"],
+        "provenance_contract": provenance["contract_identity"],
+        "preflight_contract_identity": provenance_contract_identity(),
+        "expected_revisions": expected_revisions,
+        "write_readiness": provenance["write_readiness"],
         "allowed_operation_level": trust_state["allowed_operation_level"],
         "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
         "next_actions": _resume_next_actions(mode=mode, quick_actions=quick_payload["next_actions"]),
@@ -2182,6 +3017,8 @@ def _build_progressive_resume_payload(
             ),
             support=support,
         )
+    base_payload["fast_lane_contract"]["context_brief_read"] = context_brief_path.is_file()
+    base_payload["fast_lane_contract"]["update_protocol_read"] = update_protocol_path.is_file()
     base_payload["progressive_read_plan"] = _progressive_resume_read_plan(
         mode=mode,
         project_root=workspace.project_root,
@@ -2202,12 +3039,18 @@ def _build_progressive_resume_payload(
     base_payload["context_brief"] = {
         "available": context_brief_path.is_file(),
         "path": _project_relative_path(context_brief_path, workspace.project_root),
-        "guidance": _compact_guidance(context_brief_text),
+        "guidance": _compact_guidance(
+            context_brief_text,
+            project_root=workspace.project_root,
+        ),
     }
     base_payload["update_protocol_guidance"] = {
         "available": update_protocol_path.is_file(),
         "path": _project_relative_path(update_protocol_path, workspace.project_root),
-        "guidance": _compact_guidance(update_protocol_text),
+        "guidance": _compact_guidance(
+            update_protocol_text,
+            project_root=workspace.project_root,
+        ),
     }
     return base_payload
 
@@ -2403,6 +3246,9 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
             "target_path": write_context["target_path"],
             "expected_file_revision": write_context["expected_file_revision"],
             "expected_workspace_revision": write_context["expected_workspace_revision"],
+            "provenance_state": preflight_payload.get("provenance_state"),
+            "preflight_contract_identity": preflight_payload.get("preflight_contract_identity"),
+            "write_readiness": preflight_payload.get("write_readiness"),
             "package_support": public_package_support_payload(support),
         }
         if wrapper_metadata is not None:
@@ -2419,7 +3265,14 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
     payload = _run_helper_json(
         parser,
         helper_name="commit_context_file.py",
-        helper_args=_commit_context_file_args(args, file_key=file_key, write_context=write_context),
+        helper_args=_commit_context_file_args(
+            parser,
+            args,
+            file_key=file_key,
+            write_context=write_context,
+            preflight_payload=preflight_payload,
+            support=support,
+        ),
         json_mode_on_failure=args.json,
         support=support,
         package_support_on_failure=True,
@@ -2465,11 +3318,13 @@ def main() -> None:
         return
 
     if args.command == "validate":
+        _validate_provenance_scope_args(parser, args)
+        helper_args = _validate_helper_args(args)
         if args.json:
             payload = _run_helper_json(
                 parser,
                 helper_name="validate_context.py",
-                helper_args=[args.target],
+                helper_args=helper_args,
                 json_mode_on_failure=True,
                 support=support,
             )
@@ -2477,10 +3332,10 @@ def main() -> None:
             public_payload["package_support"] = public_package_support_payload(support)
             print(json.dumps(public_payload, ensure_ascii=False, indent=2))
         else:
-            _run_helper_passthrough(helper_name="validate_context.py", helper_args=[args.target])
+            _run_helper_passthrough(helper_name="validate_context.py", helper_args=helper_args)
         return
 
-    if args.command == "resume" and (args.fast or args.full):
+    if args.command == "resume":
         mode = "full" if args.full else "fast"
         payload = _build_progressive_resume_payload(parser, args, mode=mode, support=support)
         if args.json:
@@ -2489,7 +3344,7 @@ def main() -> None:
             _print_progressive_resume_summary(payload)
         return
 
-    if args.command in {"status", "resume"}:
+    if args.command == "status":
         helper_args = _status_like_helper_args(args)
         if args.json:
             payload = _run_helper_json(
@@ -2499,24 +3354,12 @@ def main() -> None:
                 json_mode_on_failure=True,
                 support=support,
             )
-            if args.command == "resume":
-                payload = _resume_payload(payload)
             payload["package_support"] = public_package_support_payload(support)
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
-            if args.command == "resume":
-                payload = _run_helper_json(
-                    parser,
-                    helper_name="summarize_continuity_status.py",
-                    helper_args=helper_args,
-                    json_mode_on_failure=False,
-                    support=support,
-                )
-                _print_resume_summary(_resume_payload(payload))
-            else:
-                _run_helper_passthrough(
-                    helper_name="summarize_continuity_status.py", helper_args=helper_args
-                )
+            _run_helper_passthrough(
+                helper_name="summarize_continuity_status.py", helper_args=helper_args
+            )
         return
 
     if args.command == "quick-summary":
@@ -2524,7 +3367,19 @@ def main() -> None:
         return
 
     if args.command == "append":
-        helper_args = _append_helper_args(args)
+        preflight_payload = _preflight_payload(parser, args, support=support)
+        _enforce_append_preflight_gate(
+            parser,
+            args,
+            preflight_payload=preflight_payload,
+            support=support,
+        )
+        helper_args = _append_helper_args(
+            parser,
+            args,
+            preflight_payload=preflight_payload,
+            support=support,
+        )
         if args.json:
             payload = _run_helper_json(
                 parser,

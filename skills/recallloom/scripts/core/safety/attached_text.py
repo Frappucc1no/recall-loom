@@ -41,6 +41,7 @@ WINDOWS_UNC_ABSOLUTE_PATH_RE = re.compile(
     rf"{PATH_TOKEN_BOUNDARY}"
 )
 FILE_URL_ABSOLUTE_PATH_RE = re.compile(r"\bfile://[^\s`\"'<>]+", re.I)
+OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
 ABSOLUTE_PATH_PATTERNS = (
     POSIX_ABSOLUTE_PATH_RE,
     WINDOWS_DRIVE_ABSOLUTE_PATH_RE,
@@ -67,6 +68,7 @@ ATTACH_SCAN_HARD_BLOCK_PATTERNS = (
 
 ATTACH_SCAN_WARNING_PATTERNS = (
     re.compile(r"\b(secret|token|password|credential|api key)\b", re.I),
+    OPENAI_TOKEN_RE,
     re.compile(r"\bignore\b", re.I),
     re.compile(r"(密钥|令牌|密码|凭证|环境变量|API ?key)", re.I),
     re.compile(r"(忽略|无视)", re.I),

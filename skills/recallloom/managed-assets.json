@@ -8,7 +8,9 @@
   ],
   "optional_files": [
     "update_protocol.md",
-    "derived/current-routing-overlay.json"
+    "derived/current-routing-overlay.json",
+    "derived/helper-receipts.json",
+    "derived/preflight-bindings.json"
   ],
   "required_directories": [
     "daily_logs"

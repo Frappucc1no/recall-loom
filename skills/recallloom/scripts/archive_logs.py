@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import shutil
 
+from core.provenance.state import helper_write_gate_from_state
+
 from _common import (
     cli_failure_payload,
     cli_failure_payload_for_exception,
@@ -55,6 +57,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
+
+
+def enforce_provenance_write_gate(parser, *, json_mode: bool, state: dict) -> None:
+    gate = helper_write_gate_from_state(
+        state,
+        helper_name="archive_logs.py",
+        operation_class="daily_log_archive",
+        require_preflight_for_review_imported_baseline=True,
+    )
+    if gate["allowed"]:
+        return
+    message = (
+        "Refusing to archive daily logs because archive apply is outside the v0.4.2 "
+        "dispatcher-issued receipt-backed mutating surface. Use preview mode only until "
+        "archive receipt support is added."
+    )
+    exit_with_cli_error(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=message,
+        payload=cli_failure_payload(
+            "unsupported_mutating_surface",
+            error=message,
+            details={
+                "reason_code": "archive_apply_not_receipt_backed",
+                "helper_name": gate["helper_name"],
+                "operation_class": gate["operation_class"],
+                "provenance_state": gate["provenance_state"],
+                "provenance_metadata_status": gate["provenance_metadata_status"],
+                "write_readiness": gate["write_readiness"],
+                "side_effect": "none",
+                "next_actions": ["run_archive_preview", "wait_for_archive_receipt_support"],
+            },
+        ),
+    )
 
 
 def main() -> None:
@@ -107,6 +145,8 @@ def main() -> None:
                     message=str(exc),
                     payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
                 )
+            if args.yes:
+                enforce_provenance_write_gate(parser, json_mode=args.json, state=state)
             invalid_daily_logs = invalid_iso_like_daily_log_files(logs_dir)
             if invalid_daily_logs:
                 invalid_paths = [str(path) for path in invalid_daily_logs]

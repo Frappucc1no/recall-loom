@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,7 +15,21 @@ from core.bridge.blocks import (
     managed_exclude_block_text,
 )
 from core.continuity.workday import logical_workday_for
-from core.output.privacy import publicize_json_value
+from core.output.privacy import (
+    display_project_path,
+    display_project_root_label,
+    publicize_json_value,
+    redact_public_text,
+)
+from core.provenance.store import (
+    RECEIPT_STORE_RELATIVE_PATH,
+    ReceiptStoreError,
+    receipt_store_summary,
+)
+from core.provenance.state import (
+    build_provenance_report,
+    provenance_facts_from_state,
+)
 from core.protocol.contracts import (
     BRIDGE_START,
     FILE_KEYS,
@@ -82,11 +97,48 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print structured JSON output.",
     )
+    parser.add_argument(
+        "--require-provenance",
+        action="store_true",
+        help="Require explicit helper receipt evidence in addition to structural validation.",
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--changed-only",
+        action="store_true",
+        help="With --require-provenance, verify bounded current receipt-store evidence.",
+    )
+    scope.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "With --require-provenance, run the bounded current receipt-store audit. "
+            "This MVP does not perform historical receipt-chain validation."
+        ),
+    )
     return parser
+
+
+def validate_provenance_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    scope_count = int(bool(args.changed_only)) + int(bool(args.full))
+    if args.require_provenance:
+        if scope_count != 1:
+            parser.error("--require-provenance requires exactly one scope flag: --changed-only or --full.")
+        return
+    if scope_count:
+        parser.error("--changed-only and --full require --require-provenance.")
 
 
 def add_finding(findings: list[ValidationFinding], level: str, code: str, message: str, path: Path) -> None:
     findings.append(ValidationFinding(level=level, code=code, message=message, path=path))
+
+
+def sha256_text_digest(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def is_json_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def validate_marker(path: Path, text: str, expected_file_key: str, workspace, findings: list[ValidationFinding]):
@@ -899,9 +951,291 @@ def validate_exclude_block(workspace, state: dict | None, findings: list[Validat
         )
 
 
+RECEIPT_VERIFIED_FILE_KEYS = ("context_brief", "daily_log", "rolling_summary", "update_protocol")
+
+
+def current_receipt_required_file_keys(workspace, state: dict) -> list[str]:
+    required = ["rolling_summary"]
+    if (workspace.storage_root / FILE_KEYS["context_brief"]).is_file():
+        required.append("context_brief")
+    if (workspace.storage_root / FILE_KEYS["update_protocol"]).is_file():
+        required.append("update_protocol")
+    daily_state = state.get("daily_logs")
+    if isinstance(daily_state, dict) and isinstance(daily_state.get("latest_file"), str):
+        required.append("daily_log")
+    return sorted(required)
+
+
+def current_receipt_target_path(workspace, state: dict, file_key: str) -> Path:
+    if file_key == "daily_log":
+        daily_state = state.get("daily_logs")
+        latest_file = daily_state.get("latest_file") if isinstance(daily_state, dict) else None
+        return workspace.storage_root / latest_file if isinstance(latest_file, str) else workspace.storage_root
+    return workspace.storage_root / FILE_KEYS[file_key]
+
+
+def validate_provenance_receipts(
+    workspace,
+    state: dict | None,
+    findings: list[ValidationFinding],
+    *,
+    audit_scope: str,
+) -> dict:
+    store_path = workspace.storage_root / RECEIPT_STORE_RELATIVE_PATH
+    result = {
+        "required": True,
+        "audit_scope": audit_scope,
+        "historical_chain_audit": False,
+        "receipt_store": {
+            "store_file": RECEIPT_STORE_RELATIVE_PATH,
+            "verified": False,
+        },
+        "required_current_file_keys": [],
+        "verified_current_file_keys": [],
+    }
+    try:
+        summary = receipt_store_summary(
+            storage_root=workspace.storage_root,
+            project_root=workspace.project_root,
+            require_exists=True,
+        )
+    except ReceiptStoreError as exc:
+        reason_code = exc.details.get("reason_code", "receipt_store_invalid")
+        add_finding(
+            findings,
+            "error",
+            f"provenance_{reason_code}",
+            f"Receipt store failed explicit provenance validation ({reason_code}).",
+            store_path,
+        )
+        result["receipt_store"]["reason_code"] = reason_code
+        return result
+
+    result["receipt_store"] = {
+        "store_file": summary["store_file"],
+        "store_revision": summary["store_revision"],
+        "receipt_count": summary["receipt_count"],
+        "target_file_keys": summary["target_file_keys"],
+        "verified": False,
+    }
+    latest_receipts = summary["latest_receipts_by_file_key"]
+    if not latest_receipts:
+        add_finding(
+            findings,
+            "error",
+            "provenance_receipt_store_empty",
+            "Receipt store contains no finalized receipts for explicit provenance validation.",
+            store_path,
+        )
+        return result
+    if state is None:
+        add_finding(
+            findings,
+            "error",
+            "provenance_state_unavailable",
+            "state.json must be readable for explicit provenance validation.",
+            workspace.storage_root / FILE_KEYS["state"],
+        )
+        return result
+
+    state_text = read_text(workspace.storage_root / FILE_KEYS["state"])
+    current_state_digest = sha256_text_digest(state_text)
+    current_workspace_revision = state.get("workspace_revision")
+    required_file_keys = current_receipt_required_file_keys(workspace, state)
+    result["required_current_file_keys"] = required_file_keys
+    missing_receipt_keys = sorted(set(required_file_keys).difference(latest_receipts))
+    for file_key in missing_receipt_keys:
+        add_finding(
+            findings,
+            "error",
+            f"provenance_{file_key}_receipt_missing",
+            "Current managed surface is missing finalized receipt-store evidence for this file.",
+            current_receipt_target_path(workspace, state, file_key),
+        )
+    verified_file_keys: list[str] = []
+    for file_key, receipt in sorted(latest_receipts.items()):
+        if file_key not in RECEIPT_VERIFIED_FILE_KEYS:
+            add_finding(
+                findings,
+                "error",
+                "provenance_receipt_target_unsupported",
+                "Receipt store contains a finalized receipt for an unsupported managed file key.",
+                store_path,
+            )
+            continue
+        if file_key == "daily_log":
+            daily_state = state.get("daily_logs")
+            latest_file = daily_state.get("latest_file") if isinstance(daily_state, dict) else None
+            latest_entry_seq = (
+                daily_state.get("latest_entry_seq") if isinstance(daily_state, dict) else None
+            )
+            if not isinstance(latest_file, str) or not latest_file:
+                add_finding(
+                    findings,
+                    "error",
+                    "provenance_daily_log_state_missing",
+                    "state.json is missing the receipt-backed latest daily-log cursor.",
+                    workspace.storage_root / FILE_KEYS["state"],
+                )
+                continue
+            target_path = workspace.storage_root / latest_file
+            if not target_path.is_file():
+                add_finding(
+                    findings,
+                    "error",
+                    "provenance_daily_log_target_missing",
+                    "Receipt-backed latest daily log is missing.",
+                    target_path,
+                )
+                continue
+            target_text = read_text(target_path)
+            checks = {
+                "target_digest_matches_current_file": receipt.get("target_digest") == sha256_text_digest(target_text),
+                "latest_entry_seq_matches_receipt": receipt.get("result_file_revision") == latest_entry_seq,
+                "finalized": receipt.get("finalization_status") == "finalized",
+            }
+            if receipt.get("revision") == summary["store_revision"]:
+                checks.update(
+                    {
+                        "latest_state_digest_matches_current_state": (
+                            receipt.get("state_digest") == current_state_digest
+                        ),
+                        "latest_workspace_revision_matches_state": (
+                            receipt.get("result_workspace_revision") == current_workspace_revision
+                        ),
+                    }
+                )
+            else:
+                checks["workspace_revision_not_from_future"] = (
+                    is_json_int(receipt.get("result_workspace_revision"))
+                    and is_json_int(current_workspace_revision)
+                    and receipt["result_workspace_revision"] <= current_workspace_revision
+                )
+            failed_checks = [key for key, passed in checks.items() if not passed]
+            if failed_checks:
+                add_finding(
+                    findings,
+                    "error",
+                    "provenance_daily_log_receipt_mismatch",
+                    (
+                        "Current latest daily log is not backed by the latest finalized "
+                        "receipt-store evidence. Failed checks: " + ", ".join(failed_checks)
+                    ),
+                    target_path,
+                )
+                continue
+            verified_file_keys.append(file_key)
+            continue
+        target_path = workspace.storage_root / FILE_KEYS[file_key]
+        if not target_path.is_file():
+            add_finding(
+                findings,
+                "error",
+                f"provenance_{file_key}_target_missing",
+                "Receipt-backed managed file is missing.",
+                target_path,
+            )
+            continue
+        target_text = read_text(target_path)
+        file_state = parse_file_state_marker(target_text)
+        if file_state is None:
+            add_finding(
+                findings,
+                "error",
+                f"provenance_{file_key}_file_state_missing",
+                "Receipt-backed managed file is missing file-state metadata.",
+                target_path,
+            )
+            continue
+        state_entry = state.get("files", {}).get(file_key)
+        if not isinstance(state_entry, dict):
+            add_finding(
+                findings,
+                "error",
+                f"provenance_{file_key}_state_entry_missing",
+                "state.json is missing the receipt-backed managed file entry.",
+                workspace.storage_root / FILE_KEYS["state"],
+            )
+            continue
+        checks = {
+            "target_digest_matches_current_file": receipt.get("target_digest") == sha256_text_digest(target_text),
+            "file_revision_matches_marker": receipt.get("result_file_revision") == file_state.revision,
+            "state_entry_revision_matches_marker": state_entry.get("file_revision") == file_state.revision,
+            "receipt_workspace_revision_matches_marker_base": (
+                receipt.get("result_workspace_revision") == file_state.base_workspace_revision
+            ),
+            "state_entry_base_workspace_revision_matches_marker": (
+                state_entry.get("base_workspace_revision") == file_state.base_workspace_revision
+            ),
+            "finalized": receipt.get("finalization_status") == "finalized",
+        }
+        if receipt.get("revision") == summary["store_revision"]:
+            checks.update(
+                {
+                    "latest_state_digest_matches_current_state": (
+                        receipt.get("state_digest") == current_state_digest
+                    ),
+                    "latest_workspace_revision_matches_state": (
+                        receipt.get("result_workspace_revision") == current_workspace_revision
+                    ),
+                }
+            )
+        else:
+            checks["workspace_revision_not_from_future"] = (
+                is_json_int(receipt.get("result_workspace_revision"))
+                and is_json_int(current_workspace_revision)
+                and receipt["result_workspace_revision"] <= current_workspace_revision
+            )
+        failed_checks = [key for key, passed in checks.items() if not passed]
+        if failed_checks:
+            add_finding(
+                findings,
+                "error",
+                f"provenance_{file_key}_receipt_mismatch",
+                (
+                    "Current managed file is not backed by the latest finalized "
+                    "receipt-store evidence. Failed checks: " + ", ".join(failed_checks)
+                ),
+                target_path,
+            )
+            continue
+        verified_file_keys.append(file_key)
+
+    result["verified_current_file_keys"] = verified_file_keys
+    result["receipt_store"]["verified"] = (
+        set(verified_file_keys) == set(required_file_keys)
+        and set(latest_receipts).issubset(set(RECEIPT_VERIFIED_FILE_KEYS))
+    )
+    if not verified_file_keys:
+        add_finding(
+            findings,
+            "error",
+            "provenance_no_current_receipts_verified",
+            "No current managed files were verified against finalized receipt-store evidence.",
+            store_path,
+        )
+    return result
+
+
+def skipped_provenance_validation(*, audit_scope: str, reason_code: str) -> dict:
+    return {
+        "required": True,
+        "audit_scope": audit_scope,
+        "historical_chain_audit": False,
+        "skipped": True,
+        "reason_code": reason_code,
+        "receipt_store": {
+            "store_file": RECEIPT_STORE_RELATIVE_PATH,
+            "verified": False,
+        },
+        "verified_current_file_keys": [],
+    }
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    validate_provenance_args(parser, args)
     try:
         ensure_supported_python_version()
     except EnvironmentContractError as exc:
@@ -968,6 +1302,26 @@ def main() -> None:
         validate_bridge_blocks(workspace, state, findings)
         validate_exclude_block(workspace, state, findings)
         validate_unknown_storage_assets(workspace, findings)
+        provenance_validation = None
+        if args.require_provenance:
+            audit_scope = (
+                "bounded_current_receipt_store"
+                if args.full
+                else "changed_only_current_receipt_store"
+            )
+            structural_errors = [finding for finding in findings if finding.level == "error"]
+            if structural_errors:
+                provenance_validation = skipped_provenance_validation(
+                    audit_scope=audit_scope,
+                    reason_code="structural_validation_failed",
+                )
+            else:
+                provenance_validation = validate_provenance_receipts(
+                    workspace,
+                    state,
+                    findings,
+                    audit_scope=audit_scope,
+                )
     except (OSError, UnicodeDecodeError) as exc:
         exit_with_cli_error(
             parser,
@@ -983,6 +1337,36 @@ def main() -> None:
 
     errors = [f for f in findings if f.level == "error"]
     warnings = [f for f in findings if f.level == "warning"]
+    provenance_receipts_verified = False
+    if isinstance(provenance_validation, dict):
+        receipt_store = provenance_validation.get("receipt_store")
+        provenance_receipts_verified = bool(
+            isinstance(receipt_store, dict)
+            and receipt_store.get("verified") is True
+            and provenance_validation.get("verified_current_file_keys")
+        )
+    provenance_facts = provenance_facts_from_state(state, review_intent=False)
+    provenance = build_provenance_report(
+        sidecar_trust_state=(
+            "damaged"
+            if errors
+            else "security_blocked"
+            if provenance_facts["inconsistent_evidence"]
+            else "structurally_valid"
+        ),
+        continuity_state=None,
+        allowed_operation_level=None,
+        summary_stale=None,
+        receipt_chain_verified=provenance_receipts_verified,
+        receipt_store_available=provenance_receipts_verified,
+        legacy_sidecar=provenance_facts["legacy_sidecar"],
+        review_required=provenance_facts["review_required"],
+        review_imported_baseline=provenance_facts["review_imported_baseline"],
+        helper_evidenced_baseline=(
+            provenance_facts["helper_evidenced"] if provenance_receipts_verified else False
+        ),
+        metadata_status=provenance_facts["metadata_status"],
+    )
 
     payload = {
         "project_root": str(workspace.project_root),
@@ -991,6 +1375,9 @@ def main() -> None:
         "declared_storage_mode": workspace.declared_storage_mode,
         "workspace_language": workspace.workspace_language,
         "protocol_version": workspace.protocol_version,
+        "provenance_state": provenance["state_label"],
+        "provenance_metadata_status": provenance["metadata_status"],
+        "write_readiness": provenance["write_readiness"],
         "valid": not errors,
         "error_count": len(errors),
         "warning_count": len(warnings),
@@ -1004,6 +1391,8 @@ def main() -> None:
             for finding in findings
         ],
     }
+    if args.require_provenance:
+        payload["provenance_validation"] = provenance_validation
 
     if args.json:
         if startup_residue_report is not None:
@@ -1011,13 +1400,21 @@ def main() -> None:
         public_payload = publicize_json_value(payload, project_root=workspace.project_root)
         print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:
-        print(f"RecallLoom root: {workspace.project_root}")
-        print(f"Storage root: {workspace.storage_root}")
+        print(f"RecallLoom root: {display_project_root_label(workspace.project_root)}")
+        print(
+            "Storage root: "
+            f"{display_project_path(workspace.storage_root, project_root=workspace.project_root)}"
+        )
         print(f"Storage mode: {workspace.storage_mode}")
         print(f"Workspace language: {workspace.workspace_language}")
         if findings:
             for finding in findings:
-                print(f"[{finding.level.upper()}] {finding.code}: {finding.message} ({finding.path})")
+                message = redact_public_text(
+                    finding.message,
+                    project_root=workspace.project_root,
+                )
+                path = display_project_path(finding.path, project_root=workspace.project_root)
+                print(f"[{finding.level.upper()}] {finding.code}: {message} ({path})")
         else:
             print("No findings.")
         print(f"Errors: {len(errors)} | Warnings: {len(warnings)}")

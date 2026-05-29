@@ -18,6 +18,7 @@ from core.errors import (
     StorageResolutionError,
 )
 from core.bridge import blocks as bridge_blocks
+from core.provenance.state import initial_provenance_metadata
 from core.protocol import contracts as protocol_contracts
 
 PROTOCOL_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)*$")
@@ -184,6 +185,7 @@ def initial_workspace_state(
             "latest_entry_seq": 0,
             "entry_count": 0,
         },
+        "provenance": initial_provenance_metadata(timestamp=timestamp),
     }
 
 

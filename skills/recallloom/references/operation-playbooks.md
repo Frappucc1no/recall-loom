@@ -4,6 +4,8 @@
 
 - Project-Local Overrides
 - Write Protocol Red Lines
+- Public Surface Boundary
+- Non-Invasive Defaults And UX Gates
 - Cold Start
 - Choose the Write Set
 - Layered Write Judgment
@@ -42,6 +44,50 @@ That means:
 - Never hand-edit `STORAGE_ROOT/state.json` or `STORAGE_ROOT/config.json`. This includes `.recallloom/state.json` and `.recallloom/config.json`.
 - For overwrite-style managed files, use revision-aware helper commits and do not use blind file replacement.
 
+## Public Surface Boundary
+
+Public package and release surfaces should contain only files a user needs to
+install, understand, and operate the package.
+
+Do not publish copied project memory, generated runtime output,
+machine-local data, maintainer-only working files, or material that is not
+required by the installable package.
+
+Public CI and required checks validate repository contents and metadata only.
+Do not describe them as proof of a user's local workspace state, host behavior,
+or sidecar trust status.
+
+## Non-Invasive Defaults And UX Gates
+
+RecallLoom Core stays non-invasive by default.
+
+- Do not require or auto-install hooks, daemons, watchers, MCP/plugin
+  enforcement, host adapters, telemetry/metrics, or remote payload transmission.
+- Treat native command wrappers as opt-in convenience entrypoints over the same
+  dispatcher, not as an enforcement layer.
+- Keep ordinary docs/source/planning edits outside the managed sidecar on a
+  silent allow or low-friction path unless they affect provenance-sensitive
+  RecallLoom state.
+- For managed sidecar or provenance-impacting actions, route the operator UX
+  through `allow`, `warn`, `ask`, or `block`.
+- Use `warn` for low-risk structural-only or readable legacy states; warnings
+  should be short, and repeated same-session low-risk warnings should be
+  cooldown-friendly.
+- Use `ask` for legacy review / repair import or reviewed imported baseline
+  actions; require explicit operator confirmation before higher-risk writes.
+- Use `block` for forged markers, detected receipt/store inconsistency, direct
+  `state.json` / `config.json` edits, privacy violations, and any state
+  classified as `inconsistent_or_tampered_evidence`.
+- `block` is non-waivable. Recovery guidance should point to validate and the
+  canonical recovery proposal/review/promotion helpers, not manual sidecar
+  editing.
+- Do not present remote services, host memory, plugins, MCP, hooks, or wrappers
+  as authority for local helper evidence.
+- In v0.4.2, receipt-backed mutation covers dispatcher-issued managed-file
+  writes, current latest-cursor daily-log appends, and post-append summary sync.
+  Archive apply and bridge apply stay preview-only until they have their own
+  receipt-backed contracts.
+
 ## Cold Start
 
 Use this flow whenever resuming a project with an existing RecallLoom structure.
@@ -59,10 +105,16 @@ Use this flow whenever resuming a project with an existing RecallLoom structure.
 Read-side helpers may now also expose:
 
 - `sidecar_trust_state`
+- `provenance_state`
+- `write_readiness`
+- `expected_revisions`
+- `preflight_contract_identity`
 - `continuity_drift_risk_level`
 - `allowed_operation_level`
 
 Treat those as routing guidance for review vs write-readiness. They do not change the protocol file contract by themselves.
+In the provenance MVP, `structurally_valid` and `review_imported_baseline` are not receipt-backed proof. Legacy sidecars without provenance baseline metadata are readable, but mutating helper writes must route through review / repair import first. Do not claim or persist `helper_evidenced` unless a mutating helper receipt was finalized successfully.
+Default validate is structural and does not open `derived/helper-receipts.json`; receipt-store validation is an explicit operator lane with `--require-provenance --changed-only` or `--require-provenance --full`. The `--full` lane is currently bounded to current receipt-store evidence and is not a historical chain audit.
 
 Cold start is for orientation, not for automatic rewriting.
 Cold start should restore and recommend first.

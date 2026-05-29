@@ -50,10 +50,17 @@ This file is maintained by helper scripts and supports:
 Protocol `1.0` scope note:
 
 - helper-only routing fields such as `sidecar_trust_state`
+- `provenance_state`
+- `write_readiness`
+- `expected_revisions`
+- `preflight_contract_identity`
 - `continuity_drift_risk_level`
 - `allowed_operation_level`
 
-are not persisted into `state.json` in the current contract line. They stay in helper/dispatcher JSON surfaces.
+are helper/dispatcher JSON routing surfaces, not persisted write authority.
+`state.json.provenance` may store local provenance markers such as `structurally_valid`, `review_imported_baseline`, or `helper_evidenced` after a receipt-finalized helper write.
+Legacy sidecars without this metadata remain readable, but mutating helper writes must first pass review / repair import.
+`helper_evidenced` is reserved for a successfully finalized helper receipt; structural validation or review import alone must remain `structurally_valid`, `review_imported_baseline`, or another non-receipt-backed provenance state.
 
 Package support fields such as `package_support_state`, advisory source, and daily support-cache status are also not persisted into `state.json`.
 They belong to the installed package runtime and user-level cache, not to the project sidecar.

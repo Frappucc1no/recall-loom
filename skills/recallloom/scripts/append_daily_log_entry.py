@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,20 @@ from core.protocol.sections import (
     missing_section_keys,
     unknown_section_keys,
 )
+from core.provenance.bindings import (
+    PreflightBindingLeaseError,
+    verify_preflight_binding_lease,
+)
+from core.provenance.receipts import RECEIPT_SCHEMA_VERSION, assert_public_safe_json, public_receipt_claim
+from core.provenance.state import (
+    helper_evidenced_metadata,
+    helper_write_gate_from_state,
+    inconsistent_evidence_metadata,
+    provenance_contract_identity,
+    preflight_write_binding_hash,
+    unproven_sidecar_metadata,
+)
+from core.provenance.store import ReceiptStoreError, finalize_receipt_in_store, receipt_store_summary
 from core.safety.attached_text import scan_auto_attached_context_text
 from core.safety.prepared_input import (
     PreparedInputSafetyError,
@@ -56,8 +71,10 @@ from _common import (
     load_workspace_state,
     normalize_wrapper_metadata_json,
     now_iso_timestamp,
+    PACKAGE_VERSION,
     parse_daily_log_entry_line,
     parse_iso_date,
+    public_project_path,
     read_text,
     resolve_writer_attribution,
     restore_text_snapshot,
@@ -81,6 +98,62 @@ RESERVED_MARKER_FAMILIES = (
     ("<!-- daily-log-entry:", "daily_log_entry_marker"),
     ("<!-- daily-log-scaffold", "daily_log_scaffold_marker"),
 )
+PREFLIGHT_BINDING_TYPE = "recallloom.preflight_write_binding"
+PREFLIGHT_BINDING_VERSION = "0.1"
+REVIEW_IMPORTED_BASELINE_CONFIRMATION = "review_imported_baseline_confirmed"
+PREFLIGHT_BINDING_ALLOWED_KEYS = {
+    "binding_type",
+    "binding_version",
+    "operation_class",
+    "file_key",
+    "write_type",
+    "target_date",
+    "latest_file",
+    "latest_entry_id",
+    "latest_entry_seq",
+    "entry_count",
+    "latest_file_digest",
+    "contract_type",
+    "expected_workspace_revision",
+    "expected_revisions",
+    "preflight_contract_identity",
+    "preflight_contract_hash",
+    "provenance_state",
+    "write_readiness_label",
+    "ux_gate",
+    "ux_gate_requires_confirmation",
+    "ux_gate_confirmation",
+    "ux_gate_reason",
+}
+PREFLIGHT_BINDING_REQUIRED_KEYS = {
+    "binding_type",
+    "binding_version",
+    "operation_class",
+    "file_key",
+    "write_type",
+    "target_date",
+    "latest_file",
+    "latest_entry_id",
+    "latest_entry_seq",
+    "entry_count",
+    "latest_file_digest",
+    "expected_workspace_revision",
+    "preflight_contract_identity",
+    "preflight_contract_hash",
+}
+PREFLIGHT_WRITE_READINESS_LABELS = {
+    "structural_only_ready_after_preflight",
+    "helper_evidenced_ready_after_preflight",
+    "review_imported_baseline_ready_after_preflight",
+}
+
+
+def sha256_text_digest(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def expected_state_json_text(state: dict) -> str:
+    return json.dumps(state, ensure_ascii=False, indent=2) + "\n"
 
 
 def positive_int(value: str) -> int:
@@ -146,6 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
         ),
     )
+    parser.add_argument(
+        "--preflight-binding-json",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser
 
@@ -194,6 +271,690 @@ def read_limited_file_text(
     except PreparedInputSafetyError as exc:
         exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
     raise AssertionError("unreachable")
+
+
+def preflight_binding_failure(
+    parser,
+    *,
+    json_mode: bool,
+    message: str,
+    reason_code: str,
+    field_path: str = "$",
+    extra: dict | None = None,
+) -> None:
+    details = {
+        "reason_code": reason_code,
+        "field_path": field_path,
+        "side_effect": "none",
+        **(extra or {}),
+    }
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=message,
+        reason="invalid_prepared_input",
+        details=details,
+    )
+
+
+def restore_provenance_after_receipt_failure(
+    parser,
+    *,
+    json_mode: bool,
+    state_path: Path,
+    state: dict,
+    previous_provenance: object,
+    failure_message: str,
+    reason_code: str,
+) -> None:
+    previous_state_label = (
+        previous_provenance.get("state_label")
+        if isinstance(previous_provenance, dict)
+        else None
+    )
+    state["provenance"] = unproven_sidecar_metadata(
+        timestamp=now_iso_timestamp(),
+        reason_code=reason_code,
+        previous_state_label=previous_state_label if isinstance(previous_state_label, str) else None,
+    )
+    try:
+        dump_json(state_path, state)
+    except OSError as rollback_exc:
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message=(
+                f"{failure_message}. Also failed to restore provenance metadata after "
+                f"receipt finalization failure: {rollback_exc}"
+            ),
+            reason="damaged_sidecar",
+            details={
+                "reason_code": "receipt_failure_provenance_restore_failed",
+                "side_effect": "target_and_state_written_receipt_not_stored",
+            },
+        )
+
+
+def receipt_failure_reason(reason_code: str) -> str:
+    if reason_code in {
+        "prohibited_field",
+        "value_requires_redaction",
+        "non_string_key",
+        "unsupported_value_type",
+    }:
+        return "privacy_security_failure"
+    return "damaged_sidecar"
+
+
+def exit_receipt_finalization_failure(
+    parser,
+    *,
+    json_mode: bool,
+    message: str,
+    reason_code: str,
+    side_effect: str,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+    extra: dict | None = None,
+) -> None:
+    details = {
+        "reason_code": reason_code,
+        "side_effect": side_effect,
+        "file_key": "daily_log",
+        "target_entry_seq": target_entry_seq,
+        "new_workspace_revision": new_workspace_revision,
+        "receipt_finalization_status": "failed",
+        "receipt_store_file": "derived/helper-receipts.json",
+        "next_action": "review_or_repair_receipt_store_before_claiming_helper_evidenced",
+        **(extra or {}),
+    }
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=message,
+        reason=receipt_failure_reason(reason_code),
+        details=details,
+    )
+
+
+def prevalidate_receipt_store_before_append(
+    parser,
+    *,
+    json_mode: bool,
+    storage_root: Path,
+    project_root: Path,
+    preflight_binding: dict | None,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+) -> None:
+    if preflight_binding is None:
+        return
+    try:
+        receipt_store_summary(
+            storage_root=storage_root,
+            project_root=project_root,
+            require_exists=False,
+        )
+    except ReceiptStoreError as exc:
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message=str(exc),
+            reason_code=exc.reason_code,
+            side_effect="none",
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            extra={
+                **exc.details,
+                "side_effect": "none",
+                "receipt_finalization_status": "blocked_before_write",
+                "receipt_precheck": True,
+            },
+        )
+
+
+def verify_post_append_hashes(
+    parser,
+    *,
+    json_mode: bool,
+    target_path: Path,
+    state_path: Path,
+    expected_target_text: str,
+    expected_state_text: str,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+    state: dict,
+    previous_provenance: object,
+) -> tuple[str, str]:
+    def downgrade_before_exit(reason_code: str) -> None:
+        previous_state_label = (
+            previous_provenance.get("state_label")
+            if isinstance(previous_provenance, dict)
+            else None
+        )
+        state["provenance"] = inconsistent_evidence_metadata(
+            timestamp=now_iso_timestamp(),
+            reason_code=reason_code,
+            previous_state_label=previous_state_label if isinstance(previous_state_label, str) else None,
+        )
+        try:
+            dump_json(state_path, state)
+        except OSError:
+            pass
+
+    try:
+        post_target_text = read_text(target_path)
+        post_state_text = read_text(state_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        downgrade_before_exit("post_hash_read_failed")
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message=f"Could not re-read post-append target/state for receipt finalization: {exc}",
+            reason_code="post_hash_read_failed",
+            side_effect="target_and_state_written_receipt_not_stored",
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+        )
+    target_digest = sha256_text_digest(post_target_text)
+    state_digest = sha256_text_digest(post_state_text)
+    if post_target_text != expected_target_text or post_state_text != expected_state_text:
+        downgrade_before_exit("post_hash_mismatch")
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message="Post-append hash check failed; receipt finalization was not stored.",
+            reason_code="post_hash_mismatch",
+            side_effect="target_and_state_written_receipt_not_stored",
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            extra={
+                "target_digest": target_digest,
+                "state_digest": state_digest,
+                "expected_target_digest": sha256_text_digest(expected_target_text),
+                "expected_state_digest": sha256_text_digest(expected_state_text),
+            },
+        )
+    return target_digest, state_digest
+
+
+def build_append_receipt_seed(
+    *,
+    preflight_binding: dict,
+    timestamp: str,
+    target_digest: str,
+    state_digest: str,
+    previous_entry_seq: int,
+    next_entry_seq: int,
+    new_workspace_revision: int,
+) -> dict:
+    return {
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "receipt_type": "helper_write",
+        "helper_name": "append_daily_log_entry.py",
+        "helper_version": PACKAGE_VERSION,
+        "operation": "milestone_evidence",
+        "operation_class": "daily_log_append",
+        "side_effect": "target_and_state_written",
+        "result": "ok",
+        "state_label_before": preflight_binding.get("provenance_state") or "structurally_valid",
+        "state_label_after": "helper_evidenced",
+        "target_file_key": "daily_log",
+        "target_digest": target_digest,
+        "state_digest": state_digest,
+        "preflight_contract_identity": preflight_binding["preflight_contract_identity"],
+        "expected_workspace_revision": preflight_binding["expected_workspace_revision"],
+        "result_workspace_revision": new_workspace_revision,
+        "expected_file_revision": previous_entry_seq,
+        "result_file_revision": next_entry_seq,
+        "created_at": timestamp,
+    }
+
+
+def normalize_preflight_binding(
+    parser,
+    *,
+    json_mode: bool,
+    raw: str | None,
+    project_root: Path,
+    expected_workspace_revision: int,
+) -> dict | None:
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message=f"--preflight-binding-json must be valid JSON: {exc.msg}.",
+            reason_code="malformed_preflight_binding_json",
+        )
+    if not isinstance(payload, dict):
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="--preflight-binding-json must be a JSON object.",
+            reason_code="preflight_binding_not_object",
+        )
+    unknown = sorted(set(payload).difference(PREFLIGHT_BINDING_ALLOWED_KEYS))
+    if unknown:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding contains unsupported keys.",
+            reason_code="preflight_binding_unknown_key",
+            field_path=",".join(unknown),
+        )
+    missing = sorted(PREFLIGHT_BINDING_REQUIRED_KEYS.difference(payload))
+    if missing:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding is missing required fields.",
+            reason_code="preflight_binding_missing_required_key",
+            field_path=",".join(missing),
+        )
+    if payload.get("binding_type") != PREFLIGHT_BINDING_TYPE:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding type does not match this helper.",
+            reason_code="preflight_binding_type_mismatch",
+            field_path="$.binding_type",
+        )
+    if payload.get("binding_version") != PREFLIGHT_BINDING_VERSION:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding version does not match this helper.",
+            reason_code="preflight_binding_version_mismatch",
+            field_path="$.binding_version",
+        )
+    if payload.get("operation_class") != "daily_log_append":
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding operation_class does not match daily-log append.",
+            reason_code="preflight_binding_operation_class_invalid",
+            field_path="$.operation_class",
+        )
+    if payload.get("file_key") != "daily_log":
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding file_key does not match daily-log append.",
+            reason_code="preflight_binding_file_key_mismatch",
+            field_path="$.file_key",
+        )
+    if payload.get("write_type") != "milestone_evidence":
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding write_type does not match daily-log append.",
+            reason_code="preflight_binding_write_type_mismatch",
+            field_path="$.write_type",
+        )
+    target_date = payload.get("target_date")
+    if not isinstance(target_date, str) or not target_date.strip():
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding target_date must be an ISO date string.",
+            reason_code="preflight_binding_target_date_invalid",
+            field_path="$.target_date",
+        )
+    try:
+        parse_iso_date(target_date)
+    except ValueError:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding target_date is not a valid ISO date.",
+            reason_code="preflight_binding_target_date_invalid",
+            field_path="$.target_date",
+        )
+    for field in ("latest_file", "latest_entry_id"):
+        value = payload.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message=f"Preflight binding {field} must be null or a non-empty string.",
+                reason_code=f"preflight_binding_{field}_invalid",
+                field_path=f"$.{field}",
+            )
+    for field in ("latest_entry_seq", "entry_count"):
+        value = payload.get(field)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message=f"Preflight binding {field} must be null or a non-negative integer.",
+                reason_code=f"preflight_binding_{field}_invalid",
+                field_path=f"$.{field}",
+            )
+    latest_file_digest = payload.get("latest_file_digest")
+    if latest_file_digest is not None and (
+        not isinstance(latest_file_digest, str)
+        or not latest_file_digest.startswith("sha256:")
+    ):
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding latest_file_digest must be null or a sha256 digest string.",
+            reason_code="preflight_binding_latest_file_digest_invalid",
+            field_path="$.latest_file_digest",
+        )
+    if payload.get("expected_workspace_revision") != expected_workspace_revision:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding expected_workspace_revision does not match this append.",
+            reason_code="preflight_binding_workspace_revision_mismatch",
+            field_path="$.expected_workspace_revision",
+        )
+    expected_preflight_identity = provenance_contract_identity()
+    if payload.get("preflight_contract_identity") != expected_preflight_identity:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding contract identity does not match the active provenance contract.",
+            reason_code="preflight_binding_contract_identity_mismatch",
+            field_path="$.preflight_contract_identity",
+            extra={"expected_preflight_contract_identity": expected_preflight_identity},
+        )
+    expected_binding_hash = preflight_write_binding_hash(payload)
+    if payload.get("preflight_contract_hash") != expected_binding_hash:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding hash does not match the canonical binding payload.",
+            reason_code="preflight_binding_hash_mismatch",
+            field_path="$.preflight_contract_hash",
+            extra={"expected_preflight_contract_hash": expected_binding_hash},
+        )
+    try:
+        assert_public_safe_json(payload, project_root=str(project_root))
+    except ValueError as exc:
+        details = getattr(exc, "details", {})
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding is not public-safe.",
+            reason_code=str(details.get("reason_code") or "preflight_binding_privacy_violation"),
+            field_path=str(details.get("field_path") or "$"),
+        )
+    return payload
+
+
+def enforce_provenance_write_gate(
+    parser,
+    *,
+    json_mode: bool,
+    state: dict,
+    preflight_binding: dict | None,
+) -> None:
+    gate = helper_write_gate_from_state(
+        state,
+        helper_name="append_daily_log_entry.py",
+        operation_class="daily_log_append",
+        preflight_binding_present=preflight_binding is not None,
+        require_preflight_for_review_imported_baseline=True,
+    )
+    if preflight_binding is not None:
+        binding_state = preflight_binding.get("provenance_state")
+        if isinstance(binding_state, str) and binding_state != gate["provenance_state"]:
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message="Preflight binding provenance_state does not match current sidecar provenance.",
+                reason_code="preflight_binding_provenance_state_mismatch",
+                field_path="$.provenance_state",
+                extra={
+                    "current_provenance_state": gate["provenance_state"],
+                    "binding_provenance_state": binding_state,
+                },
+            )
+        readiness_label = preflight_binding.get("write_readiness_label")
+        if readiness_label not in PREFLIGHT_WRITE_READINESS_LABELS:
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message="Preflight binding does not authorize a revision-checked daily-log append.",
+                reason_code="preflight_binding_write_readiness_not_authorized",
+                field_path="$.write_readiness_label",
+                extra={
+                    "write_readiness_label": readiness_label,
+                    "allowed_write_readiness_labels": sorted(PREFLIGHT_WRITE_READINESS_LABELS),
+                },
+            )
+        if gate["provenance_state"] == "review_imported_baseline":
+            if preflight_binding.get("ux_gate") != "ask":
+                preflight_binding_failure(
+                    parser,
+                    json_mode=json_mode,
+                    message="Review-imported baseline appends require an ask UX gate.",
+                    reason_code="preflight_binding_ux_gate_mismatch",
+                    field_path="$.ux_gate",
+                    extra={"required_ux_gate": "ask"},
+                )
+            if preflight_binding.get("ux_gate_requires_confirmation") is not True:
+                preflight_binding_failure(
+                    parser,
+                    json_mode=json_mode,
+                    message="Review-imported baseline appends require explicit confirmation.",
+                    reason_code="preflight_binding_confirmation_required",
+                    field_path="$.ux_gate_requires_confirmation",
+                )
+            if preflight_binding.get("ux_gate_confirmation") != REVIEW_IMPORTED_BASELINE_CONFIRMATION:
+                preflight_binding_failure(
+                    parser,
+                    json_mode=json_mode,
+                    message="Review-imported baseline append confirmation is missing.",
+                    reason_code="preflight_binding_confirmation_missing",
+                    field_path="$.ux_gate_confirmation",
+                    extra={"required_confirmation": REVIEW_IMPORTED_BASELINE_CONFIRMATION},
+                )
+    if gate["allowed"]:
+        return
+    reason = (
+        "stale_write_context"
+        if gate["blocked_reason_code"] == "preflight_required_for_review_imported_baseline"
+        else "trust_review_required"
+    )
+    message = (
+        "Refusing to append because this RecallLoom sidecar requires provenance review "
+        "or a fresh preflight binding before any mutating helper write."
+    )
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=message,
+        reason=reason,
+        details={
+            "reason_code": gate["blocked_reason_code"],
+            "helper_name": gate["helper_name"],
+            "operation_class": gate["operation_class"],
+            "provenance_state": gate["provenance_state"],
+            "provenance_metadata_status": gate["provenance_metadata_status"],
+            "write_readiness": gate["write_readiness"],
+            "preflight_binding_present": gate["preflight_binding_present"],
+            "side_effect": "none",
+            "next_actions": [
+                "stage_recovery_proposal.py",
+                "record_recovery_review.py",
+                "prepare_recovery_promotion.py",
+                "preflight_context_check.py",
+            ],
+        },
+    )
+
+
+def enforce_preflight_daily_log_cursor(
+    parser,
+    *,
+    json_mode: bool,
+    workspace,
+    state: dict,
+    preflight_binding: dict | None,
+    target_date: date,
+    latest_existing: Path | None,
+) -> None:
+    if preflight_binding is None:
+        return
+    target_date_iso = target_date.isoformat()
+    if preflight_binding.get("target_date") != target_date_iso:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding target_date does not match this append.",
+            reason_code="preflight_binding_target_date_mismatch",
+            field_path="$.target_date",
+            extra={
+                "binding_target_date": preflight_binding.get("target_date"),
+                "actual_target_date": target_date_iso,
+            },
+        )
+
+    daily_state = state.get("daily_logs")
+    if not isinstance(daily_state, dict):
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="state.json daily_logs cursor is unavailable for append binding verification.",
+            reason_code="preflight_binding_daily_log_cursor_unavailable",
+            field_path="$.daily_logs",
+        )
+
+    latest_file = (
+        latest_existing.relative_to(workspace.storage_root).as_posix()
+        if latest_existing is not None
+        else None
+    )
+    state_cursor = {
+        "latest_file": daily_state.get("latest_file"),
+        "latest_entry_id": daily_state.get("latest_entry_id"),
+        "latest_entry_seq": daily_state.get("latest_entry_seq"),
+        "entry_count": daily_state.get("entry_count"),
+    }
+    actual_cursor = dict(state_cursor)
+    actual_latest_digest = None
+    if latest_existing is not None:
+        try:
+            latest_text = read_text(latest_existing)
+        except (OSError, UnicodeDecodeError) as exc:
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message=f"Could not read latest daily log for append binding verification: {exc}",
+                reason_code="preflight_binding_daily_log_cursor_unreadable",
+                field_path="$.latest_file",
+            )
+        actual_latest_digest = sha256_text_digest(latest_text)
+        sequences = existing_entry_sequences(latest_text)
+        latest_seq = sequences[-1] if sequences else 0
+        actual_cursor = {
+            "latest_file": latest_file,
+            "latest_entry_id": f"entry-{latest_seq}" if latest_seq else None,
+            "latest_entry_seq": latest_seq,
+            "entry_count": len(sequences),
+        }
+    elif daily_state.get("latest_file") is None:
+        actual_cursor = {
+            "latest_file": None,
+            "latest_entry_id": None,
+            "latest_entry_seq": 0,
+            "entry_count": 0,
+        }
+
+    binding_cursor = {
+        "latest_file": preflight_binding.get("latest_file"),
+        "latest_entry_id": preflight_binding.get("latest_entry_id"),
+        "latest_entry_seq": preflight_binding.get("latest_entry_seq"),
+        "entry_count": preflight_binding.get("entry_count"),
+    }
+    binding_latest_digest = preflight_binding.get("latest_file_digest")
+
+    def normalize_cursor(cursor: dict) -> dict:
+        return {
+            key: (0 if value is None and key in {"latest_entry_seq", "entry_count"} else value)
+            for key, value in cursor.items()
+        }
+
+    normalized_binding = normalize_cursor(binding_cursor)
+    normalized_state = normalize_cursor(state_cursor)
+    normalized_actual = normalize_cursor(actual_cursor)
+    if normalized_binding != normalized_state:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding daily-log cursor does not match current state.",
+            reason_code="preflight_binding_daily_log_cursor_mismatch",
+            field_path="$.daily_logs",
+            extra={
+                "binding_cursor": binding_cursor,
+                "state_cursor": state_cursor,
+            },
+        )
+    if normalized_state != normalized_actual:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Current latest daily-log file does not match the state cursor.",
+            reason_code="preflight_binding_daily_log_file_cursor_mismatch",
+            field_path="$.daily_logs",
+            extra={
+                "state_cursor": state_cursor,
+                "actual_cursor": actual_cursor,
+            },
+        )
+    if binding_latest_digest != actual_latest_digest:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message="Preflight binding latest daily-log digest does not match the current file.",
+            reason_code="preflight_binding_daily_log_digest_mismatch",
+            field_path="$.latest_file_digest",
+            extra={
+                "binding_latest_file_digest": binding_latest_digest,
+                "actual_latest_file_digest": actual_latest_digest,
+            },
+        )
+
+
+def enforce_preflight_binding_lease(
+    parser,
+    *,
+    json_mode: bool,
+    storage_root: Path,
+    project_root: Path,
+    preflight_binding: dict | None,
+) -> None:
+    if preflight_binding is None:
+        return
+    try:
+        verify_preflight_binding_lease(
+            storage_root=storage_root,
+            project_root=project_root,
+            binding=preflight_binding,
+        )
+    except PreflightBindingLeaseError as exc:
+        preflight_binding_failure(
+            parser,
+            json_mode=json_mode,
+            message=str(exc),
+            reason_code=exc.reason_code,
+            field_path=exc.field_path,
+            extra={
+                "lease_store": "derived/preflight-bindings.json",
+                "side_effect": "none",
+            },
+        )
 
 
 def read_limited_stdin(parser, *, json_mode: bool, max_input_bytes: int) -> bytes:
@@ -1030,18 +1791,44 @@ def main() -> None:
                 f"Missing: {', '.join(missing_fields)}."
             ),
             reason="invalid_prepared_input",
-            details={
-                "project_root": str(workspace.project_root),
-                "input_mode": input_mode,
-                "missing_fields": missing_fields,
+                details={
+                    "project_root": str(workspace.project_root),
+                    "input_mode": input_mode,
+                    "missing_fields": missing_fields,
                 "no_auto_detect": True,
-            },
-        )
+                },
+            )
 
+    receipt_finalization = None
     try:
         with workspace_write_lock(workspace.project_root, "append_daily_log_entry.py"):
             state_path = workspace.storage_root / FILE_KEYS["state"]
             state = load_workspace_state(state_path)
+            binding_expected_workspace_revision = (
+                state["workspace_revision"]
+                if args.expected_workspace_revision is None
+                else args.expected_workspace_revision
+            )
+            preflight_binding = normalize_preflight_binding(
+                parser,
+                json_mode=args.json,
+                raw=args.preflight_binding_json,
+                project_root=workspace.project_root,
+                expected_workspace_revision=binding_expected_workspace_revision,
+            )
+            enforce_preflight_binding_lease(
+                parser,
+                json_mode=args.json,
+                storage_root=workspace.storage_root,
+                project_root=workspace.project_root,
+                preflight_binding=preflight_binding,
+            )
+            enforce_provenance_write_gate(
+                parser,
+                json_mode=args.json,
+                state=state,
+                preflight_binding=preflight_binding,
+            )
             logs_dir = workspace.storage_root / DAILY_LOGS_DIRNAME
             latest_existing = latest_active_daily_log(logs_dir)
             logical_workday = logical_workday_for(
@@ -1194,6 +1981,41 @@ def main() -> None:
                         },
                     ),
                 )
+            if (
+                preflight_binding is not None
+                and latest_existing_date is not None
+                and target_date < latest_existing_date
+            ):
+                message = (
+                    "Refusing receipt-backed append to a historical daily log. "
+                    "v0.4.2 provenance receipts only bind the current latest daily-log cursor."
+                )
+                exit_with_cli_error(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=3,
+                    message=message,
+                    payload=failure_payload(
+                        "historical_append_not_receipt_backed",
+                        language=workspace.workspace_language,
+                        error=message,
+                        details={
+                            **append_failure_details,
+                            "latest_active_daily_log": str(latest_existing),
+                            "reason_code": "historical_append_not_receipt_backed",
+                            "side_effect": "none",
+                        },
+                    ),
+                )
+            enforce_preflight_daily_log_cursor(
+                parser,
+                json_mode=args.json,
+                workspace=workspace,
+                state=state,
+                preflight_binding=preflight_binding,
+                target_date=target_date,
+                latest_existing=latest_existing,
+            )
 
             missing_keys = missing_section_keys(body_text, SECTION_KEYS["daily_log"])
             validate_entry_body(
@@ -1314,6 +2136,15 @@ def main() -> None:
                         + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq)
                         + "\n"
                     )
+                prevalidate_receipt_store_before_append(
+                    parser,
+                    json_mode=args.json,
+                    storage_root=workspace.storage_root,
+                    project_root=workspace.project_root,
+                    preflight_binding=preflight_binding,
+                    new_workspace_revision=state["workspace_revision"] + 1,
+                    target_entry_seq=next_seq,
+                )
                 try:
                     atomic_write_if_unchanged(
                         target_path,
@@ -1331,6 +2162,15 @@ def main() -> None:
             else:
                 header = file_marker("daily_log", workspace.workspace_language)
                 updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
+                prevalidate_receipt_store_before_append(
+                    parser,
+                    json_mode=args.json,
+                    storage_root=workspace.storage_root,
+                    project_root=workspace.project_root,
+                    preflight_binding=preflight_binding,
+                    new_workspace_revision=state["workspace_revision"] + 1,
+                    target_entry_seq=next_seq,
+                )
                 try:
                     atomic_write_if_unchanged(
                         target_path,
@@ -1346,6 +2186,13 @@ def main() -> None:
                         reason="damaged_sidecar",
                     )
 
+            previous_provenance = state.get("provenance")
+            previous_state_label = (
+                previous_provenance.get("state_label")
+                if isinstance(previous_provenance, dict)
+                else None
+            )
+            previous_entry_seq = next_seq - 1
             state["workspace_revision"] += 1
             target_is_latest_after_write = (
                 latest_existing_date is None or target_date >= latest_existing_date
@@ -1360,6 +2207,15 @@ def main() -> None:
                     if refreshed_at == state["daily_logs"].get("updated_at"):
                         refreshed_at = datetime.now().astimezone().isoformat(timespec="microseconds")
                     state["daily_logs"]["updated_at"] = refreshed_at
+            receipt_timestamp = now_iso_timestamp()
+            if preflight_binding is not None and target_is_latest_after_write:
+                state["provenance"] = helper_evidenced_metadata(
+                    timestamp=receipt_timestamp,
+                    previous_state_label=(
+                        previous_state_label if isinstance(previous_state_label, str) else None
+                    ),
+                )
+            expected_state_text = expected_state_json_text(state)
             try:
                 dump_json(state_path, state)
             except OSError as exc:
@@ -1386,6 +2242,54 @@ def main() -> None:
                     ),
                     reason="damaged_sidecar",
                 )
+            if preflight_binding is not None and target_is_latest_after_write:
+                target_digest, state_digest = verify_post_append_hashes(
+                    parser,
+                    json_mode=args.json,
+                    target_path=target_path,
+                    state_path=state_path,
+                    expected_target_text=updated_text,
+                    expected_state_text=expected_state_text,
+                    new_workspace_revision=state["workspace_revision"],
+                    target_entry_seq=next_seq,
+                    state=state,
+                    previous_provenance=previous_provenance,
+                )
+                receipt_seed = build_append_receipt_seed(
+                    preflight_binding=preflight_binding,
+                    timestamp=receipt_timestamp,
+                    target_digest=target_digest,
+                    state_digest=state_digest,
+                    previous_entry_seq=previous_entry_seq,
+                    next_entry_seq=next_seq,
+                    new_workspace_revision=state["workspace_revision"],
+                )
+                try:
+                    receipt_finalization = finalize_receipt_in_store(
+                        storage_root=workspace.storage_root,
+                        receipt=receipt_seed,
+                        project_root=workspace.project_root,
+                    )
+                except ReceiptStoreError as exc:
+                    restore_provenance_after_receipt_failure(
+                        parser,
+                        json_mode=args.json,
+                        state_path=state_path,
+                        state=state,
+                        previous_provenance=previous_provenance,
+                        failure_message=str(exc),
+                        reason_code=exc.reason_code,
+                    )
+                    exit_receipt_finalization_failure(
+                        parser,
+                        json_mode=args.json,
+                        message=str(exc),
+                        reason_code=exc.reason_code,
+                        side_effect=exc.side_effect,
+                        new_workspace_revision=state["workspace_revision"],
+                        target_entry_seq=next_seq,
+                        extra=exc.details,
+                    )
     except LockBusyError as exc:
         exit_with_failure_contract(
             parser,
@@ -1438,13 +2342,34 @@ def main() -> None:
     }
     if wrapper_metadata is not None:
         payload["wrapper_metadata"] = wrapper_metadata
+    if receipt_finalization is not None:
+        receipt = receipt_finalization["receipt"]
+        payload.update(
+            {
+                "provenance_state": "helper_evidenced",
+                "provenance_result": {
+                    "state_label": "helper_evidenced",
+                    "receipt_backed": True,
+                    "receipt_finalization_status": "finalized",
+                    "receipt_store_available": True,
+                    "receipt_digest": receipt_finalization["receipt_digest"],
+                    "store_binding": receipt_finalization["store_binding"],
+                    "redaction_policy_version": receipt.get("redaction_policy_version"),
+                },
+                "public_receipt_claim": public_receipt_claim(
+                    receipt,
+                    project_root=str(workspace.project_root),
+                ),
+            }
+        )
     if args.json:
         if startup_residue_report is not None:
             payload["startup_residue_report"] = startup_residue_report
         public_payload = publicize_json_value(payload, project_root=workspace.project_root)
         print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:
-        print(f"Appended daily log entry to {target_path}")
+        public_target = public_project_path(target_path, project_root=workspace.project_root)
+        print(f"Appended daily log entry to {public_target or 'daily log'}")
 
 
 if __name__ == "__main__":

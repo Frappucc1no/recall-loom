@@ -8,7 +8,12 @@ import shutil
 import shlex
 import sys
 
-from core.output.privacy import private_json_paths_enabled, publicize_json_value, publicize_text_paths
+from core.output.privacy import (
+    private_json_paths_enabled,
+    publicize_json_value,
+    publicize_text_paths,
+    redact_public_text,
+)
 
 
 ROLLING_SUMMARY_JSON_SECTION_KEYS = frozenset(
@@ -98,14 +103,19 @@ FAILURE_REASON_REGISTRY = {
         "recoverability": "operator_repair_required",
         "surface_level": "user_safe",
         "trust_effect": "damaged",
-        "next_actions": ["repair_existing_sidecar", "rerun_validate_or_init"],
+        "next_actions": [
+            "validate_context.py",
+            "stage_recovery_proposal.py",
+            "record_recovery_review.py",
+            "prepare_recovery_promotion.py",
+        ],
         "user_message": {
             "en": "The existing RecallLoom workspace is not trustworthy yet and needs repair before continuing.",
             "zh-CN": "当前已有的 RecallLoom 工作区还不可信，需要先修复后再继续。",
         },
         "operator_note": {
-            "en": "Do not hand-build or patch managed files blindly; repair the damaged sidecar first.",
-            "zh-CN": "不要手工拼接或盲改 managed 文件；请先修复 damaged sidecar。",
+            "en": "Use validate_context.py and the recovery proposal/review/promotion helpers; do not hand-edit managed sidecar files.",
+            "zh-CN": "请使用 validate_context.py 以及 recovery proposal/review/promotion helpers；不要手工编辑 managed sidecar 文件。",
         },
     },
     "dual_sidecar_conflict": {
@@ -213,6 +223,21 @@ FAILURE_REASON_REGISTRY = {
             "zh-CN": "请重新执行 preflight，读取最新 revision 后再重试。",
         },
     },
+    "review_imported_baseline_confirmation_required": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "surface_level": "operator",
+        "trust_effect": "review_required",
+        "next_actions": ["review_preflight_readiness", "retry_with_confirm_review_imported_baseline"],
+        "user_message": {
+            "en": "This reviewed imported baseline requires explicit confirmation before a mutating write.",
+            "zh-CN": "这个已复核导入的 baseline 在执行变更写入前需要显式确认。",
+        },
+        "operator_note": {
+            "en": "Review the preflight readiness output, then retry with --confirm-review-imported-baseline if the write is intentional.",
+            "zh-CN": "请先复核 preflight readiness 输出；若确认要写入，再使用 --confirm-review-imported-baseline 重试。",
+        },
+    },
     "write_lock_busy": {
         "blocked": True,
         "recoverability": "retryable",
@@ -233,14 +258,19 @@ FAILURE_REASON_REGISTRY = {
         "recoverability": "operator_repair_required",
         "surface_level": "operator",
         "trust_effect": "damaged",
-        "next_actions": ["repair_managed_file", "rerun_validate_or_helper"],
+        "next_actions": [
+            "validate_context.py",
+            "stage_recovery_proposal.py",
+            "record_recovery_review.py",
+            "prepare_recovery_promotion.py",
+        ],
         "user_message": {
             "en": "A managed RecallLoom file is malformed and must be repaired before continuing.",
             "zh-CN": "存在损坏的 RecallLoom managed 文件，需要先修复后再继续。",
         },
         "operator_note": {
-            "en": "Repair the malformed managed file instead of bypassing marker or section checks.",
-            "zh-CN": "请修复损坏的 managed 文件，不要绕过 marker 或 section 校验。",
+            "en": "Use validate_context.py and the recovery proposal/review/promotion helpers instead of bypassing marker or section checks.",
+            "zh-CN": "请使用 validate_context.py 以及 recovery proposal/review/promotion helpers，不要绕过 marker 或 section 校验。",
         },
     },
     "derived_overlay_conflict": {
@@ -318,6 +348,21 @@ FAILURE_REASON_REGISTRY = {
             "zh-CN": "只有在确实要回填历史日志时，才使用 --allow-historical。",
         },
     },
+    "historical_append_not_receipt_backed": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "surface_level": "operator",
+        "trust_effect": "review_required",
+        "next_actions": ["append_to_latest_daily_log", "wait_for_historical_append_receipt_support"],
+        "user_message": {
+            "en": "Historical daily-log appends are not part of the current receipt-backed write contract.",
+            "zh-CN": "历史 daily-log 追加还不属于当前 receipt-backed 写入合同。",
+        },
+        "operator_note": {
+            "en": "Append only to the current latest daily-log cursor for receipt-backed provenance in this package line.",
+            "zh-CN": "在当前包版本中，只有追加到当前最新 daily-log cursor 才能进入 receipt-backed provenance 路径。",
+        },
+    },
     "project_time_policy_review_required": {
         "blocked": True,
         "recoverability": "user_input_required",
@@ -338,14 +383,19 @@ FAILURE_REASON_REGISTRY = {
         "recoverability": "user_input_required",
         "surface_level": "operator",
         "trust_effect": "review_required",
-        "next_actions": ["review_current_continuity", "refresh_before_high_risk_actions"],
+        "next_actions": [
+            "stage_recovery_proposal.py",
+            "record_recovery_review.py",
+            "prepare_recovery_promotion.py",
+            "preflight_context_check.py",
+        ],
         "user_message": {
             "en": "RecallLoom needs a continuity review before a higher-risk action can continue.",
             "zh-CN": "在继续更高风险动作前，需要先复核当前 RecallLoom continuity。",
         },
         "operator_note": {
-            "en": "Review the current continuity files and refresh state before proceeding.",
-            "zh-CN": "请先复核当前 continuity 文件，并刷新状态后再继续。",
+            "en": "Use the recovery proposal/review/promotion helpers, then rerun preflight before mutating sidecar state.",
+            "zh-CN": "请先使用 recovery proposal/review/promotion helpers，然后重新运行 preflight，再修改 sidecar state。",
         },
     },
     "continuity_drift_review_required": {
@@ -376,6 +426,21 @@ FAILURE_REASON_REGISTRY = {
         "operator_note": {
             "en": "Delete the tombstone storage path and confirm that removal is complete before treating uninstall as finished.",
             "zh-CN": "请删除 tombstone 存储目录，并确认卸载已经真正完成后，再把这次移除视为结束。",
+        },
+    },
+    "unsupported_mutating_surface": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "surface_level": "operator",
+        "trust_effect": "review_required",
+        "next_actions": ["run_preview_mode", "wait_for_receipt_backed_surface_support"],
+        "user_message": {
+            "en": "This mutating surface is not part of the current receipt-backed write contract.",
+            "zh-CN": "这个写入入口还不属于当前 receipt-backed 写入合同。",
+        },
+        "operator_note": {
+            "en": "Use preview/read-only mode for this surface until it has its own receipt-backed transaction path.",
+            "zh-CN": "在该入口具备自己的 receipt-backed transaction 路径之前，请只使用 preview/read-only 模式。",
         },
     },
     "registry_contract_invalid": {
@@ -774,11 +839,12 @@ def _public_failure_error(error: str | None, details: dict | None) -> str | None
     if not isinstance(error, str) or not error:
         return error
     project_root = _infer_project_root(details) or (details or {}).get("project_root")
-    return publicize_text_paths(
+    public_error = publicize_text_paths(
         error,
         project_root=project_root,
         private=private_json_paths_enabled(),
     )
+    return redact_public_text(public_error, project_root=project_root, private=False)
 
 
 def _python_runtime_stage(error: str | None) -> str:
@@ -918,8 +984,38 @@ def _failure_suggestion(
     if reason == "malformed_managed_file":
         return _localized_text(
             language,
-            en="Repair the malformed managed file before writing again; do not append on top of a damaged marker layout.",
-            zh_cn="请先修复损坏的 managed 文件，再重新写入；不要在损坏的 marker 结构上继续追加。",
+            en=(
+                "Run validate_context.py, then use stage_recovery_proposal.py, "
+                "record_recovery_review.py, and prepare_recovery_promotion.py before writing again."
+            ),
+            zh_cn=(
+                "请先运行 validate_context.py，然后使用 stage_recovery_proposal.py、"
+                "record_recovery_review.py 和 prepare_recovery_promotion.py，再重新写入。"
+            ),
+        )
+    if reason == "trust_review_required":
+        return _localized_text(
+            language,
+            en=(
+                "Use stage_recovery_proposal.py, record_recovery_review.py, "
+                "and prepare_recovery_promotion.py, then rerun preflight_context_check.py."
+            ),
+            zh_cn=(
+                "请使用 stage_recovery_proposal.py、record_recovery_review.py "
+                "和 prepare_recovery_promotion.py，然后重新运行 preflight_context_check.py。"
+            ),
+        )
+    if reason == "review_imported_baseline_confirmation_required":
+        return _localized_text(
+            language,
+            en=(
+                "Review the preflight readiness output. If the write is intentional, "
+                "rerun with --confirm-review-imported-baseline."
+            ),
+            zh_cn=(
+                "请复核 preflight readiness 输出；如果确认要写入，"
+                "使用 --confirm-review-imported-baseline 重试。"
+            ),
         )
     if reason == "write_lock_busy":
         return _localized_text(
@@ -994,7 +1090,11 @@ def _failure_recovery_command(
     if reason in {"damaged_sidecar", "dual_sidecar_conflict", "malformed_managed_file"}:
         if isinstance(project_root, str):
             return _script_command("validate_context.py", project_arg, "--json")
-        return "Repair the managed RecallLoom files, then rerun validate_context.py from the project root."
+        return (
+            "Run validate_context.py from the project root, then use "
+            "stage_recovery_proposal.py, record_recovery_review.py, and "
+            "prepare_recovery_promotion.py for reviewed recovery."
+        )
     if reason == "attach_scan_blocked":
         return "Edit the prepared text to remove blocked content, then rerun the same helper command."
     if reason == "invalid_date":
@@ -1057,8 +1157,16 @@ def _failure_recovery_command(
         return "Review the project date policy, then rerun append_daily_log_entry.py from the project root with the confirmed date."
     if reason == "trust_review_required":
         if isinstance(project_root, str):
-            return _script_command("preflight_context_check.py", project_arg, "--json")
-        return "Review the current continuity files, then rerun preflight_context_check.py."
+            return _script_command("stage_recovery_proposal.py", project_arg, "--source-file", "<proposal.md>", "--json")
+        return (
+            "Use stage_recovery_proposal.py, record_recovery_review.py, and "
+            "prepare_recovery_promotion.py, then rerun preflight_context_check.py."
+        )
+    if reason == "review_imported_baseline_confirmation_required":
+        return (
+            "Review preflight readiness, then rerun the same write command with "
+            "--confirm-review-imported-baseline if the write is intentional."
+        )
     if reason == "continuity_drift_review_required":
         if isinstance(project_root, str):
             return _script_command("summarize_continuity_status.py", project_arg, "--json")

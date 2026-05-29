@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,12 @@ from core.continuity.workday import (
     detect_closure_signal,
 )
 from core.trust.state import evaluate_trust_state
+from core.provenance.state import (
+    build_provenance_report,
+    expected_revisions_payload,
+    provenance_facts_from_state,
+    provenance_contract_identity,
+)
 from core.protocol.contracts import FILE_KEYS
 from core.protocol.markers import parse_file_state_marker
 
@@ -40,7 +47,6 @@ from _common import (
     latest_active_daily_log,
     load_workspace_state,
     detect_update_protocol_time_policy_cues,
-    daily_log_entries,
     extract_section_text,
     parse_daily_log_entry_line,
     parse_iso_date,
@@ -52,6 +58,10 @@ from _common import (
 
 
 DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR = 3
+
+
+def sha256_text_digest(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def summary_matches_empty_shell_template(summary_text: str) -> bool:
@@ -73,6 +83,31 @@ def continuity_state_for_workspace(
 
 def is_effectively_empty_summary_next_step(text: str) -> bool:
     return shared_is_effectively_empty_summary_next_step(text)
+
+
+def latest_daily_log_marker_summary(path: Path | None) -> tuple[object | None, int]:
+    if path is None:
+        return None, 0
+    latest_entry = None
+    entry_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            entry = parse_daily_log_entry_line(line)
+            if entry is not None:
+                latest_entry = entry
+                entry_count += 1
+    return latest_entry, entry_count
+
+
+def file_state_marker_from_path(path: Path):
+    with path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            state = parse_file_state_marker(line)
+            if state is not None:
+                return state
+            if index >= 24:
+                break
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -151,6 +186,7 @@ def build_post_append_summary_sync_contract(
     latest_daily_log: Path | None,
     latest_daily_log_entry,
     latest_daily_log_entry_count: int,
+    latest_daily_log_digest: str | None,
     continuity_seeded: bool,
     summary_revision_is_stale: bool,
     summary_stale: bool,
@@ -247,6 +283,7 @@ def build_post_append_summary_sync_contract(
         "latest_entry_id": latest_daily_log_entry.entry_id if latest_daily_log_entry else None,
         "latest_entry_seq": latest_daily_log_entry.entry_seq if latest_daily_log_entry else None,
         "entry_count": latest_daily_log_entry_count if latest_daily_log is not None else None,
+        "latest_file_digest": latest_daily_log_digest,
     }
 
     contract = {
@@ -387,7 +424,7 @@ def main() -> None:
             )
         context_brief_state = None
         if context_brief_path.is_file():
-            context_brief_state = parse_file_state_marker(read_text(context_brief_path))
+            context_brief_state = file_state_marker_from_path(context_brief_path)
             if context_brief_state is None:
                 exit_with_cli_error(
                     parser,
@@ -401,7 +438,7 @@ def main() -> None:
                 )
         update_protocol_state = None
         if update_protocol_path.is_file():
-            update_protocol_state = parse_file_state_marker(read_text(update_protocol_path))
+            update_protocol_state = file_state_marker_from_path(update_protocol_path)
             if update_protocol_state is None:
                 exit_with_cli_error(
                     parser,
@@ -417,12 +454,9 @@ def main() -> None:
         latest_daily_log_entry = None
         latest_daily_log_entry_count = 0
         if latest_daily_log is not None:
-            latest_daily_log_text_for_entries = read_text(latest_daily_log)
-            latest_daily_log_entry_count = len(daily_log_entries(latest_daily_log_text_for_entries))
-            for line in latest_daily_log_text_for_entries.splitlines():
-                entry = parse_daily_log_entry_line(line)
-                if entry is not None:
-                    latest_daily_log_entry = entry
+            latest_daily_log_entry, latest_daily_log_entry_count = latest_daily_log_marker_summary(
+                latest_daily_log
+            )
             if latest_daily_log_entry is None:
                 exit_with_cli_error(
                     parser,
@@ -443,7 +477,13 @@ def main() -> None:
 
         workspace_artifact_scan_mode = "full" if args.full else "quick"
         summary_text = read_text(summary_path)
-        latest_daily_log_text = read_text(latest_daily_log) if latest_daily_log is not None else ""
+        latest_daily_log_full_text = read_text(latest_daily_log) if latest_daily_log is not None else ""
+        latest_daily_log_digest = (
+            sha256_text_digest(latest_daily_log_full_text)
+            if latest_daily_log is not None
+            else None
+        )
+        latest_daily_log_text = latest_daily_log_full_text if args.full else ""
         freshness = evaluate_continuity_freshness(
             project_root=workspace.project_root,
             storage_root=workspace.storage_root,
@@ -472,10 +512,14 @@ def main() -> None:
             }
 
         latest_active_day = parse_iso_date(latest_daily_log.stem) if latest_daily_log is not None else None
-        closure_detected, closure_keywords = detect_closure_signal(latest_daily_log_text)
+        closure_detected, closure_keywords = (
+            detect_closure_signal(latest_daily_log_text)
+            if args.full
+            else (False, [])
+        )
         project_time_policy_cues = (
             detect_update_protocol_time_policy_cues(read_text(update_protocol_path))
-            if update_protocol_path.is_file()
+            if args.full and update_protocol_path.is_file()
             else []
         )
         next_step_text = extract_section_text(summary_text, "next_step")
@@ -514,12 +558,45 @@ def main() -> None:
             latest_daily_log_exists=latest_daily_log is not None,
             workspace_is_newer=workspace_is_newer,
         )
+        provenance_facts = provenance_facts_from_state(state, review_intent=True)
         trust_state = evaluate_trust_state(
             continuity_confidence=continuity_confidence,
             continuity_state=continuity_state,
             summary_stale=summary_stale,
             workspace_newer_than_summary=workspace_is_newer,
             conflict_state=None,
+            legacy_sidecar=provenance_facts["legacy_sidecar"],
+            legacy_review_required=provenance_facts["review_required"],
+            review_imported_baseline=provenance_facts["review_imported_baseline"],
+            helper_evidenced=provenance_facts["helper_evidenced"],
+            inconsistent_evidence=provenance_facts["inconsistent_evidence"],
+        )
+        expected_revisions = expected_revisions_payload(
+            workspace_revision=state["workspace_revision"],
+            rolling_summary_revision=summary_state.revision if summary_state else None,
+            context_brief_revision=context_brief_state.revision if context_brief_state else None,
+            update_protocol_revision=(
+                update_protocol_state.revision if update_protocol_state else None
+            ),
+        )
+        provenance_write_context_blocked = trust_state["provenance_state"] in {
+            "review_required",
+            "structurally_valid_legacy",
+            "inconsistent_or_tampered_evidence",
+        }
+        write_expected_revisions = None if provenance_write_context_blocked else expected_revisions
+        provenance = build_provenance_report(
+            sidecar_trust_state=trust_state["sidecar_trust_state"],
+            continuity_state=continuity_state,
+            allowed_operation_level=trust_state["allowed_operation_level"],
+            summary_stale=summary_stale,
+            expected_revisions=write_expected_revisions,
+            receipt_chain_verified=False,
+            legacy_sidecar=provenance_facts["legacy_sidecar"],
+            review_required=provenance_facts["review_required"],
+            review_imported_baseline=provenance_facts["review_imported_baseline"],
+            helper_evidenced_baseline=provenance_facts["helper_evidenced"],
+            metadata_status=provenance_facts["metadata_status"],
         )
     except (OSError, UnicodeDecodeError, ConfigContractError) as exc:
         message = f"Filesystem/state error: {exc}" if isinstance(exc, ConfigContractError) else f"Filesystem error: {exc}"
@@ -635,6 +712,16 @@ def main() -> None:
         "workspace_newer_than_summary": workspace_is_newer,
         "continuity_confidence": continuity_confidence,
         "sidecar_trust_state": trust_state["sidecar_trust_state"],
+        "provenance_state": provenance["state_label"],
+        "provenance_metadata_status": provenance["metadata_status"],
+        "provenance_contract": provenance["contract_identity"],
+        "preflight_contract_identity": provenance_contract_identity(),
+        "expected_revisions": write_expected_revisions,
+        "write_context_authorized": not provenance_write_context_blocked,
+        "write_context_blocked_reason": (
+            "provenance_review_required" if provenance_write_context_blocked else None
+        ),
+        "write_readiness": provenance["write_readiness"],
         "allowed_operation_level": trust_state["allowed_operation_level"],
         "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
         "freshness_risk_level": freshness_risk["level"],
@@ -664,14 +751,14 @@ def main() -> None:
             "task_type": "preflight_review",
         },
         "suggested_read_set": suggested_read_set,
-        "recommended_write_targets": recommended_write_targets,
+        "recommended_write_targets": [] if provenance_write_context_blocked else recommended_write_targets,
         "conditional_review_targets": conditional_review_targets,
         "override_review_targets": override_review_targets,
         "write_tier_judgment": build_write_tier_judgment(
             project_root=workspace.project_root,
             storage_root=workspace.storage_root,
         ),
-        "safe_write_context": {
+        "safe_write_context": None if provenance_write_context_blocked else {
             "workspace_revision": state["workspace_revision"],
             "rolling_summary_handoff": {
                 "active_task_digest": digests["active_task_digest"],
@@ -712,6 +799,8 @@ def main() -> None:
                 ),
                 "latest_entry_id": latest_daily_log_entry.entry_id if latest_daily_log_entry else None,
                 "latest_entry_seq": latest_daily_log_entry.entry_seq if latest_daily_log_entry else None,
+                "entry_count": latest_daily_log_entry_count if latest_daily_log is not None else None,
+                "latest_file_digest": None if append_date_review_required else latest_daily_log_digest,
                 "logical_workday": None if append_date_review_required else logical_workday_seen,
                 "suggested_date": append_daily_log_entry_suggested_date,
                 "recommendation_type": workday_decision["recommendation_type"],
@@ -735,36 +824,42 @@ def main() -> None:
     if startup_residue_report is not None:
         payload["startup_residue_report"] = startup_residue_report
 
-    rolling_summary_handoff = payload["safe_write_context"]["rolling_summary_handoff"]
-    payload["safe_write_context"]["post_append_summary_sync"] = build_post_append_summary_sync_contract(
-        workspace=workspace,
-        state=state,
-        summary_path=summary_path,
-        summary_state=summary_state,
-        latest_daily_log=latest_daily_log,
-        latest_daily_log_entry=latest_daily_log_entry,
-        latest_daily_log_entry_count=latest_daily_log_entry_count,
-        continuity_seeded=continuity_seeded,
-        summary_revision_is_stale=summary_revision_is_stale,
-        summary_stale=summary_stale,
-        workspace_is_newer=workspace_is_newer,
-        allowed_operation_level=trust_state["allowed_operation_level"],
-        rolling_summary_handoff=rolling_summary_handoff,
-    )
+    safe_write_context = payload.get("safe_write_context")
+    if isinstance(safe_write_context, dict):
+        rolling_summary_handoff = safe_write_context["rolling_summary_handoff"]
+        safe_write_context["post_append_summary_sync"] = build_post_append_summary_sync_contract(
+            workspace=workspace,
+            state=state,
+            summary_path=summary_path,
+            summary_state=summary_state,
+            latest_daily_log=latest_daily_log,
+            latest_daily_log_entry=latest_daily_log_entry,
+            latest_daily_log_entry_count=latest_daily_log_entry_count,
+            latest_daily_log_digest=latest_daily_log_digest,
+            continuity_seeded=continuity_seeded,
+            summary_revision_is_stale=summary_revision_is_stale,
+            summary_stale=summary_stale,
+            workspace_is_newer=workspace_is_newer,
+            allowed_operation_level=trust_state["allowed_operation_level"],
+            rolling_summary_handoff=rolling_summary_handoff,
+        )
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(f"RecallLoom root: {workspace.project_root}")
-        print(f"Storage root: {workspace.storage_root}")
+        print(f"RecallLoom root: {public_project_root}")
+        print(f"Storage root: {public_storage_root}")
         print(f"Storage mode: {workspace.storage_mode}")
         print(f"Workspace language: {workspace.workspace_language}")
-        print(f"Rolling summary: {summary_path}")
+        print(f"Rolling summary: {payload['rolling_summary']}")
         if append_date_review_required and latest_daily_log is not None:
             print("Latest active daily log: redacted pending date review")
         else:
-            print("Latest active daily log: " f"{latest_daily_log if latest_daily_log else 'none'}")
-        print("Latest workspace artifact: " f"{latest_workspace_artifact if latest_workspace_artifact else 'none'}")
+            print("Latest active daily log: " f"{public_latest_daily_log if public_latest_daily_log else 'none'}")
+        print(
+            "Latest workspace artifact: "
+            f"{public_latest_workspace_artifact if public_latest_workspace_artifact else 'none'}"
+        )
         print(f"Workspace artifact scan mode: {workspace_artifact_scan_mode}")
         print("Summary revision stale: " f"{'yes' if summary_revision_is_stale else 'no'}")
         print(f"Continuity confidence: {continuity_confidence}")
@@ -787,13 +882,16 @@ def main() -> None:
             print("Override review targets:")
             for target in override_review_targets:
                 print(f"  - {target['path']}: {target['reason']}")
-        print("Safe write context:")
-        print(f"  - workspace_revision: {state['workspace_revision']}")
-        print(
-            "  - use commit_context_file.py for revision-checked writes to "
-            "context_brief.md, rolling_summary.md, or update_protocol.md"
-        )
-        print("  - use append_daily_log_entry.py for revision-checked daily-log milestone entries")
+        if isinstance(payload.get("safe_write_context"), dict):
+            print("Safe write context:")
+            print(f"  - workspace_revision: {state['workspace_revision']}")
+            print(
+                "  - use commit_context_file.py for revision-checked writes to "
+                "context_brief.md, rolling_summary.md, or update_protocol.md"
+            )
+            print("  - use append_daily_log_entry.py for revision-checked daily-log milestone entries")
+        else:
+            print("Safe write context: unavailable pending provenance review")
 
     raise SystemExit(3 if args.fail_on_stale and workspace_is_newer else 0)
 

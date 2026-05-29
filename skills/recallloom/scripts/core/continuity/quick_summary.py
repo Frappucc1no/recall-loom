@@ -13,6 +13,7 @@ from core.continuity.freshness import (
     is_effectively_empty_summary_next_step,
     summary_matches_empty_shell_template,
 )
+from core.output.privacy import public_project_root_label, redact_public_text
 from core.protocol.sections import extract_section_text
 
 
@@ -61,12 +62,18 @@ def _meaningful_lines(text: str) -> list[str]:
     return lines
 
 
-def _compact(text: str | None, *, max_chars: int) -> str | None:
+def _compact(
+    text: str | None,
+    *,
+    max_chars: int,
+    project_root: Path | None = None,
+) -> str | None:
     if text is None:
         return None
     compacted = WHITESPACE_RE.sub(" ", text).strip()
     if not compacted:
         return None
+    compacted = redact_public_text(compacted, project_root=project_root) or "redacted"
     if len(compacted) <= max_chars:
         return compacted
     shortened = compacted[: max_chars - 3].rstrip(" ,;:|/-")
@@ -77,29 +84,29 @@ def _extract_project_label(current_state_text: str, project_root: Path) -> str:
     for line in _meaningful_lines(current_state_text)[:6]:
         version_match = PROJECT_VERSION_RE.search(line)
         if version_match:
-            return _compact(version_match.group(1), max_chars=48) or project_root.name
+            return _compact(version_match.group(1), max_chars=48, project_root=project_root) or public_project_root_label(project_root)
         path_match = BACKTICK_PATH_RE.search(line)
         if path_match:
             candidate = Path(path_match.group(1)).name
             if candidate:
-                return _compact(candidate, max_chars=48) or project_root.name
-    return project_root.name
+                return _compact(candidate, max_chars=48, project_root=project_root) or public_project_root_label(project_root)
+    return redact_public_text(public_project_root_label(project_root), project_root=project_root) or "project"
 
 
-def _extract_phase(current_state_text: str, active_judgments_text: str) -> str:
+def _extract_phase(current_state_text: str, active_judgments_text: str, *, project_root: Path) -> str:
     lines = _meaningful_lines(current_state_text)[:6] + _meaningful_lines(active_judgments_text)[:4]
 
     for line in lines:
         explicit = PHASE_LABEL_RE.search(line)
         if explicit:
-            return _compact(explicit.group("value"), max_chars=72) or "active"
+            return _compact(explicit.group("value"), max_chars=72, project_root=project_root) or "active"
 
     for line in lines:
         lowered = line.casefold()
         if PROJECT_VERSION_RE.search(line):
             for _, keywords in PHASE_KEYWORDS:
                 if any(keyword in lowered for keyword in keywords):
-                    return _compact(line, max_chars=72) or "active"
+                    return _compact(line, max_chars=72, project_root=project_root) or "active"
 
     for phase_label, keywords in PHASE_KEYWORDS:
         for line in lines:
@@ -110,7 +117,7 @@ def _extract_phase(current_state_text: str, active_judgments_text: str) -> str:
     return "active"
 
 
-def _extract_next_step(next_step_text: str) -> str | None:
+def _extract_next_step(next_step_text: str, *, project_root: Path) -> str | None:
     if is_effectively_empty_summary_next_step(next_step_text):
         return None
     lines = [
@@ -120,7 +127,7 @@ def _extract_next_step(next_step_text: str) -> str | None:
     ]
     if not lines:
         return None
-    return _compact(" | ".join(lines[:2]), max_chars=160)
+    return _compact(" | ".join(lines[:2]), max_chars=160, project_root=project_root)
 
 
 def quick_summary_next_actions(
@@ -182,12 +189,20 @@ def build_quick_summary_payload(
         "schema_version": "1.1",
         "ok": True,
         "command": "quick-summary",
-        "project_root": project_root.name or project_root.as_posix(),
+        "project_root": redact_public_text(
+            public_project_root_label(project_root),
+            project_root=project_root,
+        )
+        or "project",
         "storage_root": storage_root.relative_to(project_root).as_posix(),
         "summary": {
             "project": _extract_project_label(current_state_text, project_root),
-            "phase": "unseeded" if empty_shell else _extract_phase(current_state_text, active_judgments_text),
-            "next_step": None if empty_shell else _extract_next_step(next_step_text),
+            "phase": (
+                "unseeded"
+                if empty_shell
+                else _extract_phase(current_state_text, active_judgments_text, project_root=project_root)
+            ),
+            "next_step": None if empty_shell else _extract_next_step(next_step_text, project_root=project_root),
             "confidence": freshness["continuity_confidence"],
         },
         "freshness": {
@@ -213,7 +228,11 @@ def build_no_project_payload(start_path: Path) -> dict:
         "schema_version": "1.1",
         "ok": True,
         "command": "quick-summary",
-        "project_root": start_path.name or start_path.as_posix(),
+        "project_root": redact_public_text(
+            public_project_root_label(start_path),
+            project_root=start_path,
+        )
+        or "project",
         "storage_root": None,
         "summary": {
             "project": None,

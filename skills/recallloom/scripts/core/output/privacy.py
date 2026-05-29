@@ -50,9 +50,32 @@ _PATH_LIST_FIELDS = {
     "skipped",
     "unknown_assets",
 }
+_SENSITIVE_FIELD_NAMES = {
+    "absolute_path",
+    "artifact_path",
+    "command",
+    "command_line",
+    "environment",
+    "env",
+    "full_payload",
+    "host_memory_payload",
+    "raw_payload",
+    "remote_response",
+    "remote_service_response",
+    "secret",
+    "shell_transcript",
+    "sidecar_body",
+    "source_path",
+    "target_path",
+    "token",
+}
 _TRAILING_PATH_PUNCTUATION = ".,:;!?)]}"
-_QUOTED_PATH_PATTERN = re.compile(r"(?P<quote>[\"'])(?P<path>(?:~|/|[A-Za-z]:[\\\\/])[^\"']+)(?P=quote)")
-_UNQUOTED_PATH_PATTERN = re.compile(r"(?P<path>(?:~|/|[A-Za-z]:[\\\\/])\S+)")
+_QUOTED_PATH_PATTERN = re.compile(
+    r"(?P<quote>[\"'])(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/])[^\"']+)(?P=quote)"
+)
+_UNQUOTED_PATH_PATTERN = re.compile(
+    r"(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/])\S+)"
+)
 _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|token|secret|password|credential)\s*[:=]\s*['\"]?[^\s,'\"]+"
@@ -60,17 +83,13 @@ _SECRET_ASSIGNMENT_PATTERN = re.compile(
 _COMMON_TOKEN_PATTERN = re.compile(
     r"\b(ghp_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[baprs]-[A-Za-z0-9-]{6,}|AKIA[0-9A-Z]{12,})\b"
 )
-_OPENAI_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9]{6,}\b")
+_OPENAI_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
 _BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]+")
 _URL_PATTERN = re.compile(r"(?i)\b(?:https?|file)://\S+")
 
 
 def private_json_paths_enabled(env: dict[str, str] | None = None) -> bool:
-    env = env or os.environ
-    raw = env.get(PRIVATE_JSON_PATHS_ENV)
-    if raw is None:
-        return False
-    return raw.strip().casefold() not in _FALSEY_ENV_VALUES
+    return False
 
 
 def _resolve_path(path: Path) -> Path:
@@ -192,7 +211,8 @@ def redact_public_text(
 ) -> str | None:
     if not isinstance(text, str) or not text:
         return text
-    publicized = publicize_text_paths(text, project_root=project_root, private=private)
+    url_redacted = _URL_PATTERN.sub("redacted-url", text)
+    publicized = publicize_text_paths(url_redacted, project_root=project_root, private=private)
     if publicized is None:
         return publicized
     redacted = _SECRET_ASSIGNMENT_PATTERN.sub("credential=redacted", publicized)
@@ -218,6 +238,16 @@ def _field_looks_pathlike(field_name: str | None) -> bool:
     )
 
 
+def _field_looks_sensitive(field_name: str | None) -> bool:
+    if not field_name:
+        return False
+    normalized = field_name.strip().casefold().replace("-", "_")
+    suffix_sensitive = _SENSITIVE_FIELD_NAMES.difference({"command", "env"})
+    return normalized in _SENSITIVE_FIELD_NAMES or any(
+        normalized.endswith(f"_{name}") for name in suffix_sensitive
+    )
+
+
 def publicize_json_value(
     value,
     *,
@@ -226,6 +256,8 @@ def publicize_json_value(
     private: bool | None = None,
 ):
     private = private_json_paths_enabled() if private is None else private
+    if _field_looks_sensitive(field_name):
+        return "redacted"
     if isinstance(value, dict):
         return {
             key: publicize_json_value(
@@ -238,16 +270,26 @@ def publicize_json_value(
         }
     if isinstance(value, list):
         if field_name in _PATH_LIST_FIELDS:
-            return [
-                display_project_path(item, project_root=project_root or ".", private=private)
-                if isinstance(item, (str, Path))
-                else publicize_json_value(
-                    item,
-                    project_root=project_root,
-                    private=private,
-                )
-                for item in value
-            ]
+            public_items = []
+            for item in value:
+                if isinstance(item, (str, Path)):
+                    public_path = display_project_path(
+                        item,
+                        project_root=project_root or ".",
+                        private=private,
+                    )
+                    public_items.append(
+                        redact_public_text(public_path, project_root=project_root, private=False)
+                    )
+                else:
+                    public_items.append(
+                        publicize_json_value(
+                            item,
+                            project_root=project_root,
+                            private=private,
+                        )
+                    )
+            return public_items
         return [
             publicize_json_value(
                 item,
@@ -257,11 +299,20 @@ def publicize_json_value(
             for item in value
         ]
     if isinstance(value, (str, Path)) and _field_looks_pathlike(field_name):
+        raw_value = str(value)
         if field_name == "project_root":
-            return display_project_root_label(value, private=private)
-        return display_project_path(
-            value,
-            project_root=project_root or value,
-            private=private,
+            public_value = display_project_root_label(raw_value, private=private)
+        else:
+            public_value = display_project_path(
+                raw_value,
+                project_root=project_root or raw_value,
+                private=private,
+            )
+        return redact_public_text(public_value, project_root=project_root, private=False)
+    if isinstance(value, (str, Path)):
+        return redact_public_text(
+            str(value),
+            project_root=project_root,
+            private=False,
         )
     return value

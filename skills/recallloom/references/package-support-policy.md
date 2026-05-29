@@ -20,6 +20,18 @@ This URL should remain the canonical public location on `origin/main`.
 Remote support/readiness checks should be rerun after publishing package updates, not worked around by rewriting the canonical URL for each environment.
 Operators can override it with `RECALLLOOM_SUPPORT_ADVISORY_URL` or provide a local JSON file with `RECALLLOOM_SUPPORT_ADVISORY_FILE`.
 
+## Repository Boundary
+
+Package-support advisories, public CI, and required checks validate public
+package metadata and support-policy posture. They must not present repository
+checks as proof of a user's local workspace state, host behavior, or sidecar
+trust status.
+
+Public support metadata must stay limited to information needed for package
+support decisions and must not include copied project memory, generated runtime
+output, machine-local data, maintainer-only working files, or material that is
+not required by the installable package.
+
 ## Advisory Schema
 
 The current advisory shape is:

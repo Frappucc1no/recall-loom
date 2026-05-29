@@ -18,6 +18,7 @@ from core.coldstart.structured import (
 )
 from core.protocol.contracts import FILE_KEYS
 from core.protocol.markers import parse_file_state_marker
+from core.provenance.state import provenance_facts_from_state
 
 from _common import (
     cli_failure_payload,
@@ -415,6 +416,7 @@ def main() -> None:
             )
         latest_daily_log = latest_active_daily_log(workspace.storage_root / DAILY_LOGS_DIRNAME)
         latest_daily_log_entry = latest_daily_log_entry_info(latest_daily_log)
+        provenance_facts = provenance_facts_from_state(state, review_intent=False)
     except ConfigContractError as exc:
         exit_with_cli_error(
             parser,
@@ -437,6 +439,9 @@ def main() -> None:
             ),
         )
 
+    safe_write_context_allowed = (
+        promotion_ready and provenance_facts["review_imported_baseline"]
+    )
     payload = {
         "ok": True,
         "project_root": str(workspace.project_root),
@@ -451,6 +456,19 @@ def main() -> None:
         "review_sections_present": sorted(review_sections.keys()),
         "review_action": review_action,
         "promotion_ready": promotion_ready,
+        "provenance_metadata_status": provenance_facts["metadata_status"],
+        "provenance_state": (
+            "helper_evidenced"
+            if provenance_facts["helper_evidenced"]
+            else "review_imported_baseline"
+            if provenance_facts["review_imported_baseline"]
+            else "review_required"
+            if provenance_facts["review_required"]
+            else "structurally_valid_legacy"
+            if provenance_facts["legacy_sidecar"]
+            else "structurally_valid"
+        ),
+        "review_import_does_not_claim_helper_evidenced": True,
         "safe_write_context": ({
             "workspace_revision": state["workspace_revision"],
             "commit_context_file": {
@@ -478,11 +496,19 @@ def main() -> None:
                 "suggested_date": latest_daily_log.stem if latest_daily_log is not None else None,
                 "expected_workspace_revision": state["workspace_revision"],
             },
-        } if promotion_ready else None),
+        } if safe_write_context_allowed else None),
+        "write_context_blocked_reason": (
+            None
+            if safe_write_context_allowed
+            else "review_import_not_recorded"
+            if promotion_ready
+            else "promotion_not_ready"
+        ),
         "notes": [
             "This helper does not promote any content into core continuity files.",
             "Only rolling_summary.md, context_brief.md, and daily log appends are valid promotion targets for reviewed recovery content.",
             "A model or human must still decide what content is durable enough to write and which target file is appropriate.",
+            "Safe write context is emitted only after the reviewed import baseline is recorded in state.json.",
         ],
     }
 

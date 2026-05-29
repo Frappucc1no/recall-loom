@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 import json
 from pathlib import Path
 
@@ -11,7 +12,10 @@ from core.coldstart.structured import (
     REVIEW_SECTION_ALIASES,
     classify_review_action,
     extract_structured_sections,
+    promotion_ready_for_action,
 )
+from core.protocol.contracts import FILE_KEYS
+from core.provenance.state import review_imported_baseline_metadata
 from core.safety.prepared_input import (
     PreparedInputSafetyError,
     read_prepared_input_source_text,
@@ -30,6 +34,7 @@ from _common import (
     exit_with_cli_error,
     exit_with_failure_contract,
     find_recallloom_root,
+    load_workspace_state,
     LockBusyError,
     ManagedDirectorySafetyError,
     now_iso_timestamp,
@@ -285,6 +290,13 @@ def main() -> None:
 
     review_path = review_log_dir / f"{proposal_path.stem}.review.md"
 
+    review_sections = extract_structured_sections(body_text, REVIEW_SECTION_ALIASES)
+    review_action = classify_review_action(review_sections)
+    promotion_ready = promotion_ready_for_action(review_action)
+    recorded_at = now_iso_timestamp()
+    provenance_state_after = None
+    new_workspace_revision = None
+
     try:
         with workspace_write_lock(workspace.project_root, "record_recovery_review.py"):
             proposals_dir = ensure_managed_directory_chain(
@@ -346,7 +358,29 @@ def main() -> None:
                 project_root=workspace.project_root,
                 create=False,
                 )
+            proposal_text = read_text(proposal_path)
+            state_path = workspace.storage_root / FILE_KEYS["state"]
+            next_state_text = None
+            if promotion_ready:
+                state = load_workspace_state(state_path)
+                state["workspace_revision"] += 1
+                state["provenance"] = review_imported_baseline_metadata(
+                    timestamp=recorded_at,
+                    review_action=review_action,
+                    proposal_digest=text_digest(proposal_text),
+                    review_digest=text_digest(body_text),
+                )
+                new_workspace_revision = state["workspace_revision"]
+                next_state_text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
             write_text(review_path, body_text.rstrip("\n") + "\n")
+            if next_state_text is not None:
+                try:
+                    write_text(state_path, next_state_text)
+                except OSError:
+                    with suppress(FileNotFoundError):
+                        review_path.unlink()
+                    raise
+                provenance_state_after = "review_imported_baseline"
     except LockBusyError as exc:
         public_message = publicize_text_paths(
             str(exc),
@@ -371,17 +405,19 @@ def main() -> None:
                 details=exc.details,
             ),
         )
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, ConfigContractError) as exc:
         message = "Filesystem error while recording recovery review."
+        if isinstance(exc, ConfigContractError):
+            message = str(exc)
         exit_with_cli_error(
             parser,
             json_mode=args.json,
             exit_code=2,
             message=message,
-            payload=cli_failure_payload(
-                "damaged_sidecar",
-                error=message,
-                details={"error_type": type(exc).__name__},
+            payload=cli_failure_payload_for_exception(
+                exc,
+                default_reason="damaged_sidecar",
+                extra={"error_type": type(exc).__name__},
             ),
         )
 
@@ -391,9 +427,13 @@ def main() -> None:
         "review_path": str(review_path),
         "source_file": str(source_path),
         "source_digest": text_digest(body_text),
-        "review_sections_present": sorted(extract_structured_sections(body_text, REVIEW_SECTION_ALIASES).keys()),
-        "review_action": classify_review_action(extract_structured_sections(body_text, REVIEW_SECTION_ALIASES)),
-        "recorded_at": now_iso_timestamp(),
+        "review_sections_present": sorted(review_sections.keys()),
+        "review_action": review_action,
+        "promotion_ready": promotion_ready,
+        "provenance_state_after": provenance_state_after,
+        "new_workspace_revision": new_workspace_revision,
+        "workspace_revision_bumped": new_workspace_revision is not None,
+        "recorded_at": recorded_at,
     }
     if args.json:
         print(

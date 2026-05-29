@@ -54,9 +54,20 @@ Please do not add:
 - 本机路径、宿主工具元数据、token、形似 token 的示例值、个人聊天记录或客户/项目数据
 - copied `.recallloom/` project memory from a real workspace
 - 从真实工作区复制出来的 `.recallloom/` 项目记忆
+- copied project memory, review records, local operation outputs, or
+  maintainer-only working files that are not required for installation or
+  everyday use
+- 复制出来的真实项目记忆、审阅记录、本地运行输出，或安装和日常使用不需要的维护者工作文件
 - broad rewrites that mix product behavior, version or support facts, and
   documentation style changes in one pull request
 - 在一个 PR 里混合产品行为、版本或支持状态信息和文档风格的大范围改写
+
+Public CI or required checks may be useful, but describe them only as
+repository content and metadata checks. They are not proof of a user's local
+workspace state, host behavior, or project-memory trust status.
+
+公开 CI 或 required check 可以有帮助，但只能把它们描述为仓库内容和元数据检查；
+它们不是用户本地工作区状态、宿主行为或项目记忆可信状态的证明。
 
 When in doubt, keep the pull request small and explain the user-facing reason
 for the change.

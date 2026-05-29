@@ -255,6 +255,8 @@ When `rolling_summary.md` becomes hard to scan, compress it and preserve moved d
 
 When daily logs accumulate past their useful immediate horizon, archive older entries according to project rules.
 
+In v0.4.2, archive helpers may preview archive candidates, but archive apply is not part of the receipt-backed mutating surface yet.
+
 ### Stale content retirement
 
 False, superseded, or no-longer-useful content should not remain in the active continuity layer.
@@ -282,6 +284,8 @@ For packaged helper writes in the current package line, RecallLoom also uses:
 - revision-aware commits for overwrite-style files
 - revision-aware appends for daily-log entries
 - atomic replace for managed overwrite-style writes
+- read-side provenance labels in helper JSON only; `structurally_valid` is not the same as `helper_evidenced`
+- optional `state.json.provenance` metadata for distinguishing fresh helper initialization, reviewed legacy import, and receipt-finalized helper evidence
 
 This safety layer does not replace editorial judgment:
 
@@ -295,6 +299,10 @@ Recommended deterministic write flow:
 2. prepare the intended content change
 3. commit overwrite-style files with revision-aware helper writes
 4. append milestone log entries with revision-aware helper appends
+
+The provenance helper surfaces expose `preflight_contract_identity`, `expected_revisions`, `provenance_state`, and `write_readiness`; dispatcher-backed managed-file writes may additionally finalize a minimal local helper receipt in `derived/helper-receipts.json`.
+Review / repair import may move a legacy sidecar to `review_imported_baseline`, but that import is not helper evidence. Only a later mutating helper write with a finalized receipt may claim `helper_evidenced` and persist that provenance marker.
+Hidden direct-helper preflight bindings are accepted only when they match a dispatcher-issued local lease in `derived/preflight-bindings.json`; the lease is a local freshness guard, not a remote authenticity proof.
 
 ## Progressive Disclosure
 

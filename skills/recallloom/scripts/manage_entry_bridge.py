@@ -16,6 +16,7 @@ from core.bridge.blocks import (
     replace_or_insert_bridge,
 )
 from core.protocol.contracts import FILE_KEYS, ROOT_ENTRY_CANDIDATES
+from core.provenance.state import helper_write_gate_from_state
 from core.safety.attached_text import scan_auto_attached_context_text
 
 from _common import (
@@ -82,6 +83,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def enforce_provenance_write_gate(parser, *, json_mode: bool, state: dict) -> None:
+    gate = helper_write_gate_from_state(
+        state,
+        helper_name="manage_entry_bridge.py",
+        operation_class="entry_bridge_update",
+        require_preflight_for_review_imported_baseline=True,
+    )
+    if gate["allowed"]:
+        return
+    message = (
+        "Refusing to update bridge files because bridge apply is outside the v0.4.2 "
+        "dispatcher-issued receipt-backed mutating surface. Use preview mode only until "
+        "bridge receipt support is added."
+    )
+    exit_with_cli_error(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=message,
+        payload=cli_failure_payload(
+            "unsupported_mutating_surface",
+            error=message,
+            details={
+                "reason_code": "bridge_apply_not_receipt_backed",
+                "helper_name": gate["helper_name"],
+                "operation_class": gate["operation_class"],
+                "provenance_state": gate["provenance_state"],
+                "provenance_metadata_status": gate["provenance_metadata_status"],
+                "write_readiness": gate["write_readiness"],
+                "side_effect": "none",
+                "next_actions": ["run_bridge_preview", "wait_for_bridge_receipt_support"],
+            },
+        ),
+    )
+
+
 def resolve_targets(project_root: Path, explicit_files: list[str]) -> list[Path]:
     if explicit_files:
         targets: list[Path] = []
@@ -112,7 +149,7 @@ def bridge_integrity_message(reason: str | None, target: Path) -> str:
     detail = detail_map.get(reason, "the managed bridge block is malformed")
     return (
         f"Refusing to modify {target} because {detail}. "
-        "Repair or remove the malformed bridge block manually before retrying."
+        "Use validate_context.py and the recovery proposal/review/promotion helpers before retrying."
     )
 
 
@@ -253,6 +290,8 @@ def main() -> None:
                     message=str(exc),
                     payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
                 )
+            if args.yes:
+                enforce_provenance_write_gate(parser, json_mode=args.json, state=state)
 
             results = []
             for target in targets:

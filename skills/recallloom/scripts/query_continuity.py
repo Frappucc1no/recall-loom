@@ -14,6 +14,8 @@ from core.continuity.freshness import (
     freshness_risk_summary,
     summary_matches_empty_shell_template as shared_summary_matches_empty_shell_template,
 )
+from core.output.privacy import publicize_json_value, redact_public_text
+from core.provenance.state import provenance_facts_from_state
 from core.trust.state import evaluate_trust_state
 
 from _common import (
@@ -25,12 +27,10 @@ from _common import (
     exit_with_cli_error,
     ensure_supported_python_version,
     EnvironmentContractError,
-    exit_if_startup_scratch_residue,
     extract_section_text,
     find_recallloom_root,
     FILE_KEYS,
     invalid_iso_like_daily_log_files,
-    latest_active_daily_log,
     load_workspace_state,
     MARKDOWN_HEADING_RE,
     parse_daily_log_entry_line,
@@ -957,7 +957,7 @@ def confidence_for_hits(
     return "low"
 
 
-def public_hits(hits: list[dict]) -> list[dict]:
+def public_hits(hits: list[dict], *, project_root: Path) -> list[dict]:
     return [
         {
             "path": item["path"],
@@ -971,7 +971,7 @@ def public_hits(hits: list[dict]) -> list[dict]:
             "do_not_promote_to_current": item.get("do_not_promote_to_current", False),
             "do_not_use_as_current_fact": item.get("do_not_use_as_current_fact", False),
             "date": citation_date(item["path"], item["source_type"]),
-            "excerpt": item["excerpt"],
+            "excerpt": redact_public_text(item["excerpt"], project_root=project_root) or "redacted",
         }
         for item in hits
     ]
@@ -1038,6 +1038,8 @@ def operation_metadata_for_query(
     query_intent: str,
     include_daily_logs: bool,
     context_brief_included: bool,
+    latest_daily_log_included: bool,
+    latest_daily_log_read_reason: str | None,
     recent_daily_logs_included: bool,
     derived_overlay_read: bool,
 ) -> dict:
@@ -1046,18 +1048,28 @@ def operation_metadata_for_query(
         recommended_path = "query_continuity --include-daily-logs"
         reason = "Historical or timeline-oriented query; daily-log evidence must remain evidence, not current truth."
         followup = "Use daily_log_path, entry_id, and entry_seq when citing evidence."
-        read_set = ["rolling_summary", "latest_daily_log"]
-        do_not_read_by_default = ["context_brief"]
+        read_set = ["rolling_summary"]
+        do_not_read_by_default = ["context_brief", "update_protocol"]
     else:
         operation_class = "read_current_status"
         recommended_path = "query_continuity --quick"
-        reason = "Fast current-status read uses bounded current sources and avoids context_brief by default."
+        reason = (
+            "Fast current-status read searches rolling_summary first and avoids "
+            "daily-log content unless direct evidence is explicitly needed."
+        )
         followup = "Escalate to detailed/background review only when current sources are insufficient."
-        read_set = ["rolling_summary", "latest_daily_log"]
-        do_not_read_by_default = ["context_brief"]
+        read_set = ["rolling_summary"]
+        do_not_read_by_default = ["context_brief", "latest_daily_log", "update_protocol"]
+    if latest_daily_log_included:
+        read_set.append("latest_daily_log")
+        do_not_read_by_default = [
+            item for item in do_not_read_by_default if item != "latest_daily_log"
+        ]
     if context_brief_included:
         read_set.append("context_brief")
-        do_not_read_by_default = []
+        do_not_read_by_default = [
+            item for item in do_not_read_by_default if item != "context_brief"
+        ]
     if derived_overlay_read:
         read_set.append("derived_overlay")
     if recent_daily_logs_included:
@@ -1069,6 +1081,7 @@ def operation_metadata_for_query(
         "followup": followup,
         "read_set": read_set,
         "do_not_read_by_default": do_not_read_by_default,
+        "latest_daily_log_read_reason": latest_daily_log_read_reason,
     }
 
 
@@ -1077,6 +1090,8 @@ def read_set_evidence_for_query(
     operation_metadata: dict,
     sources_considered: list[dict],
     context_brief_included: bool,
+    latest_daily_log_included: bool,
+    latest_daily_log_read_reason: str | None,
     derived_overlay_review: dict,
     include_daily_logs: bool,
     recent_daily_logs_included: bool,
@@ -1095,6 +1110,8 @@ def read_set_evidence_for_query(
         ],
         "context_brief_read": context_brief_included,
         "context_brief_default_read": False,
+        "latest_daily_log_read": latest_daily_log_included,
+        "latest_daily_log_read_reason": latest_daily_log_read_reason,
         "derived_overlay_read": derived_overlay_review.get("derived_overlay_read", False),
         "derived_overlay_review": derived_overlay_review,
         "include_daily_logs_requested": include_daily_logs,
@@ -1577,6 +1594,44 @@ def attach_scan_text_surface(
     return "\n".join(part for part in parts if part.strip())
 
 
+def _mark_source_included(sources: list[dict], source_type: str) -> None:
+    for item in sources:
+        if item.get("source_type") == source_type:
+            item["included"] = True
+            return
+
+
+def _latest_daily_log_read_decision(
+    *,
+    query_intent: str,
+    include_daily_logs: bool,
+    summary_hits_found: bool,
+    context_brief_included: bool,
+) -> tuple[bool, str | None]:
+    if include_daily_logs:
+        return True, "include_daily_logs_requested"
+    if query_intent in {"progress", "timeline"}:
+        return True, f"{query_intent}_intent"
+    if query_intent == "background" or context_brief_included:
+        return False, None
+    if not summary_hits_found:
+        return True, "no_current_summary_hit_direct_evidence_needed"
+    return False, None
+
+
+def _state_latest_daily_log_path(state: dict, storage_root: Path) -> Path | None:
+    daily_logs = state.get("daily_logs")
+    if not isinstance(daily_logs, dict):
+        return None
+    entry_count = daily_logs.get("entry_count")
+    latest_file = daily_logs.get("latest_file")
+    if not isinstance(entry_count, int) or isinstance(entry_count, bool) or entry_count <= 0:
+        return None
+    if not isinstance(latest_file, str) or not latest_file:
+        return None
+    return storage_root / latest_file
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -1640,15 +1695,10 @@ def main() -> None:
             payload=cli_failure_payload(
                 "no_project_root",
                 error="No RecallLoom project root found.",
-                details={"project_root": str(Path(args.path).expanduser().resolve())},
+                details={"project_root": public_project_root_label(Path(args.path).expanduser().resolve())},
             ),
         )
-    startup_residue_report = exit_if_startup_scratch_residue(
-        parser,
-        json_mode=args.json,
-        project_root=workspace.project_root,
-        storage_root=workspace.storage_root,
-    )
+    startup_residue_report = None
 
     summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
     context_brief_path = workspace.storage_root / FILE_KEYS["context_brief"]
@@ -1704,41 +1754,7 @@ def main() -> None:
                         error=f"Missing required file-state metadata marker: {context_brief_path}",
                     ),
                 )
-        if update_protocol_path.is_file():
-            update_protocol_state = parse_file_state_marker(read_text(update_protocol_path))
-            if update_protocol_state is None:
-                exit_with_cli_error(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=2,
-                    message=f"Missing required file-state metadata marker: {update_protocol_path}",
-                    payload=cli_failure_payload(
-                        "malformed_managed_file",
-                        error=f"Missing required file-state metadata marker: {update_protocol_path}",
-                    ),
-                )
-        latest_daily_log = latest_active_daily_log(logs_dir)
-        latest_daily_log_text = read_text(latest_daily_log) if latest_daily_log is not None else ""
-        if latest_daily_log is not None and not any(
-            parse_daily_log_entry_line(line) is not None
-            for line in latest_daily_log_text.splitlines()
-        ):
-            exit_with_cli_error(
-                parser,
-                json_mode=args.json,
-                exit_code=2,
-                message=(
-                    "Missing required daily-log-entry metadata marker in the latest ISO-dated daily log: "
-                    f"{latest_daily_log}"
-                ),
-                payload=cli_failure_payload(
-                    "malformed_managed_file",
-                    error=(
-                        "Missing required daily-log-entry metadata marker in the latest ISO-dated daily log: "
-                        f"{latest_daily_log}"
-                    ),
-                ),
-            )
+        latest_daily_log = _state_latest_daily_log_path(state, workspace.storage_root)
         scan_mode = "full" if args.full else "quick"
         freshness = evaluate_continuity_freshness(
             project_root=workspace.project_root,
@@ -1785,7 +1801,16 @@ def main() -> None:
             "do_not_read_by_default": True,
             "reason": "context_brief is reserved for background/deep review, not fast current-status reads.",
         },
-        {"path": str(update_protocol_path), "source_type": "update_protocol", "included": update_protocol_path.is_file()},
+        {
+            "path": str(update_protocol_path),
+            "source_type": "update_protocol",
+            "included": False,
+            "do_not_read_by_default": True,
+            "reason": (
+                "update_protocol is surfaced as an override review target when present; "
+                "query does not read its body by default."
+            ),
+        },
         {
             "path": str(derived_overlay_path),
             "source_type": "derived_overlay",
@@ -1797,15 +1822,15 @@ def main() -> None:
     ]
 
     hits: list[dict] = []
+    summary_hits: list[dict] = []
     if continuity_has_seeded_state:
-        hits.extend(
-            gather_file_hits(
-                path=summary_path,
-                source_type="rolling_summary",
-                query_terms=query_terms,
-                full_query=full_query,
-            )
+        summary_hits = gather_file_hits(
+            path=summary_path,
+            source_type="rolling_summary",
+            query_terms=query_terms,
+            full_query=full_query,
         )
+        hits.extend(summary_hits)
     if continuity_has_seeded_state and context_brief_included and context_brief_path.is_file():
         hits.extend(
             gather_file_hits(
@@ -1816,19 +1841,58 @@ def main() -> None:
             )
         )
 
+    latest_daily_log_included, latest_daily_log_read_reason = _latest_daily_log_read_decision(
+        query_intent=query_analysis["intent"],
+        include_daily_logs=args.include_daily_logs,
+        summary_hits_found=bool(summary_hits),
+        context_brief_included=context_brief_included,
+    )
+    latest_daily_log_included = bool(
+        continuity_has_seeded_state and latest_daily_log is not None and latest_daily_log_included
+    )
+    if not latest_daily_log_included:
+        latest_daily_log_read_reason = None
     if continuity_has_seeded_state and latest_daily_log is not None:
         sources_considered.append(
-            {"path": str(latest_daily_log), "source_type": "latest_daily_log", "included": True}
+            {
+                "path": str(latest_daily_log),
+                "source_type": "latest_daily_log",
+                "included": latest_daily_log_included,
+                "do_not_read_by_default": not latest_daily_log_included,
+                "read_reason": latest_daily_log_read_reason,
+            }
         )
-        hits.extend(
-            gather_daily_log_hits(
-                path=latest_daily_log,
-                source_type="latest_daily_log",
-                query_terms=query_terms,
-                full_query=full_query,
-                text=latest_daily_log_text,
+        if latest_daily_log_included:
+            latest_daily_log_text = read_text(latest_daily_log)
+            if not any(
+                parse_daily_log_entry_line(line) is not None
+                for line in latest_daily_log_text.splitlines()
+            ):
+                exit_with_cli_error(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=2,
+                    message=(
+                        "Missing required daily-log-entry metadata marker in the latest ISO-dated daily log: "
+                        f"{latest_daily_log}"
+                    ),
+                    payload=cli_failure_payload(
+                        "malformed_managed_file",
+                        error=(
+                            "Missing required daily-log-entry metadata marker in the latest ISO-dated daily log: "
+                            f"{latest_daily_log}"
+                        ),
+                    ),
+                )
+            hits.extend(
+                gather_daily_log_hits(
+                    path=latest_daily_log,
+                    source_type="latest_daily_log",
+                    query_terms=query_terms,
+                    full_query=full_query,
+                    text=latest_daily_log_text,
+                )
             )
-        )
 
     recent_daily_logs_included = False
     if continuity_has_seeded_state and args.include_daily_logs:
@@ -1863,6 +1927,8 @@ def main() -> None:
         query_intent=query_analysis["intent"],
         include_daily_logs=args.include_daily_logs,
         context_brief_included=context_brief_included,
+        latest_daily_log_included=latest_daily_log_included,
+        latest_daily_log_read_reason=latest_daily_log_read_reason,
         recent_daily_logs_included=recent_daily_logs_included,
         derived_overlay_read=derived_overlay_path.exists(),
     )
@@ -1896,8 +1962,11 @@ def main() -> None:
                 "derived_overlay_conflict",
                 error="Derived overlay conflicts with rolling_summary current truth.",
                 details={
-                    "project_root": str(workspace.project_root),
-                    "path": str(derived_overlay_path),
+                    "project_root": public_project_root_label(workspace.project_root),
+                    "path": public_project_path(
+                        derived_overlay_path,
+                        project_root=workspace.project_root,
+                    ),
                     "reason_code": "derived_overlay_conflict",
                     "fallback_source": DERIVED_OVERLAY_FALLBACK_SOURCE,
                 },
@@ -1908,7 +1977,7 @@ def main() -> None:
             ),
         )
     if derived_overlay_review.get("included"):
-        sources_considered[-1]["included"] = True
+        _mark_source_included(sources_considered, "derived_overlay")
         hits.extend(derived_overlay_review.get("supporting_hits", []))
         sorted_hits = sort_hits(hits, query_intent=query_analysis["intent"])
         truth_candidate_hits = [
@@ -1926,6 +1995,8 @@ def main() -> None:
             query_intent=query_analysis["intent"],
             include_daily_logs=args.include_daily_logs,
             context_brief_included=context_brief_included,
+            latest_daily_log_included=latest_daily_log_included,
+            latest_daily_log_read_reason=latest_daily_log_read_reason,
             recent_daily_logs_included=recent_daily_logs_included,
             derived_overlay_read=derived_overlay_review.get("derived_overlay_read", True),
         )
@@ -1953,24 +2024,28 @@ def main() -> None:
         }
         for item in surface_hits
     ]
-    public_hit_list = public_hits(surface_hits)
-    support_window = supporting_context_window(public_hit_list, mode=args.mode)
     answer_hits = [primary_truth_hit] if primary_truth_hit is not None else []
-    answer = answer_for_query(hits=answer_hits, continuity_state=continuity_state)
+    public_answer_hits = public_hits(answer_hits, project_root=workspace.project_root)
+    public_hit_list = public_hits(surface_hits, project_root=workspace.project_root)
+    support_window = supporting_context_window(public_hit_list, mode=args.mode)
+    answer = answer_for_query(hits=public_answer_hits, continuity_state=continuity_state)
     risk_freshness_note = risk_freshness_note_for_query(
         freshness=freshness,
         conflict_state=conflict_state,
         continuity_state=continuity_state,
         update_protocol_present=update_protocol_path.is_file(),
     )
-    synthesized_recall = render_synthesized_recall(
-        query=args.query,
-        answer=answer,
-        citations=citations,
-        hits=public_hit_list,
-        mode=args.mode,
-        risk_freshness_note=risk_freshness_note,
-    )
+    synthesized_recall = redact_public_text(
+        render_synthesized_recall(
+            query=args.query,
+            answer=answer,
+            citations=citations,
+            hits=public_hit_list,
+            mode=args.mode,
+            risk_freshness_note=risk_freshness_note,
+        ),
+        project_root=workspace.project_root,
+    ) or "redacted"
 
     attach_scan = scan_auto_attached_context_text(
         attach_scan_text_surface(
@@ -2007,12 +2082,18 @@ def main() -> None:
             supporting_window=support_window if args.mode == "detailed" else [],
         )
     )
+    provenance_facts = provenance_facts_from_state(state, review_intent=False)
     trust_state = evaluate_trust_state(
         continuity_confidence=freshness["continuity_confidence"],
         continuity_state=continuity_state,
         summary_stale=freshness["summary_stale"],
         workspace_newer_than_summary=freshness["workspace_newer_than_summary"],
         conflict_state=conflict_state,
+        legacy_sidecar=provenance_facts["legacy_sidecar"],
+        legacy_review_required=provenance_facts["review_required"],
+        review_imported_baseline=provenance_facts["review_imported_baseline"],
+        helper_evidenced=provenance_facts["helper_evidenced"],
+        inconsistent_evidence=provenance_facts["inconsistent_evidence"],
     )
     public_project_root = public_project_root_label(workspace.project_root)
     public_storage_root = public_project_path(workspace.storage_root, project_root=workspace.project_root)
@@ -2036,7 +2117,7 @@ def main() -> None:
         project_root=workspace.project_root,
     )
     public_truth_candidate_hits = publicize_public_hit_paths(
-        public_hits(truth_candidate_hits),
+        public_hits(truth_candidate_hits, project_root=workspace.project_root),
         project_root=workspace.project_root,
     )
     citations = [
@@ -2061,6 +2142,8 @@ def main() -> None:
         operation_metadata=operation_metadata,
         sources_considered=public_sources_considered,
         context_brief_included=context_brief_included,
+        latest_daily_log_included=latest_daily_log_included,
+        latest_daily_log_read_reason=latest_daily_log_read_reason,
         derived_overlay_review={
             **derived_overlay_review,
             "path": public_project_path(
@@ -2072,7 +2155,8 @@ def main() -> None:
                     [
                         annotate_hit_truth_metadata(item, active_source=False)
                         for item in derived_overlay_review.get("supporting_hits", [])
-                    ]
+                    ],
+                    project_root=workspace.project_root,
                 ),
                 project_root=workspace.project_root,
             ),
@@ -2102,10 +2186,22 @@ def main() -> None:
     )
     payload = {
         "schema_version": "1.1",
+        "fast_lane_contract": {
+            "read_only": True,
+            "attach_safe": True,
+            "receipt_store_audit_performed": False,
+            "receipt_chain_scan_performed": False,
+            "daily_log_content_read": latest_daily_log_included,
+            "recent_daily_log_sweep_performed": recent_daily_logs_included,
+            "supporting_context_window_included": args.mode == "detailed",
+            "context_brief_read": context_brief_included,
+            "startup_scratch_scan_performed": False,
+        },
         "project_root": public_project_root,
         "storage_root": public_storage_root,
         "continuity_confidence": freshness["continuity_confidence"],
         "sidecar_trust_state": trust_state["sidecar_trust_state"],
+        "provenance_metadata_status": provenance_facts["metadata_status"],
         "allowed_operation_level": trust_state["allowed_operation_level"],
         "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
         "continuity_state": continuity_state,
@@ -2204,7 +2300,8 @@ def main() -> None:
         payload["startup_residue_report"] = startup_residue_report
 
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        public_payload = publicize_json_value(payload, project_root=workspace.project_root)
+        print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:
         print(synthesized_recall)
 

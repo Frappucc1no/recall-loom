@@ -28,7 +28,7 @@ PACKAGE_SUPPORT_PUBLIC_HINT_KEY_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 PACKAGE_SUPPORT_PUBLIC_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._,;:()'+-]{0,159}$")
 PACKAGE_SUPPORT_PRIVATE_TEXT_RE = re.compile(
     r"(?i)(?:https?://|file://|/|\\|@|\b(?:api[_-]?key|token|secret|password|credential)\b|"
-    r"\bsk-[A-Za-z0-9]{6,}\b|"
+    r"\bsk-[A-Za-z0-9_-]{6,}\b|"
     r"\bghp_[A-Za-z0-9_]{6,}\b|"
     r"\bgithub_pat_[A-Za-z0-9_]{6,}\b|"
     r"\bbearer\s+[A-Za-z0-9._-]+)"
@@ -497,7 +497,7 @@ _WRITER_ID_SECRET_WORD_RE = re.compile(
 _WRITER_ID_COMMON_TOKEN_RE = re.compile(
     r"\b(ghp_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b"
 )
-_WRITER_ID_OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9]{8,}\b")
+_WRITER_ID_OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _WRITER_ID_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]+")
 _WRITER_ID_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:")
 _SENSITIVE_WRITER_PREFIXES = (
@@ -788,7 +788,7 @@ _WRAPPER_METADATA_SECRET_ASSIGNMENT_RE = re.compile(
 _WRAPPER_METADATA_COMMON_TOKEN_RE = re.compile(
     r"\b(ghp_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,})\b"
 )
-_WRAPPER_METADATA_OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9]{8,}\b")
+_WRAPPER_METADATA_OPENAI_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _WRAPPER_METADATA_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]+")
 _WRAPPER_METADATA_PRIVATE_PATH_RE = re.compile(r"(^|[\s\"'=])(?:~|/|[A-Za-z]:[\\/])")
 _WRAPPER_METADATA_HASH_REF_RE = re.compile(r"^(?:hmac:[a-f0-9]{16,64}|ephemeral:[A-Za-z0-9._+-]{1,48}|none)$")
@@ -1498,7 +1498,9 @@ def exit_with_cli_error(
         body = {"ok": False, "error": message}
         if payload:
             body.update(payload)
-        print(json.dumps(body, ensure_ascii=False, indent=2))
+        project_root = body.get("project_root") if isinstance(body.get("project_root"), str) else None
+        public_body = publicize_json_value(body, project_root=project_root)
+        print(json.dumps(public_body if isinstance(public_body, dict) else body, ensure_ascii=False, indent=2))
         raise SystemExit(exit_code)
     public_message = shared_redact_public_text(message, project_root=None) or message
     parser.exit(exit_code, public_message + "\n")
@@ -1709,7 +1711,10 @@ def enforce_package_support_gate(
         advisory_url=metadata.get("support_advisory_url"),
         env=os.environ,
     )
-    os.environ[SUPPORT_STATE_ENV] = json.dumps(support, ensure_ascii=False)
+    os.environ[SUPPORT_STATE_ENV] = json.dumps(
+        public_package_support_payload(support) or {},
+        ensure_ascii=False,
+    )
     if support["allowed"]:
         return support
     public_support = public_package_support_payload(support)
