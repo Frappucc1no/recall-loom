@@ -136,6 +136,7 @@ from _common import (
     cli_failure_payload,
     cli_failure_payload_for_exception,
     ConfigContractError,
+    DailyLogCursorError,
     EnvironmentContractError,
     enforce_package_support_gate,
     ensure_supported_python_version,
@@ -558,6 +559,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     post_append_sync_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+
+    repair_parser = subparsers.add_parser(
+        "repair-daily-log-cursor",
+        help="Preview or apply the structural daily-log cursor repair helper.",
+    )
+    repair_parser.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="Project path or a descendant path. Defaults to the current working directory.",
+    )
+    repair_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the cursor repair. Requires --yes.",
+    )
+    repair_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the explicit --apply repair.",
+    )
+    repair_parser.add_argument(
+        "--expected-workspace-revision",
+        type=int,
+        help="Optional revision guard forwarded to repair_daily_log_cursor.py apply mode.",
+    )
+    repair_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
     bridge_parser = subparsers.add_parser(
         "bridge",
@@ -1071,6 +1099,92 @@ def _append_helper_args(
     return helper_args
 
 
+def _append_dispatcher_input_mode(args: argparse.Namespace) -> str | None:
+    selected_sources = int(args.entry_json is not None) + int(args.entry_file is not None) + int(args.stdin)
+    if selected_sources == 0:
+        return "missing"
+    if selected_sources > 1:
+        return "ambiguous"
+    input_format = args.input_format or "auto"
+    if args.entry_json is not None:
+        return "json-string"
+    if args.entry_file is not None:
+        return "json-file" if input_format == "json" else "file"
+    if args.stdin:
+        return "json-stdin" if input_format == "json" else "stdin"
+    return None
+
+
+def _append_retry_payload(
+    args: argparse.Namespace,
+    *,
+    extra_args: list[str] | None = None,
+    requires_repair_command_first: bool = False,
+) -> dict:
+    input_mode = _append_dispatcher_input_mode(args) or "missing"
+    input_format = args.input_format or "auto"
+    input_args: list[str]
+    input_ref: str
+    if input_mode == "json-string":
+        input_args = ["--entry-json", "<prepared-entry-json>"]
+        input_ref = "same_entry_json_payload"
+    elif input_mode == "json-file":
+        input_args = ["--entry-file", "<entry.json>", "--input-format", "json"]
+        input_ref = "same_prepared_entry_file"
+    elif input_mode == "json-stdin":
+        input_args = ["--stdin", "--input-format", "json"]
+        input_ref = "resubmit_same_stdin_payload"
+    elif input_mode == "stdin":
+        input_args = ["--stdin"]
+        input_ref = "resubmit_same_stdin_payload"
+    elif input_mode in {"ambiguous", "missing"}:
+        input_args = ["--entry-json", "<prepared-entry-json>"]
+        input_ref = "choose_one_prepared_entry_source"
+    else:
+        input_args = ["--entry-file", "<prepared-entry.md>"]
+        input_ref = "same_prepared_entry_file"
+    if args.max_input_bytes is not None:
+        input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    if args.date is not None:
+        input_args.extend(["--date", args.date])
+    if args.allow_historical:
+        input_args.append("--allow-historical")
+    if args.no_auto_detect:
+        input_args.append("--no-auto-detect")
+    writer_args: list[str] = []
+    writer_fields: dict[str, str | bool] = {}
+    if args.writer_id is not None:
+        safe_writer_id = normalize_safe_writer_id(args.writer_id)
+        writer_arg = safe_writer_id or "same_explicit_writer_id"
+        writer_args = ["--writer-id", writer_arg]
+        writer_fields = {
+            "writer_id_source": "explicit_cli",
+            "writer_id_ref": "same_explicit_writer_id",
+            "writer_id_public_safe": safe_writer_id is not None,
+        }
+        if safe_writer_id is not None:
+            writer_fields["writer_id"] = safe_writer_id
+    return {
+        "command": "recallloom.py append",
+        "project_ref": "same_project",
+        "input_mode": input_mode,
+        "input_ref": input_ref,
+        "input_format": input_format,
+        "argv_template": [
+            "recallloom.py",
+            "append",
+            "same_project",
+            *input_args,
+            *writer_args,
+            *(extra_args or []),
+            "--json",
+        ],
+        "requires_repair_command_first": requires_repair_command_first,
+        "side_effect": "none_until_retry",
+        **writer_fields,
+    }
+
+
 WRITE_TYPE_FILE_KEYS = {
     "current-state": "rolling_summary",
     "stable-context": "context_brief",
@@ -1106,6 +1220,36 @@ def _write_invalid_input_payload(
             "recovery_command": recovery_command,
         },
     )
+
+
+def _write_argument_failure_details(
+    args: argparse.Namespace,
+    *,
+    write_type: str | None = None,
+    file_key: str | None = None,
+    input_mode: str | None = None,
+    prepared_input_builder: str | None = None,
+    reason_code: str = "write_argument_invalid",
+    extra: dict | None = None,
+) -> dict:
+    details = {
+        "command": "write",
+        "operation": "managed_file_commit",
+        "reason_code": reason_code,
+        "side_effect": "none",
+        **(extra or {}),
+    }
+    routing_write_type = write_type if write_type in WRITE_TYPE_FILE_KEYS else args.write_type
+    if routing_write_type in WRITE_TYPE_FILE_KEYS:
+        details["write_type"] = routing_write_type
+        details["file_key"] = WRITE_TYPE_FILE_KEYS[routing_write_type]
+    elif file_key is not None:
+        details["file_key"] = file_key
+    if input_mode in {"file", "json-file", "json-stdin", "json-string", "stdin"}:
+        details["input_mode"] = input_mode
+    if prepared_input_builder == "rolling_summary_json":
+        details["prepared_input_builder"] = prepared_input_builder
+    return details
 
 
 def _exit_write_invalid_input(
@@ -1145,10 +1289,14 @@ def _validate_write_args(parser, args: argparse.Namespace, *, support: dict) -> 
                 "recallloom.py write <project> --type current-state "
                 "--source-file <prepared-file> --json"
             ),
-            details={
-                "accepted_write_types": sorted(WRITE_TYPE_FILE_KEYS),
-                "phase_1_infers_target": False,
-            },
+            details=_write_argument_failure_details(
+                args,
+                reason_code="missing_write_type",
+                extra={
+                    "accepted_write_types": sorted(WRITE_TYPE_FILE_KEYS),
+                    "phase_1_infers_target": False,
+                },
+            ),
         )
     file_key = WRITE_TYPE_FILE_KEYS.get(args.write_type)
     if file_key is None:
@@ -1164,11 +1312,15 @@ def _validate_write_args(parser, args: argparse.Namespace, *, support: dict) -> 
                 "recallloom.py write <project> --type current-state "
                 "--source-file <prepared-file> --json"
             ),
-            details={
-                "accepted_write_types": sorted(WRITE_TYPE_FILE_KEYS),
-                "received_write_type": args.write_type,
-                "phase_1_infers_target": False,
-            },
+            details=_write_argument_failure_details(
+                args,
+                reason_code="unsupported_write_type",
+                extra={
+                    "accepted_write_types": sorted(WRITE_TYPE_FILE_KEYS),
+                    "received_write_type": args.write_type,
+                    "phase_1_infers_target": False,
+                },
+            ),
         )
     input_mode = _write_input_mode(args)
     if input_mode is None:
@@ -1185,11 +1337,20 @@ def _validate_write_args(parser, args: argparse.Namespace, *, support: dict) -> 
                 f"recallloom.py write <project> --type {args.write_type} "
                 "--source-file <prepared-file> --json"
             ),
-            details={
-                "input_contract": "source-file_xor_stdin",
-                "source_file_present": args.source_file is not None,
-                "stdin_present": bool(args.stdin),
-            },
+            details=_write_argument_failure_details(
+                args,
+                file_key=file_key,
+                reason_code=(
+                    "both_input_sources"
+                    if args.source_file is not None and args.stdin
+                    else "missing_input_source"
+                ),
+                extra={
+                    "input_contract": "source-file_xor_stdin",
+                    "source_file_present": args.source_file is not None,
+                    "stdin_present": bool(args.stdin),
+                },
+            ),
         )
     if args.input_format == "json" and file_key != "rolling_summary":
         _exit_write_invalid_input(
@@ -1201,11 +1362,18 @@ def _validate_write_args(parser, args: argparse.Namespace, *, support: dict) -> 
                 "recallloom.py write <project> --type current-state "
                 "--stdin --input-format json --json"
             ),
-            details={
-                "input_format": "json",
-                "received_write_type": args.write_type,
-                "accepted_write_type": "current-state",
-            },
+            details=_write_argument_failure_details(
+                args,
+                write_type="current-state",
+                input_mode=f"json-{input_mode}",
+                prepared_input_builder="rolling_summary_json",
+                reason_code="json_input_requires_current_state",
+                extra={
+                    "input_format": "json",
+                    "received_write_type": args.write_type,
+                    "accepted_write_type": "current-state",
+                },
+            ),
         )
     return file_key, input_mode
 
@@ -1543,6 +1711,8 @@ def _enforce_append_preflight_gate(
                 "Review the readiness output and rerun with --confirm-review-imported-baseline "
                 "to confirm this mutating append."
             )
+            input_mode = _append_dispatcher_input_mode(args)
+            input_format = args.input_format or "auto"
             payload = cli_failure_payload(
                 "review_imported_baseline_confirmation_required",
                 error=message,
@@ -1550,30 +1720,18 @@ def _enforce_append_preflight_gate(
                     **_preflight_gate_details(preflight_payload),
                     "reason_code": "review_imported_baseline_confirmation_required",
                     "command": "append",
+                    "operation": "daily_log_append",
+                    **({"input_mode": input_mode} if input_mode is not None else {}),
+                    "input_format": input_format,
                     "side_effect": "none",
                     "required_flag": "--confirm-review-imported-baseline",
                 },
                 extra={
-                    "retry_payload": {
-                        "command": "recallloom.py append",
-                        "project_ref": "same_project",
-                        "input_ref": (
-                            "same_prepared_entry_file"
-                            if args.entry_file is not None
-                            else "resubmit_same_stdin_payload"
-                            if args.stdin
-                            else "same_entry_json_payload"
-                        ),
-                        "argv_template": [
-                            "recallloom.py",
-                            "append",
-                            "same_project",
-                            "--confirm-review-imported-baseline",
-                            "--json",
-                        ],
-                        "requires_repair_command_first": False,
-                        "side_effect": "none_until_retry",
-                    },
+                    "retry_payload": _append_retry_payload(
+                        args,
+                        extra_args=["--confirm-review-imported-baseline"],
+                        requires_repair_command_first=False,
+                    ),
                 },
             )
             _exit_with_support(
@@ -2075,6 +2233,8 @@ def _post_append_sync_failure_payload(
             "contract is allowed for a single append delta."
         ),
         "next_actions": ["rerun_preflight", "review_post_append_summary_sync_contract"],
+        "single_next_command": "recallloom.py status <project-path> --json",
+        "safe_to_retry": False,
         "append_cursor": append_cursor if isinstance(append_cursor, dict) else None,
         "provenance_guard": provenance_guard if isinstance(provenance_guard, dict) else {},
         "ordinary_write_gate_preserved": (
@@ -2127,10 +2287,15 @@ def _post_append_sync_invalid_input_payload(
     input_args = ["--stdin", "--input-format", "json"]
     if args.max_input_bytes is not None:
         input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    reason_code = "source_file_not_supported" if source_file_present else "stdin_required"
     return cli_failure_payload(
         "invalid_prepared_input",
         error=message,
         details={
+            "command": POST_APPEND_SYNC_COMMAND,
+            "operation": "post_append_summary_sync",
+            "reason_code": reason_code,
+            "side_effect": "none",
             "input_contract": "stdin_only_json",
             "source_file_present": source_file_present,
             "stdin_present": stdin_present,
@@ -2209,7 +2374,10 @@ def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support
                 error=message,
                 details={
                     "field": "writer_id",
+                    "command": POST_APPEND_SYNC_COMMAND,
+                    "operation": "post_append_summary_sync",
                     "reason_code": "unsafe_explicit_writer_id",
+                    "side_effect": "none",
                     "writer_id_source": "explicit_cli",
                     "writer_id_public_safe": False,
                 },
@@ -2282,8 +2450,11 @@ def _post_append_sync_contract_reason(contract: object) -> str | None:
         return "missing_ordinary_write_gate"
     if ordinary_write_gate.get("contract_does_not_authorize_recallloom_write") is not True:
         return "ordinary_write_gate_authorization_mismatch"
-    if ordinary_write_gate.get("allowed_operation_level") != "read_current_state":
+    allowed_gate_levels = {"read_current_state", "write_current_state_after_preflight"}
+    if ordinary_write_gate.get("allowed_operation_level") not in allowed_gate_levels:
         return "ordinary_write_gate_level_mismatch"
+    # The ordinary write route is still preserved by summary_stale=true;
+    # post-append sync is the narrower single-append reconciliation path.
     if ordinary_write_gate.get("summary_stale") is not True:
         return "ordinary_write_gate_stale_state_mismatch"
     provenance_guard = contract.get("provenance_guard")
@@ -2421,8 +2592,16 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
         )
 
     assert contract is not None
-    if (
+    provenance_guard = contract.get("provenance_guard")
+    review_imported_baseline_sync_confirmation_required = (
         preflight_payload.get("provenance_state") == "review_imported_baseline"
+        or (
+            isinstance(provenance_guard, dict)
+            and provenance_guard.get("review_imported_baseline_plus_append_delta") is True
+        )
+    )
+    if (
+        review_imported_baseline_sync_confirmation_required
         and not args.confirm_review_imported_baseline
     ):
         message = (
@@ -2481,6 +2660,94 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
         print(f"Synced rolling_summary after append to {result.get('target_path', '.recallloom/rolling_summary.md')}")
 
 
+def _repair_daily_log_cursor_args(args: argparse.Namespace) -> list[str]:
+    helper_args = [args.target]
+    if args.apply:
+        helper_args.append("--apply")
+    if args.yes:
+        helper_args.append("--yes")
+    if args.expected_workspace_revision is not None:
+        helper_args.extend(
+            ["--expected-workspace-revision", str(args.expected_workspace_revision)]
+        )
+    return helper_args
+
+
+def _handle_repair_daily_log_cursor(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+) -> None:
+    helper_args = _repair_daily_log_cursor_args(args)
+    if args.json:
+        payload = _run_helper_json(
+            parser,
+            helper_name="repair_daily_log_cursor.py",
+            helper_args=helper_args,
+            json_mode_on_failure=True,
+            support=support,
+            package_support_on_failure=True,
+        )
+        payload["schema_version"] = payload.get("schema_version", "1.1")
+        payload["command"] = "repair-daily-log-cursor"
+        payload["package_support"] = public_package_support_payload(support)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    _run_helper_passthrough(
+        helper_name="repair_daily_log_cursor.py",
+        helper_args=helper_args,
+    )
+
+
+def _exit_repair_argument_error(
+    parser,
+    args: argparse.Namespace,
+    *,
+    message: str,
+    reason_code: str,
+) -> None:
+    exit_with_cli_error(
+        parser,
+        json_mode=args.json,
+        exit_code=2,
+        message=message,
+        payload=cli_failure_payload(
+            "invalid_prepared_input",
+            error=message,
+            details={
+                "side_effect": "none",
+                "command": "repair-daily-log-cursor",
+                "operation": "repair_daily_log_cursor",
+                "reason_code": reason_code,
+            },
+        ),
+    )
+
+
+def _validate_repair_dispatcher_args(
+    parser,
+    args: argparse.Namespace,
+) -> None:
+    if args.command != "repair-daily-log-cursor":
+        return
+    if args.yes and not args.apply:
+        _exit_repair_argument_error(
+            parser,
+            args,
+            message="--yes is only valid with --apply.",
+            reason_code="yes_without_apply",
+        )
+    if args.apply and not args.yes:
+        _exit_repair_argument_error(
+            parser,
+            args,
+            message="--apply requires --yes before repair can write state.json.",
+            reason_code="apply_requires_yes",
+        )
+
+
 def _resume_ready(payload: dict) -> bool:
     if payload.get("continuity_confidence") == "broken":
         return False
@@ -2500,12 +2767,11 @@ def _resume_payload(payload: dict) -> dict:
     return result
 
 
-def _dispatcher_action_level(command: str) -> str:
-    if command == "quick-summary":
-        return "diagnostic"
-    if command in {"append", "write", POST_APPEND_SYNC_COMMAND}:
-        return "mutating"
-    return action_level_for_dispatcher(command)
+def _dispatcher_action_level(args: argparse.Namespace) -> str:
+    return action_level_for_dispatcher(
+        args.command,
+        apply=bool(getattr(args, "apply", False)),
+    )
 
 
 def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) -> None:
@@ -2584,15 +2850,33 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
                 ),
                 support=support,
             )
-        payload = build_quick_summary_payload(
-            project_root=workspace.project_root,
-            storage_root=workspace.storage_root,
-            summary_path=summary_path,
-            summary_text=summary_text,
-            summary_revision=summary_state.revision,
-            summary_base_workspace_revision=summary_state.base_workspace_revision,
-            state=state,
-        )
+        try:
+            payload = build_quick_summary_payload(
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+                summary_path=summary_path,
+                summary_text=summary_text,
+                summary_revision=summary_state.revision,
+                summary_base_workspace_revision=summary_state.base_workspace_revision,
+                state=state,
+            )
+        except DailyLogCursorError as exc:
+            _exit_with_support(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=str(exc),
+                payload=cli_failure_payload(
+                    "malformed_managed_file",
+                    error=str(exc),
+                    details={
+                        **exc.details,
+                        "project_root": str(workspace.project_root),
+                    },
+                    extra={"continuity_confidence": "broken"},
+                ),
+                support=support,
+            )
         if startup_residue_report is not None:
             payload["startup_residue_report"] = startup_residue_report
 
@@ -2900,15 +3184,33 @@ def _build_progressive_resume_payload(
             support=support,
         )
 
-    quick_payload = build_quick_summary_payload(
-        project_root=workspace.project_root,
-        storage_root=workspace.storage_root,
-        summary_path=summary_path,
-        summary_text=summary_text,
-        summary_revision=summary_state.revision,
-        summary_base_workspace_revision=summary_state.base_workspace_revision,
-        state=state,
-    )
+    try:
+        quick_payload = build_quick_summary_payload(
+            project_root=workspace.project_root,
+            storage_root=workspace.storage_root,
+            summary_path=summary_path,
+            summary_text=summary_text,
+            summary_revision=summary_state.revision,
+            summary_base_workspace_revision=summary_state.base_workspace_revision,
+            state=state,
+        )
+    except DailyLogCursorError as exc:
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=str(exc),
+            payload=cli_failure_payload(
+                "malformed_managed_file",
+                error=str(exc),
+                details={
+                    **exc.details,
+                    "project_root": str(workspace.project_root),
+                },
+                extra={"continuity_confidence": "broken"},
+            ),
+            support=support,
+        )
     continuity_state = _resume_continuity_state(quick_payload)
     continuity_confidence = quick_payload["summary"]["confidence"]
     provenance_facts = provenance_facts_from_state(state, review_intent=False)
@@ -3306,11 +3608,12 @@ def main() -> None:
             message=str(exc),
             payload=_contract_payload("python_runtime_unavailable"),
         )
+    _validate_repair_dispatcher_args(parser, args)
     support = enforce_package_support_gate(
         parser,
         json_mode=getattr(args, "json", False),
         action_name=f"recallloom.py {args.command}",
-        action_level=_dispatcher_action_level(args.command),
+        action_level=_dispatcher_action_level(args),
     )
 
     if args.command == "init":
@@ -3401,6 +3704,10 @@ def main() -> None:
 
     if args.command == POST_APPEND_SYNC_COMMAND:
         _handle_post_append_summary_sync(parser, args, support=support)
+        return
+
+    if args.command == "repair-daily-log-cursor":
+        _handle_repair_daily_log_cursor(parser, args, support=support)
         return
 
     if args.command == "bridge":

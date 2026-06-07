@@ -16,6 +16,8 @@ from core.continuity.freshness import (
 from core.output.privacy import public_project_root_label, redact_public_text
 from core.protocol.sections import extract_section_text
 
+from _common import validate_state_entry_bearing_latest_daily_log
+
 
 PROJECT_VERSION_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_-]*)\s+v?\d+\.\d+(?:\.\d+)?\b")
 BACKTICK_PATH_RE = re.compile(r"`([^`]+)`")
@@ -155,8 +157,11 @@ def build_quick_summary_payload(
     summary_base_workspace_revision: int,
     state: dict,
 ) -> dict:
-    daily_logs_state = state.get("daily_logs")
-    latest_daily_log_exists = isinstance(daily_logs_state, dict) and daily_logs_state.get("latest_file") is not None
+    latest_daily_log_cursor = validate_state_entry_bearing_latest_daily_log(
+        storage_root=storage_root,
+        state=state,
+    )
+    latest_daily_log_exists = latest_daily_log_cursor is not None
     continuity_state, continuity_seeded = continuity_state_for_workspace(
         state=state,
         summary_text=summary_text,
@@ -170,6 +175,7 @@ def build_quick_summary_payload(
         summary_base_workspace_revision=summary_base_workspace_revision,
         latest_daily_log_exists=latest_daily_log_exists,
         scan_mode="quick",
+        state=state,
     )
     freshness_risk = freshness_risk_summary(
         workspace_artifact_scan_mode=freshness["workspace_artifact_scan_mode"],

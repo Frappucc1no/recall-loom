@@ -306,29 +306,43 @@ def load_workspace_state(path: Path) -> dict:
             f"state.json daily_logs.latest_entry_id must be null or a non-empty string: {path}"
         )
     latest_entry_seq = daily_logs.get("latest_entry_seq")
-    if not isinstance(latest_entry_seq, int) or latest_entry_seq < 0:
+    if latest_entry_seq is not None and (
+        not isinstance(latest_entry_seq, int) or latest_entry_seq < 0
+    ):
         raise ConfigContractError(
-            f"state.json daily_logs.latest_entry_seq must be a non-negative integer: {path}"
+            f"state.json daily_logs.latest_entry_seq must be null or a non-negative integer: {path}"
         )
     entry_count = daily_logs.get("entry_count")
     if not isinstance(entry_count, int) or entry_count < 0:
         raise ConfigContractError(
             f"state.json daily_logs.entry_count must be a non-negative integer: {path}"
         )
-    if entry_count < latest_entry_seq:
+    latest_entry_seq_value = 0 if latest_entry_seq is None else latest_entry_seq
+    if entry_count < latest_entry_seq_value:
         raise ConfigContractError(
             f"state.json daily_logs.entry_count cannot be smaller than latest_entry_seq: {path}"
         )
     if latest_file is None:
-        if latest_entry_id is not None or latest_entry_seq != 0 or entry_count != 0:
+        if latest_entry_id is not None or latest_entry_seq not in {0, None} or entry_count != 0:
             raise ConfigContractError(
                 "state.json daily_logs must use the null/zero cursor shape when no active daily log exists: "
                 f"{path}"
             )
     else:
-        if latest_entry_id is None or latest_entry_seq < 1 or entry_count < 1:
+        empty_scaffold_cursor = (
+            latest_entry_id is None
+            and latest_entry_seq in {0, None}
+            and entry_count == 0
+        )
+        populated_cursor = (
+            latest_entry_id is not None
+            and isinstance(latest_entry_seq, int)
+            and latest_entry_seq >= 1
+            and entry_count >= 1
+        )
+        if not empty_scaffold_cursor and not populated_cursor:
             raise ConfigContractError(
-                "state.json daily_logs must record a non-null latest_entry_id and positive entry counters "
+                "state.json daily_logs must record either an empty-scaffold cursor or a populated cursor "
                 f"when latest_file is set: {path}"
             )
     if "updated_at" in daily_logs:

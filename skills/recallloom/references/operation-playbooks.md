@@ -12,6 +12,7 @@
 - End-of-Day Update
 - Compression
 - Archive
+- Daily-log Cursor Repair
 - External-Writer Reconciliation
 
 ## Project-Local Overrides
@@ -83,10 +84,18 @@ RecallLoom Core stays non-invasive by default.
   editing.
 - Do not present remote services, host memory, plugins, MCP, hooks, or wrappers
   as authority for local helper evidence.
-- In v0.4.2, receipt-backed mutation covers dispatcher-issued managed-file
-  writes, current latest-cursor daily-log appends, and post-append summary sync.
+- In the current package line, receipt-backed mutation covers
+  dispatcher-issued managed-file writes, current latest-cursor daily-log
+  appends, and post-append summary sync.
   Archive apply and bridge apply stay preview-only until they have their own
   receipt-backed contracts.
+- Daily-log cursor repair is a non-receipt-backed structural repair. It must not
+  write `derived/helper-receipts.json`, add a receipt operation, finalize a
+  mutating receipt, or claim historical daily-log origin. If the previous state
+  was `helper_evidenced`, preserve that label only when current bounded evidence
+  independently supports it; otherwise downgrade to structural/non-receipt-backed
+  provenance. Preserve `review_imported_baseline` as reviewed import, not helper
+  evidence.
 
 ## Cold Start
 
@@ -309,6 +318,31 @@ Recommended behavior:
 - require explicit confirmation before moving files
 - refuse the whole operation if archive-target collisions are detected
 - if `update_protocol.md` exists, surface it for review before archiving
+
+## Daily-log Cursor Repair
+
+Use `repair-daily-log-cursor` only when validation or helper output shows that
+`state.json.daily_logs` no longer matches the latest active daily log.
+
+Operator flow:
+
+1. run `recallloom.py repair-daily-log-cursor <project-path> --json`
+2. review `current_cursor`, `expected_cursor`, `repair_eligible`, and
+   `next_action`
+3. if repair is intentional, rerun with `--apply --yes` and the fresh
+   `--expected-workspace-revision`
+4. rerun status, validation, or the blocked write path that originally surfaced
+   the cursor mismatch
+
+Repair rules:
+
+- preview is read-only; apply is mutating and must pass the support gate
+- apply updates cursor state from parser evidence instead of editing daily-log
+  content
+- the repair does not create helper receipts or claim historical helper origin
+- if a failure payload includes `safe_to_retry: false` or a non-`none`
+  `trust_effect`, follow `single_next_command` or validation guidance before
+  retrying a write
 
 ## External-Writer Reconciliation
 

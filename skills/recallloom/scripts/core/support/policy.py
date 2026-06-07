@@ -36,14 +36,20 @@ SCRIPT_ACTION_LEVELS = {
     "record_recovery_review.py": "mutating",
     "remove_context.py": "mutating",
     "install_native_commands.py": "mutating",
+    "repair_daily_log_cursor.py": "readonly",
 }
 
 DISPATCHER_ACTION_LEVELS = {
     "validate": "diagnostic",
     "status": "diagnostic",
     "resume": "readonly",
+    "quick-summary": "diagnostic",
     "init": "mutating",
     "bridge": "mutating",
+    "append": "mutating",
+    "write": "mutating",
+    "sync-current-state-after-append": "mutating",
+    "repair-daily-log-cursor": "readonly",
 }
 
 SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)*$")
@@ -123,7 +129,16 @@ def action_level_for_script(script_name: str) -> str:
     return SCRIPT_ACTION_LEVELS.get(script_name, "readonly")
 
 
-def action_level_for_dispatcher(command: str) -> str:
+def _normalize_dispatcher_command(command: str) -> str:
+    if command.startswith("recallloom.py "):
+        return command.split(None, 1)[1]
+    return command
+
+
+def action_level_for_dispatcher(command: str, *, apply: bool = False) -> str:
+    command = _normalize_dispatcher_command(command)
+    if command == "repair-daily-log-cursor":
+        return "mutating" if apply else "readonly"
     return DISPATCHER_ACTION_LEVELS.get(command, "readonly")
 
 

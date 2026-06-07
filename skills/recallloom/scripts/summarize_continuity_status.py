@@ -139,6 +139,7 @@ from core.protocol.sections import extract_section_text
 
 from _common import (
     ConfigContractError,
+    DailyLogCursorError,
     cli_failure_payload,
     cli_failure_payload_for_exception,
     detect_update_protocol_time_policy_cues,
@@ -154,6 +155,7 @@ from _common import (
     public_project_root_label,
     read_text,
     StorageResolutionError,
+    validate_state_entry_bearing_latest_daily_log,
 )
 
 
@@ -621,7 +623,30 @@ def main() -> None:
                     ),
                 )
 
-        latest_daily_log = _state_latest_daily_log_path(state, workspace.storage_root)
+        try:
+            latest_daily_log_cursor = validate_state_entry_bearing_latest_daily_log(
+                storage_root=workspace.storage_root,
+                state=state,
+            )
+        except DailyLogCursorError as exc:
+            exit_with_cli_error(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=str(exc),
+                payload=cli_failure_payload(
+                    "malformed_managed_file",
+                    error=str(exc),
+                    details={
+                        **exc.details,
+                        "project_root": str(workspace.project_root),
+                    },
+                    extra={"continuity_confidence": "broken"},
+                ),
+            )
+        latest_daily_log = (
+            latest_daily_log_cursor.latest_path if latest_daily_log_cursor is not None else None
+        )
         latest_daily_log_entry = None
         latest_daily_log_text = ""
         if args.expanded and latest_daily_log is not None:
@@ -654,6 +679,7 @@ def main() -> None:
             summary_base_workspace_revision=summary_state.base_workspace_revision,
             latest_daily_log_exists=latest_daily_log is not None,
             scan_mode="quick",
+            state=state,
         )
         digests = continuity_digest_bundle(
             summary_text=summary_text,

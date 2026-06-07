@@ -1,6 +1,6 @@
 # RecallLoom Entry Index
 
-This file is the full repository map for RecallLoom v0.4.3.
+This file is the full repository map for RecallLoom v0.4.4.
 Start with the short README front doors:
 
 - [README.md](./README.md)
@@ -47,6 +47,7 @@ The dispatcher surface also includes:
 - `append`
 - `write`
 - `sync-current-state-after-append`
+- `repair-daily-log-cursor`
 - `bridge`
 
 Natural-language project prompts stay the primary public path. Wrapper aliases
@@ -122,6 +123,7 @@ authority layer.
 
 ### Release notes
 
+- `docs/releases/v0.4.4.md`
 - `docs/releases/v0.4.3.md`
 - `docs/releases/v0.4.2.md`
 - `docs/releases/v0.4.1.md`

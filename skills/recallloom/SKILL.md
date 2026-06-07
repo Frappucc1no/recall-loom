@@ -40,7 +40,7 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.3`
+- package version: `0.4.4`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -93,6 +93,7 @@ RecallLoom package support is separate from project sidecar protocol compatibili
 
 - Managed sidecar writes MUST use helper scripts. Do not bypass them with blind file replacement, blind patching, or hand-built sidecar files.
 - Daily-log writes MUST use `append_daily_log_entry.py` or dispatcher `append`. Do not handwrite `daily-log-entry` markers.
+- Daily-log cursor repair MUST use `repair_daily_log_cursor.py` or dispatcher `repair-daily-log-cursor`. Do not hand-edit `state.json.daily_logs`.
 - Overwrite-style managed files MUST use revision-aware helper commits. Do not handwrite `file-state` markers.
 - `STORAGE_ROOT/state.json` and `STORAGE_ROOT/config.json` MUST NOT be hand-edited during normal operation.
 - Protocol `1.0` daily-log counters are file-local: `entry-seq` is `1..N` within one daily log and canonical `entry-id` is `entry-{entry_seq}`. Do not treat either as globally unique.
@@ -148,8 +149,9 @@ The others are operator-facing stable action names that can be interpreted by th
 `rl-bridge` remains the canonical dispatcher/helper action label for bridge work, but this package line does not promise a universal native wrapper or deterministic first-hop routing for that label.
 Natural language remains the default public phrasing for these actions.
 
-The dispatcher command surface also includes `quick-summary`, `append`, `write`, and `sync-current-state-after-append`.
+The dispatcher command surface also includes `quick-summary`, `append`, `write`, `sync-current-state-after-append`, and `repair-daily-log-cursor`.
 Use `quick-summary` for current-state snapshots, `append --entry-json` for milestone logging, `write --type ... --source-file <prepared-file> --dry-run` or `write --type ... --stdin --dry-run` before typed managed-file writes, and `sync-current-state-after-append --stdin --input-format json` only after preflight allows `post_append_summary_sync`.
+Use `repair-daily-log-cursor` in preview mode first when `state.json.daily_logs` no longer matches the parsed latest active daily log. Apply mode requires `--apply --yes`, should include `--expected-workspace-revision` after a fresh preview/status check, is support-gated as mutating, and repairs cursor fields without writing helper receipts or rewriting daily-log content.
 These dispatcher additions are optional for existing `v0.3.4` projects and do not change sidecar protocol `1.0`.
 
 Native wrappers for `rl-init`, `rl-resume`, `rl-status`, and `rl-validate`

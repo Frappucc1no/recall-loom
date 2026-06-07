@@ -21,6 +21,7 @@ from core.trust.state import evaluate_trust_state
 from _common import (
     ConfigContractError,
     DAILY_LOGS_DIRNAME,
+    DailyLogCursorError,
     cli_failure_payload,
     cli_failure_payload_for_exception,
     enforce_package_support_gate,
@@ -43,6 +44,7 @@ from _common import (
     section_keys_in_text,
     sorted_daily_log_files,
     StorageResolutionError,
+    validate_state_entry_bearing_latest_daily_log,
 )
 
 
@@ -1754,7 +1756,29 @@ def main() -> None:
                         error=f"Missing required file-state metadata marker: {context_brief_path}",
                     ),
                 )
-        latest_daily_log = _state_latest_daily_log_path(state, workspace.storage_root)
+        try:
+            latest_daily_log_cursor = validate_state_entry_bearing_latest_daily_log(
+                storage_root=workspace.storage_root,
+                state=state,
+            )
+        except DailyLogCursorError as exc:
+            exit_with_cli_error(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=str(exc),
+                payload=cli_failure_payload(
+                    "malformed_managed_file",
+                    error=str(exc),
+                    details={
+                        **exc.details,
+                        "project_root": str(workspace.project_root),
+                    },
+                ),
+            )
+        latest_daily_log = (
+            latest_daily_log_cursor.latest_path if latest_daily_log_cursor is not None else None
+        )
         scan_mode = "full" if args.full else "quick"
         freshness = evaluate_continuity_freshness(
             project_root=workspace.project_root,
@@ -1764,6 +1788,7 @@ def main() -> None:
             summary_base_workspace_revision=summary_state.base_workspace_revision,
             latest_daily_log_exists=latest_daily_log is not None,
             scan_mode=scan_mode,
+            state=state,
         )
         continuity_state, continuity_seeded = continuity_state_for_workspace(
             state=state,

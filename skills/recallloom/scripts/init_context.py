@@ -810,6 +810,16 @@ def main() -> None:
                 tool_name=tool_name,
                 timestamp=timestamp,
                 git_exclude_mode=git_exclude_mode,
+                daily_log_cursor=(
+                    {
+                        "latest_file": f"{DAILY_LOGS_DIRNAME}/{args.date}.md",
+                        "latest_entry_id": None,
+                        "latest_entry_seq": None,
+                        "entry_count": 0,
+                    }
+                    if args.create_daily_log
+                    else None
+                ),
             )
             try:
                 state_payload, state_reconciled = bridge_state_snapshot(

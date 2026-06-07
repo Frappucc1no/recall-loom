@@ -15,8 +15,8 @@ from _common import (
     cli_failure_payload_for_exception,
     ConfigContractError,
     DAILY_LOGS_DIRNAME,
-    daily_log_entries,
-    daily_log_sequence_error,
+    daily_log_cursor_from_text,
+    DailyLogCursorError,
     EnvironmentContractError,
     enforce_package_support_gate,
     exit_with_cli_error,
@@ -183,7 +183,13 @@ def main() -> None:
                         payload=cli_failure_payload(
                             "invalid_date",
                             error=message,
-                            details={"before": args.before},
+                            details={
+                                "command": "archive",
+                                "operation": "daily_log_archive",
+                                "reason_code": "archive_before_date_invalid",
+                                "before": args.before,
+                                "side_effect": "none",
+                            },
                         ),
                     )
                 for path in candidates:
@@ -200,7 +206,13 @@ def main() -> None:
                     payload=cli_failure_payload(
                         "invalid_prepared_input",
                         error=message,
-                        details={"max_active": effective_max_active},
+                        details={
+                            "command": "archive",
+                            "operation": "daily_log_archive",
+                            "reason_code": "archive_max_active_invalid",
+                            "max_active": effective_max_active,
+                            "side_effect": "none",
+                        },
                     ),
                 )
 
@@ -237,13 +249,20 @@ def main() -> None:
             latest_entry_seq = 0
             entry_count = 0
             if latest_remaining is not None:
+                latest_file = latest_remaining.relative_to(
+                    workspace.storage_root
+                ).as_posix()
                 latest_text = latest_remaining.read_text(encoding="utf-8")
-                latest_entries = daily_log_entries(latest_text)
-                sequence_error = daily_log_sequence_error(latest_entries)
-                if sequence_error is not None:
+                try:
+                    latest_cursor = daily_log_cursor_from_text(
+                        latest_text,
+                        path=latest_remaining,
+                        latest_file=latest_file,
+                    )
+                except DailyLogCursorError as exc:
                     message = (
                         "Refusing to archive because the newest remaining daily log is damaged: "
-                        f"{latest_remaining}. {sequence_error}"
+                        f"{latest_remaining}. {exc}"
                     )
                     exit_with_cli_error(
                         parser,
@@ -253,13 +272,12 @@ def main() -> None:
                         payload=cli_failure_payload(
                             "malformed_managed_file",
                             error=message,
-                            details={"path": str(latest_remaining), "sequence_error": sequence_error},
+                            details=exc.details,
                         ),
                     )
-                latest_entry = latest_entries[-1]
-                latest_entry_id = latest_entry.entry_id
-                latest_entry_seq = latest_entry.entry_seq
-                entry_count = len(latest_entries)
+                latest_entry_id = latest_cursor.latest_entry_id
+                latest_entry_seq = latest_cursor.latest_entry_seq
+                entry_count = latest_cursor.entry_count
 
             previous_daily_state = state.get("daily_logs", {})
             next_latest_file = (

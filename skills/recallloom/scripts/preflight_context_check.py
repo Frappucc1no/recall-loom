@@ -44,11 +44,15 @@ from _common import (
     exit_with_cli_error,
     find_recallloom_root,
     invalid_iso_like_daily_log_files,
+    DailyLogCursorError,
     latest_active_daily_log,
+    latest_active_daily_log_cursor,
     load_workspace_state,
+    validate_state_entry_bearing_latest_daily_log,
     detect_update_protocol_time_policy_cues,
     extract_section_text,
     parse_daily_log_entry_line,
+    parse_daily_log_scaffold_marker,
     parse_iso_date,
     public_project_path,
     public_project_root_label,
@@ -85,18 +89,18 @@ def is_effectively_empty_summary_next_step(text: str) -> bool:
     return shared_is_effectively_empty_summary_next_step(text)
 
 
-def latest_daily_log_marker_summary(path: Path | None) -> tuple[object | None, int]:
+def latest_daily_log_marker_summary(path: Path | None) -> tuple[object | None, int, bool]:
     if path is None:
-        return None, 0
+        return None, 0, False
+    text = read_text(path)
     latest_entry = None
     entry_count = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            entry = parse_daily_log_entry_line(line)
-            if entry is not None:
-                latest_entry = entry
-                entry_count += 1
-    return latest_entry, entry_count
+    for line in text.splitlines():
+        entry = parse_daily_log_entry_line(line)
+        if entry is not None:
+            latest_entry = entry
+            entry_count += 1
+    return latest_entry, entry_count, parse_daily_log_scaffold_marker(text)
 
 
 def file_state_marker_from_path(path: Path):
@@ -232,9 +236,21 @@ def build_post_append_summary_sync_contract(
     )
     workspace_revision = state["workspace_revision"]
     summary_base_workspace_revision = summary_state.base_workspace_revision if summary_state else None
-    single_append_delta = (
+    single_revision_append_delta = (
         isinstance(summary_base_workspace_revision, int)
         and workspace_revision == summary_base_workspace_revision + 1
+    )
+    provenance = state.get("provenance")
+    review_imported_baseline_plus_append_delta = (
+        isinstance(summary_base_workspace_revision, int)
+        and workspace_revision == summary_base_workspace_revision + 2
+        and isinstance(provenance, dict)
+        and provenance.get("state_label") == "helper_evidenced"
+        and provenance.get("previous_state_label") == "review_imported_baseline"
+        and provenance.get("receipt_backed") is True
+    )
+    single_append_delta = (
+        single_revision_append_delta or review_imported_baseline_plus_append_delta
     )
     non_summary_writes_after_summary_base: list[str] = []
     files_state = state.get("files")
@@ -300,7 +316,13 @@ def build_post_append_summary_sync_contract(
         "provenance_guard": {
             "summary_base_workspace_revision": summary_base_workspace_revision,
             "workspace_revision": workspace_revision,
-            "expected_workspace_revision_delta": 1,
+            "expected_workspace_revision_delta": (
+                2 if review_imported_baseline_plus_append_delta else 1
+            ),
+            "single_revision_append_delta": single_revision_append_delta,
+            "review_imported_baseline_plus_append_delta": (
+                review_imported_baseline_plus_append_delta
+            ),
             "single_append_delta": single_append_delta,
             "cursor_matches_latest_log": cursor_matches_latest_log,
             "non_summary_writes_after_summary_base": non_summary_writes_after_summary_base,
@@ -408,8 +430,38 @@ def main() -> None:
                 ),
             )
 
-        latest_daily_log = latest_active_daily_log(logs_dir)
+        directory_latest_daily_log = latest_active_daily_log(logs_dir)
         state = load_workspace_state(state_path)
+        try:
+            state_latest_daily_log_cursor = validate_state_entry_bearing_latest_daily_log(
+                storage_root=workspace.storage_root,
+                state=state,
+            )
+        except DailyLogCursorError as exc:
+            exit_with_cli_error(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=str(exc),
+                payload=cli_failure_payload(
+                    "malformed_managed_file",
+                    error=str(exc),
+                    details={
+                        **exc.details,
+                        "project_root": str(workspace.project_root),
+                    },
+                ),
+            )
+        latest_daily_log = (
+            state_latest_daily_log_cursor.latest_path
+            if state_latest_daily_log_cursor is not None
+            else directory_latest_daily_log
+        )
+        daily_log_selection_rule = (
+            "state_entry_bearing_latest_daily_log"
+            if state_latest_daily_log_cursor is not None
+            else "latest_active_daily_log"
+        )
         summary_state = parse_file_state_marker(read_text(summary_path))
         if summary_state is None:
             exit_with_cli_error(
@@ -453,11 +505,32 @@ def main() -> None:
 
         latest_daily_log_entry = None
         latest_daily_log_entry_count = 0
+        latest_daily_log_has_entries = False
+        if directory_latest_daily_log is not None:
+            try:
+                latest_active_daily_log_cursor(workspace.storage_root)
+            except DailyLogCursorError as exc:
+                exit_with_cli_error(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=2,
+                    message=str(exc),
+                    payload=cli_failure_payload(
+                        "malformed_managed_file",
+                        error=str(exc),
+                        details={
+                            **exc.details,
+                            "project_root": str(workspace.project_root),
+                        },
+                    ),
+                )
         if latest_daily_log is not None:
-            latest_daily_log_entry, latest_daily_log_entry_count = latest_daily_log_marker_summary(
-                latest_daily_log
-            )
-            if latest_daily_log_entry is None:
+            (
+                latest_daily_log_entry,
+                latest_daily_log_entry_count,
+                latest_daily_log_is_scaffold,
+            ) = latest_daily_log_marker_summary(latest_daily_log)
+            if latest_daily_log_entry is None and not latest_daily_log_is_scaffold:
                 exit_with_cli_error(
                     parser,
                     json_mode=args.json,
@@ -474,6 +547,7 @@ def main() -> None:
                         ),
                     ),
                 )
+            latest_daily_log_has_entries = latest_daily_log_entry_count > 0
 
         workspace_artifact_scan_mode = "full" if args.full else "quick"
         summary_text = read_text(summary_path)
@@ -490,8 +564,9 @@ def main() -> None:
             summary_path=summary_path,
             workspace_revision=state["workspace_revision"],
             summary_base_workspace_revision=summary_state.base_workspace_revision,
-            latest_daily_log_exists=latest_daily_log is not None,
+            latest_daily_log_exists=latest_daily_log_has_entries,
             scan_mode=workspace_artifact_scan_mode,
+            state=state,
         )
         digests = continuity_digest_bundle(
             summary_text=summary_text,
@@ -501,7 +576,7 @@ def main() -> None:
         continuity_state, continuity_seeded = continuity_state_for_workspace(
             state=state,
             summary_text=summary_text,
-            latest_daily_log_exists=latest_daily_log is not None,
+            latest_daily_log_exists=latest_daily_log_has_entries,
         )
         if continuity_state == "initialized_empty_shell":
             digests = {
@@ -555,7 +630,7 @@ def main() -> None:
             continuity_state=continuity_state,
             update_protocol_exists=update_protocol_path.is_file(),
             context_brief_exists=context_brief_path.is_file(),
-            latest_daily_log_exists=latest_daily_log is not None,
+            latest_daily_log_exists=latest_daily_log_has_entries,
             workspace_is_newer=workspace_is_newer,
         )
         provenance_facts = provenance_facts_from_state(state, review_intent=True)
@@ -702,7 +777,8 @@ def main() -> None:
         "latest_daily_log": public_latest_daily_log,
         "latest_daily_log_entry_id": latest_daily_log_entry.entry_id if latest_daily_log_entry else None,
         "latest_daily_log_entry_seq": latest_daily_log_entry.entry_seq if latest_daily_log_entry else None,
-        "daily_log_selection_rule": "latest_active_daily_log",
+        "latest_daily_log_entry_count": latest_daily_log_entry_count,
+        "daily_log_selection_rule": daily_log_selection_rule,
         "workspace_artifact_scan_mode": workspace_artifact_scan_mode,
         "workspace_artifact_scan_performed": workspace_artifact_scan_performed,
         "latest_workspace_artifact": public_latest_workspace_artifact,
@@ -744,6 +820,7 @@ def main() -> None:
             "latest_active_daily_log_entry_seq_seen": (
                 latest_daily_log_entry.entry_seq if latest_daily_log_entry else None
             ),
+            "latest_active_daily_log_entry_count_seen": latest_daily_log_entry_count,
             "logical_workday_seen": logical_workday_seen,
             "continuity_confidence": continuity_confidence,
             "continuity_state": continuity_state,

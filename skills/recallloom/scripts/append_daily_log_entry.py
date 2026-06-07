@@ -56,9 +56,14 @@ from _common import (
     ConfigContractError,
     DAILY_LOG_ENTRY_RE,
     DAILY_LOGS_DIRNAME,
+    DailyLogCursorError,
     EnvironmentContractError,
     LockBusyError,
     StorageResolutionError,
+    daily_log_cursors_equivalent,
+    daily_log_cursor_from_text,
+    daily_log_cursor_is_legacy_empty,
+    daily_log_cursor_state_fields,
     dump_json,
     detect_update_protocol_time_policy_cues,
     enforce_package_support_gate,
@@ -68,6 +73,7 @@ from _common import (
     exit_with_failure_contract,
     find_recallloom_root,
     latest_active_daily_log,
+    latest_active_daily_log_cursor,
     load_workspace_state,
     normalize_wrapper_metadata_json,
     now_iso_timestamp,
@@ -795,6 +801,15 @@ def enforce_provenance_write_gate(
     )
 
 
+def preflight_cursor_is_no_log(cursor: dict[str, object]) -> bool:
+    return (
+        cursor.get("latest_file") is None
+        and cursor.get("latest_entry_id") is None
+        and cursor.get("latest_entry_seq") in {0, None}
+        and cursor.get("entry_count") in {0, None}
+    )
+
+
 def enforce_preflight_daily_log_cursor(
     parser,
     *,
@@ -856,14 +871,19 @@ def enforce_preflight_daily_log_cursor(
                 field_path="$.latest_file",
             )
         actual_latest_digest = sha256_text_digest(latest_text)
-        sequences = existing_entry_sequences(latest_text)
-        latest_seq = sequences[-1] if sequences else 0
-        actual_cursor = {
-            "latest_file": latest_file,
-            "latest_entry_id": f"entry-{latest_seq}" if latest_seq else None,
-            "latest_entry_seq": latest_seq,
-            "entry_count": len(sequences),
-        }
+        try:
+            actual_cursor = daily_log_cursor_state_fields(
+                latest_active_daily_log_cursor(workspace.storage_root).as_state_fields()
+            )
+        except DailyLogCursorError as exc:
+            preflight_binding_failure(
+                parser,
+                json_mode=json_mode,
+                message=str(exc),
+                reason_code=exc.reason_code,
+                field_path="$.daily_logs",
+                extra={"actual_latest_file": latest_file},
+            )
     elif daily_state.get("latest_file") is None:
         actual_cursor = {
             "latest_file": None,
@@ -871,6 +891,7 @@ def enforce_preflight_daily_log_cursor(
             "latest_entry_seq": 0,
             "entry_count": 0,
         }
+        state_cursor = dict(actual_cursor)
 
     binding_cursor = {
         "latest_file": preflight_binding.get("latest_file"),
@@ -878,18 +899,15 @@ def enforce_preflight_daily_log_cursor(
         "latest_entry_seq": preflight_binding.get("latest_entry_seq"),
         "entry_count": preflight_binding.get("entry_count"),
     }
+    if preflight_cursor_is_no_log(binding_cursor) and daily_log_cursor_is_legacy_empty(actual_cursor):
+        binding_cursor = dict(actual_cursor)
     binding_latest_digest = preflight_binding.get("latest_file_digest")
 
-    def normalize_cursor(cursor: dict) -> dict:
-        return {
-            key: (0 if value is None and key in {"latest_entry_seq", "entry_count"} else value)
-            for key, value in cursor.items()
-        }
-
-    normalized_binding = normalize_cursor(binding_cursor)
-    normalized_state = normalize_cursor(state_cursor)
-    normalized_actual = normalize_cursor(actual_cursor)
-    if normalized_binding != normalized_state:
+    if not daily_log_cursors_equivalent(
+        binding_cursor,
+        state_cursor,
+        actual_cursor=actual_cursor,
+    ):
         preflight_binding_failure(
             parser,
             json_mode=json_mode,
@@ -901,7 +919,11 @@ def enforce_preflight_daily_log_cursor(
                 "state_cursor": state_cursor,
             },
         )
-    if normalized_state != normalized_actual:
+    if not daily_log_cursors_equivalent(
+        state_cursor,
+        actual_cursor,
+        actual_cursor=actual_cursor,
+    ):
         preflight_binding_failure(
             parser,
             json_mode=json_mode,
@@ -993,6 +1015,21 @@ def load_entry_source(
 ) -> tuple[str, str, Path | None]:
     selected_sources = int(entry_json is not None) + int(entry_file is not None) + int(use_stdin)
     if selected_sources != 1:
+        input_mode = "ambiguous" if selected_sources > 1 else "missing"
+        details = {
+            "command": "append",
+            "operation": "daily_log_append",
+            "input_mode": input_mode,
+            "input_contract": "entry-json_xor_entry-file_xor_stdin",
+            "entry_json_present": entry_json is not None,
+            "entry_file_present": entry_file is not None,
+            "stdin_present": bool(use_stdin),
+            "side_effect": "none",
+            "trust_effect": "none",
+            "reason_code": (
+                "both_input_sources" if selected_sources > 1 else "missing_input_source"
+            ),
+        }
         if selected_sources > 1:
             exit_with_failure_contract(
                 parser,
@@ -1000,6 +1037,7 @@ def load_entry_source(
                 exit_code=2,
                 message="Use exactly one prepared-entry input: --entry-json, --entry-file, or --stdin.",
                 reason="invalid_prepared_input",
+                details=details,
             )
         exit_with_failure_contract(
             parser,
@@ -1007,6 +1045,7 @@ def load_entry_source(
             exit_code=2,
             message="Provide prepared entry content with exactly one of --entry-json, --entry-file, or --stdin.",
             reason="invalid_prepared_input",
+            details=details,
         )
 
     if entry_json is not None:
@@ -2097,36 +2136,25 @@ def main() -> None:
                         reason="malformed_managed_file",
                         details={"path": str(target_path)},
                     )
+                target_latest_file = target_path.relative_to(workspace.storage_root).as_posix()
+                try:
+                    target_cursor = daily_log_cursor_from_text(
+                        current_text,
+                        path=target_path,
+                        latest_file=target_latest_file,
+                    )
+                except DailyLogCursorError as exc:
+                    exit_with_failure_contract(
+                        parser,
+                        json_mode=args.json,
+                        exit_code=2,
+                        message=f"Refusing to append to damaged daily log {target_path}: {exc}",
+                        reason="malformed_managed_file",
+                        details=exc.details,
+                    )
+                next_seq = target_cursor.entry_count + 1
                 scaffold = parse_daily_log_scaffold_marker(current_text)
-                sequences = existing_entry_sequences(current_text)
-                if scaffold and sequences:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=f"Refusing to append to malformed scaffold daily log {target_path}: scaffold marker cannot coexist with entry markers.",
-                        reason="malformed_managed_file",
-                        details={"path": str(target_path)},
-                    )
-                expected_sequences = list(range(1, len(sequences) + 1))
-                if sequences != expected_sequences:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=(
-                            f"Refusing to append to damaged daily log {target_path}. "
-                            f"Expected contiguous entry_seq values {expected_sequences}, found {sequences}."
-                        ),
-                        reason="malformed_managed_file",
-                        details={
-                            "path": str(target_path),
-                            "expected_sequences": expected_sequences,
-                            "actual_sequences": sequences,
-                        },
-                    )
-                next_seq = len(sequences) + 1
-                if scaffold and not sequences:
+                if scaffold and target_cursor.entry_count == 0:
                     header = file_marker("daily_log", workspace.workspace_language)
                     updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
                 else:

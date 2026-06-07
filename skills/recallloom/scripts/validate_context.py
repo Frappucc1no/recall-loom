@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-import hashlib
 import json
 from pathlib import Path
 
@@ -23,8 +22,11 @@ from core.output.privacy import (
 )
 from core.provenance.store import (
     RECEIPT_STORE_RELATIVE_PATH,
-    ReceiptStoreError,
-    receipt_store_summary,
+)
+from core.provenance.evidence import (
+    bounded_current_helper_evidence_check,
+    current_receipt_required_file_keys as evidence_current_receipt_required_file_keys,
+    current_receipt_target_path as evidence_current_receipt_target_path,
 )
 from core.provenance.state import (
     build_provenance_report,
@@ -40,7 +42,6 @@ from core.protocol.contracts import (
     SUPPORTED_PROTOCOL_VERSIONS,
 )
 from core.protocol.markers import (
-    parse_daily_log_entry_marker,
     parse_daily_log_scaffold_marker,
     parse_file_marker,
     parse_file_state_marker,
@@ -66,6 +67,11 @@ from _common import (
     ensure_supported_python_version,
     find_recallloom_root,
     invalid_iso_like_daily_log_files,
+    DailyLogCursorError,
+    daily_log_cursor_from_text,
+    daily_log_cursor_is_empty_scaffold,
+    daily_log_cursor_is_legacy_empty,
+    latest_active_daily_log_cursor,
     load_workspace_state,
     is_optional_storage_file,
     is_required_storage_directory,
@@ -131,14 +137,6 @@ def validate_provenance_args(parser: argparse.ArgumentParser, args: argparse.Nam
 
 def add_finding(findings: list[ValidationFinding], level: str, code: str, message: str, path: Path) -> None:
     findings.append(ValidationFinding(level=level, code=code, message=message, path=path))
-
-
-def sha256_text_digest(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def is_json_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def validate_marker(path: Path, text: str, expected_file_key: str, workspace, findings: list[ValidationFinding]):
@@ -496,25 +494,22 @@ def validate_daily_logs(workspace, state: dict | None, findings: list[Validation
         text = read_text(log_path)
         marker = validate_marker(log_path, text, "daily_log", workspace, findings)
         validate_language_match(log_path, marker.language if marker else None, workspace.workspace_language, findings)
+        try:
+            daily_log_cursor_from_text(
+                text,
+                path=log_path,
+                latest_file=log_path.relative_to(workspace.storage_root).as_posix(),
+            )
+        except DailyLogCursorError as exc:
+            add_finding(
+                findings,
+                "error",
+                exc.reason_code,
+                str(exc),
+                log_path,
+            )
+            continue
         scaffold = parse_daily_log_scaffold_marker(text)
-        if scaffold and parse_daily_log_entry_marker(text) is not None:
-            add_finding(
-                findings,
-                "error",
-                "invalid_daily_log_scaffold",
-                "A scaffold daily log may not already contain daily-log entry metadata markers",
-                log_path,
-            )
-            continue
-        if not scaffold and parse_daily_log_entry_marker(text) is None:
-            add_finding(
-                findings,
-                "error",
-                "missing_daily_log_entry_marker",
-                "Missing required daily-log entry metadata marker",
-                log_path,
-            )
-            continue
         entry_markers = []
         entry_lines: list[list[str]] = []
         current_entry_lines: list[str] = []
@@ -568,7 +563,7 @@ def validate_daily_logs(workspace, state: dict | None, findings: list[Validation
             if entry.entry_id != f"entry-{entry.entry_seq}":
                 add_finding(
                     findings,
-                    "warning",
+                    "error",
                     "noncanonical_daily_log_entry_id",
                     (
                         f"Daily log entry id '{entry.entry_id}' does not match the canonical "
@@ -751,15 +746,36 @@ def validate_state_file(workspace, findings: list[ValidationFinding]) -> None:
         latest_file = daily_state.get("latest_file")
         if latest_file is not None and (not isinstance(latest_file, str) or not latest_file.strip()):
             add_finding(findings, "error", "invalid_latest_daily_log", "state.json daily_logs.latest_file must be null or a non-empty string", path)
-        if not isinstance(daily_state.get("latest_entry_seq"), int) or daily_state["latest_entry_seq"] < 0:
-            add_finding(findings, "error", "invalid_latest_daily_log_entry_seq", "state.json daily_logs.latest_entry_seq must be a non-negative integer", path)
+        latest_entry_seq = daily_state.get("latest_entry_seq")
+        if latest_entry_seq is not None and (
+            not isinstance(latest_entry_seq, int) or latest_entry_seq < 0
+        ):
+            add_finding(findings, "error", "invalid_latest_daily_log_entry_seq", "state.json daily_logs.latest_entry_seq must be null or a non-negative integer", path)
         latest_entry_id = daily_state.get("latest_entry_id")
         if latest_entry_id is not None and (not isinstance(latest_entry_id, str) or not latest_entry_id.strip()):
             add_finding(findings, "error", "invalid_latest_daily_log_entry_id", "state.json daily_logs.latest_entry_id must be null or a non-empty string", path)
         if not isinstance(daily_state.get("entry_count"), int) or daily_state["entry_count"] < 0:
             add_finding(findings, "error", "invalid_daily_log_entry_count", "state.json daily_logs.entry_count must be a non-negative integer", path)
-        if daily_state.get("entry_count", 0) < daily_state.get("latest_entry_seq", 0):
+        latest_entry_seq_value = 0 if latest_entry_seq is None else latest_entry_seq
+        if isinstance(latest_entry_seq_value, int) and daily_state.get("entry_count", 0) < latest_entry_seq_value:
             add_finding(findings, "error", "invalid_daily_log_entry_count_order", "state.json daily_logs.entry_count cannot be smaller than latest_entry_seq", path)
+        if latest_file is None:
+            if latest_entry_id is not None or latest_entry_seq not in {0, None} or daily_state.get("entry_count") != 0:
+                add_finding(findings, "error", "invalid_daily_log_null_cursor", "state.json daily_logs must use the null/zero cursor shape when no active daily log exists", path)
+        else:
+            empty_scaffold_cursor = (
+                latest_entry_id is None
+                and latest_entry_seq in {0, None}
+                and daily_state.get("entry_count") == 0
+            )
+            populated_cursor = (
+                latest_entry_id is not None
+                and isinstance(latest_entry_seq, int)
+                and latest_entry_seq >= 1
+                and daily_state.get("entry_count", 0) >= 1
+            )
+            if not empty_scaffold_cursor and not populated_cursor:
+                add_finding(findings, "error", "invalid_daily_log_populated_cursor", "state.json daily_logs must record either an empty-scaffold cursor or a populated cursor when latest_file is set", path)
 
     if (
         workspace.protocol_version is not None
@@ -813,6 +829,22 @@ def validate_daily_log_state(workspace, state: dict | None, findings: list[Valid
     )
     if latest_file is None:
         if actual_latest_rel is not None:
+            state_cursor = {
+                "latest_file": None,
+                "latest_entry_id": daily_state.get("latest_entry_id"),
+                "latest_entry_seq": daily_state.get("latest_entry_seq"),
+                "entry_count": daily_state.get("entry_count"),
+            }
+            try:
+                actual_cursor = latest_active_daily_log_cursor(workspace.storage_root).as_state_fields()
+            except DailyLogCursorError:
+                actual_cursor = {}
+            if (
+                daily_log_cursor_is_legacy_empty(state_cursor)
+                and daily_log_cursor_is_empty_scaffold(actual_cursor)
+                and actual_cursor.get("latest_file") == actual_latest_rel
+            ):
+                return
             add_finding(
                 findings,
                 "error",
@@ -949,29 +981,19 @@ def validate_exclude_block(workspace, state: dict | None, findings: list[Validat
             "A managed git exclude block exists, but state.json does not record git_exclude_mode=managed",
             exclude_path,
         )
-
-
-RECEIPT_VERIFIED_FILE_KEYS = ("context_brief", "daily_log", "rolling_summary", "update_protocol")
-
-
 def current_receipt_required_file_keys(workspace, state: dict) -> list[str]:
-    required = ["rolling_summary"]
-    if (workspace.storage_root / FILE_KEYS["context_brief"]).is_file():
-        required.append("context_brief")
-    if (workspace.storage_root / FILE_KEYS["update_protocol"]).is_file():
-        required.append("update_protocol")
-    daily_state = state.get("daily_logs")
-    if isinstance(daily_state, dict) and isinstance(daily_state.get("latest_file"), str):
-        required.append("daily_log")
-    return sorted(required)
+    return evidence_current_receipt_required_file_keys(
+        storage_root=workspace.storage_root,
+        state=state,
+    )
 
 
 def current_receipt_target_path(workspace, state: dict, file_key: str) -> Path:
-    if file_key == "daily_log":
-        daily_state = state.get("daily_logs")
-        latest_file = daily_state.get("latest_file") if isinstance(daily_state, dict) else None
-        return workspace.storage_root / latest_file if isinstance(latest_file, str) else workspace.storage_root
-    return workspace.storage_root / FILE_KEYS[file_key]
+    return evidence_current_receipt_target_path(
+        storage_root=workspace.storage_root,
+        state=state,
+        file_key=file_key,
+    )
 
 
 def validate_provenance_receipts(
@@ -993,41 +1015,6 @@ def validate_provenance_receipts(
         "required_current_file_keys": [],
         "verified_current_file_keys": [],
     }
-    try:
-        summary = receipt_store_summary(
-            storage_root=workspace.storage_root,
-            project_root=workspace.project_root,
-            require_exists=True,
-        )
-    except ReceiptStoreError as exc:
-        reason_code = exc.details.get("reason_code", "receipt_store_invalid")
-        add_finding(
-            findings,
-            "error",
-            f"provenance_{reason_code}",
-            f"Receipt store failed explicit provenance validation ({reason_code}).",
-            store_path,
-        )
-        result["receipt_store"]["reason_code"] = reason_code
-        return result
-
-    result["receipt_store"] = {
-        "store_file": summary["store_file"],
-        "store_revision": summary["store_revision"],
-        "receipt_count": summary["receipt_count"],
-        "target_file_keys": summary["target_file_keys"],
-        "verified": False,
-    }
-    latest_receipts = summary["latest_receipts_by_file_key"]
-    if not latest_receipts:
-        add_finding(
-            findings,
-            "error",
-            "provenance_receipt_store_empty",
-            "Receipt store contains no finalized receipts for explicit provenance validation.",
-            store_path,
-        )
-        return result
     if state is None:
         add_finding(
             findings,
@@ -1038,182 +1025,59 @@ def validate_provenance_receipts(
         )
         return result
 
-    state_text = read_text(workspace.storage_root / FILE_KEYS["state"])
-    current_state_digest = sha256_text_digest(state_text)
-    current_workspace_revision = state.get("workspace_revision")
-    required_file_keys = current_receipt_required_file_keys(workspace, state)
-    result["required_current_file_keys"] = required_file_keys
-    missing_receipt_keys = sorted(set(required_file_keys).difference(latest_receipts))
-    for file_key in missing_receipt_keys:
+    try:
+        state_text = read_text(workspace.storage_root / FILE_KEYS["state"])
+    except (OSError, UnicodeDecodeError) as exc:
         add_finding(
             findings,
             "error",
-            f"provenance_{file_key}_receipt_missing",
-            "Current managed surface is missing finalized receipt-store evidence for this file.",
-            current_receipt_target_path(workspace, state, file_key),
+            "provenance_state_unreadable",
+            f"state.json must be readable for explicit provenance validation: {exc}",
+            workspace.storage_root / FILE_KEYS["state"],
         )
-    verified_file_keys: list[str] = []
-    for file_key, receipt in sorted(latest_receipts.items()):
-        if file_key not in RECEIPT_VERIFIED_FILE_KEYS:
-            add_finding(
-                findings,
-                "error",
-                "provenance_receipt_target_unsupported",
-                "Receipt store contains a finalized receipt for an unsupported managed file key.",
-                store_path,
-            )
-            continue
-        if file_key == "daily_log":
-            daily_state = state.get("daily_logs")
-            latest_file = daily_state.get("latest_file") if isinstance(daily_state, dict) else None
-            latest_entry_seq = (
-                daily_state.get("latest_entry_seq") if isinstance(daily_state, dict) else None
-            )
-            if not isinstance(latest_file, str) or not latest_file:
-                add_finding(
-                    findings,
-                    "error",
-                    "provenance_daily_log_state_missing",
-                    "state.json is missing the receipt-backed latest daily-log cursor.",
-                    workspace.storage_root / FILE_KEYS["state"],
-                )
-                continue
-            target_path = workspace.storage_root / latest_file
-            if not target_path.is_file():
-                add_finding(
-                    findings,
-                    "error",
-                    "provenance_daily_log_target_missing",
-                    "Receipt-backed latest daily log is missing.",
-                    target_path,
-                )
-                continue
-            target_text = read_text(target_path)
-            checks = {
-                "target_digest_matches_current_file": receipt.get("target_digest") == sha256_text_digest(target_text),
-                "latest_entry_seq_matches_receipt": receipt.get("result_file_revision") == latest_entry_seq,
-                "finalized": receipt.get("finalization_status") == "finalized",
-            }
-            if receipt.get("revision") == summary["store_revision"]:
-                checks.update(
-                    {
-                        "latest_state_digest_matches_current_state": (
-                            receipt.get("state_digest") == current_state_digest
-                        ),
-                        "latest_workspace_revision_matches_state": (
-                            receipt.get("result_workspace_revision") == current_workspace_revision
-                        ),
-                    }
-                )
-            else:
-                checks["workspace_revision_not_from_future"] = (
-                    is_json_int(receipt.get("result_workspace_revision"))
-                    and is_json_int(current_workspace_revision)
-                    and receipt["result_workspace_revision"] <= current_workspace_revision
-                )
-            failed_checks = [key for key, passed in checks.items() if not passed]
-            if failed_checks:
-                add_finding(
-                    findings,
-                    "error",
-                    "provenance_daily_log_receipt_mismatch",
-                    (
-                        "Current latest daily log is not backed by the latest finalized "
-                        "receipt-store evidence. Failed checks: " + ", ".join(failed_checks)
-                    ),
-                    target_path,
-                )
-                continue
-            verified_file_keys.append(file_key)
-            continue
-        target_path = workspace.storage_root / FILE_KEYS[file_key]
-        if not target_path.is_file():
-            add_finding(
-                findings,
-                "error",
-                f"provenance_{file_key}_target_missing",
-                "Receipt-backed managed file is missing.",
-                target_path,
-            )
-            continue
-        target_text = read_text(target_path)
-        file_state = parse_file_state_marker(target_text)
-        if file_state is None:
-            add_finding(
-                findings,
-                "error",
-                f"provenance_{file_key}_file_state_missing",
-                "Receipt-backed managed file is missing file-state metadata.",
-                target_path,
-            )
-            continue
-        state_entry = state.get("files", {}).get(file_key)
-        if not isinstance(state_entry, dict):
-            add_finding(
-                findings,
-                "error",
-                f"provenance_{file_key}_state_entry_missing",
-                "state.json is missing the receipt-backed managed file entry.",
-                workspace.storage_root / FILE_KEYS["state"],
-            )
-            continue
-        checks = {
-            "target_digest_matches_current_file": receipt.get("target_digest") == sha256_text_digest(target_text),
-            "file_revision_matches_marker": receipt.get("result_file_revision") == file_state.revision,
-            "state_entry_revision_matches_marker": state_entry.get("file_revision") == file_state.revision,
-            "receipt_workspace_revision_matches_marker_base": (
-                receipt.get("result_workspace_revision") == file_state.base_workspace_revision
-            ),
-            "state_entry_base_workspace_revision_matches_marker": (
-                state_entry.get("base_workspace_revision") == file_state.base_workspace_revision
-            ),
-            "finalized": receipt.get("finalization_status") == "finalized",
-        }
-        if receipt.get("revision") == summary["store_revision"]:
-            checks.update(
-                {
-                    "latest_state_digest_matches_current_state": (
-                        receipt.get("state_digest") == current_state_digest
-                    ),
-                    "latest_workspace_revision_matches_state": (
-                        receipt.get("result_workspace_revision") == current_workspace_revision
-                    ),
-                }
-            )
-        else:
-            checks["workspace_revision_not_from_future"] = (
-                is_json_int(receipt.get("result_workspace_revision"))
-                and is_json_int(current_workspace_revision)
-                and receipt["result_workspace_revision"] <= current_workspace_revision
-            )
-        failed_checks = [key for key, passed in checks.items() if not passed]
-        if failed_checks:
-            add_finding(
-                findings,
-                "error",
-                f"provenance_{file_key}_receipt_mismatch",
-                (
-                    "Current managed file is not backed by the latest finalized "
-                    "receipt-store evidence. Failed checks: " + ", ".join(failed_checks)
-                ),
-                target_path,
-            )
-            continue
-        verified_file_keys.append(file_key)
+        return result
 
-    result["verified_current_file_keys"] = verified_file_keys
-    result["receipt_store"]["verified"] = (
-        set(verified_file_keys) == set(required_file_keys)
-        and set(latest_receipts).issubset(set(RECEIPT_VERIFIED_FILE_KEYS))
+    check = bounded_current_helper_evidence_check(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        state=state,
+        state_text=state_text,
+        helper_evidenced_only=False,
+        require_receipt_store=True,
     )
-    if not verified_file_keys:
+    result["required_current_file_keys"] = check.get("required_current_file_keys", [])
+    result["verified_current_file_keys"] = check.get("verified_current_file_keys", [])
+    if isinstance(check.get("receipt_store"), dict):
+        result["receipt_store"] = check["receipt_store"]
+    else:
+        result["receipt_store"]["reason_code"] = check.get("reason_code")
+    if isinstance(check.get("config_guard"), dict):
+        result["config_guard"] = check["config_guard"]
+
+    for file_key in check.get("missing_current_file_keys", []):
+        if isinstance(file_key, str):
+            add_finding(
+                findings,
+                "error",
+                f"provenance_{file_key}_receipt_missing",
+                "Current managed surface is missing finalized receipt-store evidence for this file.",
+                current_receipt_target_path(workspace, state, file_key),
+            )
+
+    if check.get("verified") is not True:
+        reason_code = str(check.get("reason_code") or "receipt_evidence_mismatch")
+        finding_path = store_path
+        config_guard = check.get("config_guard")
+        if isinstance(config_guard, dict) and isinstance(config_guard.get("path"), str):
+            finding_path = Path(config_guard["path"])
         add_finding(
             findings,
             "error",
-            "provenance_no_current_receipts_verified",
-            "No current managed files were verified against finalized receipt-store evidence.",
-            store_path,
+            f"provenance_{reason_code}",
+            f"Bounded current receipt-store evidence was not verified ({reason_code}).",
+            finding_path,
         )
+    result["receipt_store"]["verified"] = check.get("verified") is True
     return result
 
 

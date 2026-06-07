@@ -38,7 +38,7 @@ The current advisory shape is:
 
 ```json
 {
-  "latest_version": "0.3.4",
+  "latest_version": "0.4.4",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
   "advisory_level": "supported",
@@ -82,6 +82,14 @@ Helpers currently validate and gate behavior from the core support fields above,
 - diagnostic: `validate`, `status`, root detection, support diagnostics, write-lock inspection
 - readonly: `resume`, query, preflight, workday recommendation, cold-start proposal generation, recovery promotion preparation
 - mutating: init, bridge apply/remove, context commits, daily-log appends, archive, recovery staging/review recording, uninstall, native wrapper installation
+
+Daily-log cursor repair is a structural repair action, not a receipt-backed
+mutation. The direct `repair_daily_log_cursor.py` helper and dispatcher
+`repair-daily-log-cursor` command use the same support policy:
+
+- preview/default mode is read-only and may run anywhere read-only actions are allowed
+- `--apply --yes` is mutating and is blocked under `readonly_only`, `diagnostic_only`, and `unknown_offline`
+- both entrypoints are explicitly registered in support action-level maps; apply must not rely on the default read-only fallback
 
 When a support gate blocks an action, helpers return the shared failure contract with `blocked_reason: package_support_blocked` plus a `package_support` object describing state, action level, advisory source, cache source, update hints, and diagnostic reason.
 

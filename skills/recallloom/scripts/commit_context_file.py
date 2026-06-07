@@ -290,10 +290,27 @@ def load_prepared_text(
     source_file: str | None,
     use_stdin: bool,
     max_input_bytes: int,
+    file_key: str | None = None,
+    write_type: str | None = None,
     project_root: Path | None = None,
     storage_root: Path | None = None,
 ) -> tuple[str, str]:
     if bool(source_file) == bool(use_stdin):
+        details = {
+            "command": "write",
+            "operation": "managed_file_commit",
+            "input_contract": "source-file_xor_stdin",
+            "source_file_present": source_file is not None,
+            "stdin_present": bool(use_stdin),
+            "side_effect": "none",
+            "reason_code": (
+                "both_input_sources" if source_file and use_stdin else "missing_input_source"
+            ),
+        }
+        if file_key is not None:
+            details["file_key"] = file_key
+        if write_type is not None:
+            details["write_type"] = write_type
         if source_file and use_stdin:
             exit_with_failure_contract(
                 parser,
@@ -301,6 +318,7 @@ def load_prepared_text(
                 exit_code=2,
                 message="Use exactly one prepared-content input: --source-file or --stdin.",
                 reason="invalid_prepared_input",
+                details=details,
             )
         exit_with_failure_contract(
             parser,
@@ -308,6 +326,7 @@ def load_prepared_text(
             exit_code=2,
             message="Provide prepared content with --source-file or --stdin.",
             reason="invalid_prepared_input",
+            details=details,
         )
 
     if source_file:
@@ -559,6 +578,8 @@ def rolling_summary_json_failure_details(
 ) -> dict:
     details = {
         **(recovery_details or {}),
+        "command": "write",
+        "operation": "managed_file_commit",
         "prepared_input_builder": "rolling_summary_json",
         "file_key": "rolling_summary",
         "write_type": "current-state",
@@ -569,11 +590,17 @@ def rolling_summary_json_failure_details(
         "allowed_section_keys": list(ROLLING_SUMMARY_JSON_KEYS),
         "reason_code": reason_code,
         "side_effect": "none",
+        "trust_effect": "none",
     }
     if section_key is not None:
         details["section_key"] = section_key
     if extra:
         details.update(extra)
+    if recovery_details:
+        for route_key in ("command", "operation"):
+            route_value = recovery_details.get(route_key)
+            if isinstance(route_value, str) and route_value.strip():
+                details[route_key] = route_value
     return details
 
 
@@ -867,12 +894,16 @@ def rolling_summary_json_recovery_details(
     input_mode: str,
     source_file: str | None,
     project_root: Path | None,
+    route_details: dict | None = None,
 ) -> dict:
-    return prepared_body_failure_details(
+    details = prepared_body_failure_details(
         input_mode=input_mode,
         source_file=source_file,
         project_root=project_root,
     )
+    if route_details:
+        details.update(route_details)
+    return details
 
 
 def prepared_body_failure_details(
@@ -927,6 +958,7 @@ def prepare_body_text(
     expected_language: str,
     source_file: str | None = None,
     project_root: Path | None = None,
+    route_details: dict | None = None,
 ) -> tuple[str, str]:
     if input_format == "markdown":
         return (
@@ -939,13 +971,27 @@ def prepare_body_text(
         )
 
     if file_key != "rolling_summary":
+        input_mode = "json-file" if source_kind == "file" else "json-stdin"
         exit_with_failure_contract(
             parser,
             json_mode=json_mode,
             exit_code=2,
             message="Structured JSON input is only supported for --file-key rolling_summary.",
             reason="invalid_prepared_input",
-            details={"input_format": "json", "file_key": file_key},
+            details={
+                **prepared_body_failure_details(
+                    input_mode=input_mode,
+                    source_file=source_file,
+                    project_root=project_root,
+                    file_key=file_key,
+                ),
+                "command": "write",
+                "operation": "managed_file_commit",
+                "input_format": "json",
+                "reason_code": "json_input_requires_current_state",
+                "side_effect": "none",
+                "trust_effect": "none",
+            },
         )
 
     input_mode = "json-file" if source_kind == "file" else "json-stdin"
@@ -953,6 +999,7 @@ def prepare_body_text(
         input_mode=input_mode,
         source_file=source_file,
         project_root=project_root,
+        route_details=route_details,
     )
     return (
         normalize_rolling_summary_json_text(
@@ -1596,6 +1643,8 @@ def main() -> None:
         source_file=args.source_file,
         use_stdin=args.stdin,
         max_input_bytes=args.max_input_bytes,
+        file_key=args.file_key,
+        write_type=WRITE_TYPE_BY_FILE_KEY.get(args.file_key),
         project_root=workspace.project_root,
         storage_root=workspace.storage_root,
     )
@@ -1763,6 +1812,15 @@ def main() -> None:
             timestamp = now_iso_timestamp()
             new_file_revision = current_state.revision + 1
             new_workspace_revision = state["workspace_revision"] + 1
+            route_details = None
+            if (
+                isinstance(preflight_binding, dict)
+                and preflight_binding.get("operation_class") == "post_append_summary_sync"
+            ):
+                route_details = {
+                    "command": "sync-current-state-after-append",
+                    "operation": "post_append_summary_sync",
+                }
             body_text, input_mode = prepare_body_text(
                 parser,
                 json_mode=args.json,
@@ -1773,6 +1831,7 @@ def main() -> None:
                 expected_language=workspace.workspace_language,
                 source_file=args.source_file,
                 project_root=workspace.project_root,
+                route_details=route_details,
             )
             managed_write_recovery_details = prepared_body_failure_details(
                 input_mode=input_mode,

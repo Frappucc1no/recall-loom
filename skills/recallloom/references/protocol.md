@@ -420,7 +420,8 @@ That scaffold uses this shape:
 For protocol `1.0`:
 
 - scaffold logs are not counted as active milestone entries
-- scaffold logs keep `state.json.daily_logs` in the null/zero cursor shape until the first real append
+- scaffold logs still count as the latest active daily-log file for `state.json.daily_logs.latest_file`
+- scaffold logs keep `latest_entry_id = null`, `latest_entry_seq = null`, and `entry_count = 0` until the first real append
 - the first real append to a scaffold still becomes `entry-1`
 
 For protocol `1.0`:
@@ -438,6 +439,11 @@ For protocol `1.0`, `state.json.daily_logs` describes the latest active daily lo
 - `latest_entry_id` is the matching marker id from that same entry.
 - `entry_count` keeps its existing field name and means the number of entry markers in that latest active daily log file.
 - `entry_count` is not a global cumulative count across `daily_logs/`, and protocol `1.0` does not rename it to `latest_file_entry_count`.
+- if the latest active daily log is an empty scaffold, `latest_file` remains the relative daily-log path, while `latest_entry_id = null`, `latest_entry_seq = null`, and `entry_count = 0`.
+- if no active daily log file exists, `latest_file = null`, `latest_entry_id = null`, `latest_entry_seq = 0`, and `entry_count = 0`.
+- `repair-daily-log-cursor` may recalculate this cursor from the latest active
+  daily log. It previews by default and applies only with explicit confirmation
+  and the normal support / revision guards.
 
 ### Rolling summary metadata marker
 
@@ -550,7 +556,8 @@ Compatibility rules for helper schema `1.1`:
 
 See `references/file-contracts.md` for the field-level semantics of helper
 schema `1.1`, including `next_actions`, `suggestion`,
-`recovery_command`, `read_plan`, and `estimated_tokens`.
+`recovery_command`, `single_next_command`, `safe_to_retry`, `side_effect`,
+`trust_effect`, `read_plan`, and `estimated_tokens`.
 
 ## Validator Semantics
 

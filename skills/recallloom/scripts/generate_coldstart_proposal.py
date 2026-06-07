@@ -25,18 +25,18 @@ from _common import (
     cli_failure_payload,
     cli_failure_payload_for_exception,
     ConfigContractError,
-    DAILY_LOGS_DIRNAME,
+    DailyLogCursorError,
     EnvironmentContractError,
     enforce_package_support_gate,
     ensure_supported_python_version,
     exit_with_cli_error,
     exit_with_failure_contract,
     find_recallloom_root,
-    latest_active_daily_log,
     load_workspace_state,
     public_json_payload,
     read_text,
     StorageResolutionError,
+    validate_state_entry_bearing_latest_daily_log,
 )
 
 
@@ -158,13 +158,34 @@ def main() -> None:
             json_mode=args.json,
             exit_code=2,
             message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+                payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+        )
+
+    try:
+        latest_daily_log_cursor = validate_state_entry_bearing_latest_daily_log(
+            storage_root=workspace.storage_root,
+            state=state,
+        )
+    except DailyLogCursorError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=str(exc),
+            payload=cli_failure_payload(
+                "malformed_managed_file",
+                error=str(exc),
+                details={
+                    **exc.details,
+                    "project_root": str(workspace.project_root),
+                },
+            ),
         )
 
     continuity_state, continuity_seeded = continuity_state_for_workspace(
         state=state,
         summary_text=summary_text,
-        latest_daily_log_exists=latest_active_daily_log(workspace.storage_root / DAILY_LOGS_DIRNAME) is not None,
+        latest_daily_log_exists=latest_daily_log_cursor is not None,
     )
     proposal_markdown = render_coldstart_proposal(
         workspace.project_root,

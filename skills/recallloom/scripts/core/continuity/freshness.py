@@ -100,6 +100,38 @@ EMPTY_NEXT_STEP_MARKERS = {
 }
 
 
+def _structural_cursor_repair_revision_only(
+    *,
+    state: dict,
+    summary_base_workspace_revision: int,
+    workspace_revision: int,
+) -> bool:
+    if workspace_revision != summary_base_workspace_revision + 1:
+        return False
+    provenance = state.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    repair = provenance.get("last_structural_repair")
+    if not isinstance(repair, dict):
+        return False
+    if repair.get("repair_kind") != "daily_log_cursor_repair":
+        return False
+    if repair.get("receipt_backed") is not False:
+        return False
+    if repair.get("finalizes_mutating_receipt") is not False:
+        return False
+    files_state = state.get("files")
+    if not isinstance(files_state, dict):
+        return True
+    for file_state in files_state.values():
+        if not isinstance(file_state, dict):
+            continue
+        base_revision = file_state.get("base_workspace_revision")
+        if isinstance(base_revision, int) and base_revision > summary_base_workspace_revision:
+            return False
+    return True
+
+
 def latest_file(paths: list[Path]) -> Path | None:
     if not paths:
         return None
@@ -373,6 +405,7 @@ def evaluate_continuity_freshness(
     summary_base_workspace_revision: int,
     latest_daily_log_exists: bool,
     scan_mode: str = "quick",
+    state: dict | None = None,
 ) -> dict:
     if scan_mode not in {"quick", "full"}:
         raise ValueError(f"Unsupported scan_mode: {scan_mode}")
@@ -391,7 +424,19 @@ def evaluate_continuity_freshness(
             and latest_workspace_artifact.stat().st_mtime > summary_mtime
         )
 
-    summary_revision_is_stale = workspace_revision > summary_base_workspace_revision
+    raw_summary_revision_is_stale = workspace_revision > summary_base_workspace_revision
+    structural_cursor_repair_revision_only = (
+        raw_summary_revision_is_stale
+        and isinstance(state, dict)
+        and _structural_cursor_repair_revision_only(
+            state=state,
+            summary_base_workspace_revision=summary_base_workspace_revision,
+            workspace_revision=workspace_revision,
+        )
+    )
+    summary_revision_is_stale = (
+        raw_summary_revision_is_stale and not structural_cursor_repair_revision_only
+    )
     workspace_is_newer = (
         (workspace_artifact_is_newer if workspace_artifact_is_newer is not None else False)
         or summary_revision_is_stale
@@ -410,6 +455,8 @@ def evaluate_continuity_freshness(
         "latest_workspace_artifact": latest_workspace_artifact,
         "workspace_artifact_newer_than_summary": workspace_artifact_is_newer,
         "summary_revision_stale": summary_revision_is_stale,
+        "raw_summary_revision_stale": raw_summary_revision_is_stale,
+        "structural_cursor_repair_revision_only": structural_cursor_repair_revision_only,
         "workspace_newer_than_summary": workspace_is_newer,
         "summary_stale": workspace_is_newer,
         "continuity_confidence": continuity_confidence,

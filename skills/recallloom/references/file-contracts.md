@@ -107,6 +107,10 @@ Expected `bridged_entries` value shape:
   - `latest_entry_id = null`
   - `latest_entry_seq = 0`
   - `entry_count = 0`
+- when the latest active daily log is an empty scaffold, helpers must keep `latest_file = daily_logs/YYYY-MM-DD.md` while writing:
+  - `latest_entry_id = null`
+  - `latest_entry_seq = null`
+  - `entry_count = 0`
 
 Allowed `storage_mode` values:
 
@@ -297,6 +301,22 @@ Field semantics for helper schema `1.1`:
   - use a literal command string when a deterministic rerun path exists
   - otherwise use a concise imperative instruction instead of fabricating a
     fake shell command
+- `single_next_command`
+  - additive failure-payload field with one dispatcher-oriented command to try
+    next
+  - placeholders such as `<project-path>` are intentionally public-safe and
+    should be replaced by the operator or wrapper
+- `safe_to_retry`
+  - additive boolean on shared failure payloads
+  - true only when the helper reports no side effect and no trust impact
+- `side_effect`
+  - additive failure-payload field describing whether the failed helper changed
+    anything; public values include `none`, `partial`, `write_attempted`, and
+    `unknown`
+- `trust_effect`
+  - shared failure-payload field describing the trust impact of the failure
+  - consumers should treat anything other than `none` as review-required before
+    retrying a mutating operation
 - `read_plan`
   - optional structured read recommendation for follow-up continuity loading
   - additive in schema `1.1`; consumers that do not understand it may ignore
@@ -353,6 +373,16 @@ Tier intent:
   - highest-confidence tier for stale, conflicting, or evidence-heavy cases
   - may add the latest active daily log and other directly relevant managed
     evidence
+
+`repair-daily-log-cursor` success payloads:
+
+- preview mode returns `mode: "preview"`, `dry_run: true`, `applied: false`,
+  `repair_eligible`, `current_cursor`, `expected_cursor`, and `next_action`
+- apply mode returns `mode: "apply"` and uses the same cursor fields; when a
+  repair is applied it also returns a public `provenance_decision` summary
+- apply mode repairs only the `state.json.daily_logs` cursor fields and
+  repair-decision provenance metadata; it does not rewrite daily-log files or
+  create helper receipts
 
 Review-before-write rule:
 
@@ -604,7 +634,8 @@ Optional scaffold form before the first real entry:
 - scaffold logs use:
   - `<!-- daily-log-scaffold: true -->`
 - scaffold logs are not counted as active entries
-- scaffold logs keep `state.json.daily_logs` in the null/zero cursor shape until the first real append
+- scaffold logs still count as the latest active daily-log file for `state.json.daily_logs.latest_file`
+- scaffold logs keep `latest_entry_id = null`, `latest_entry_seq = null`, and `entry_count = 0` until the first real append
 - the first real append to a scaffold still becomes `entry-1`
 
 Language rule:

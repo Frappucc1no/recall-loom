@@ -26,6 +26,18 @@ TRANSIT_ONLY_LEGACY_PROVENANCE_STATES = (
     "review_required",
 )
 
+NON_RECEIPT_BACKED_STRUCTURAL_REPAIR_KINDS = (
+    "daily_log_cursor_repair",
+)
+
+CURSOR_REPAIR_BLOCKING_REASON_CODES = (
+    "legacy_import_review_required",
+    "provenance_evidence_inconsistent",
+    "receipt_evidence_mismatch",
+    "direct_state_or_config_edit_detected",
+    "metadata_state_review_required",
+)
+
 PROVENANCE_ACTION_MATRIX = {
     "structurally_valid": {
         "allowed_actions": [
@@ -263,6 +275,91 @@ def inconsistent_evidence_metadata(
     return payload
 
 
+def _state_provenance_metadata(state: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if not isinstance(state, Mapping):
+        return None
+    metadata = state.get("provenance")
+    return metadata if isinstance(metadata, Mapping) else None
+
+
+def _copy_current_provenance_metadata(
+    state: Mapping[str, Any] | None,
+    *,
+    fallback_state_label: str,
+    fallback_baseline_kind: str,
+    fallback_receipt_backed: bool,
+) -> dict:
+    metadata = _state_provenance_metadata(state)
+    if (
+        metadata is not None
+        and metadata.get("schema_version") == PROVENANCE_METADATA_SCHEMA_VERSION
+        and metadata.get("state_label") in PROVENANCE_STATE_LABELS
+    ):
+        return dict(metadata)
+    return {
+        "schema_version": PROVENANCE_METADATA_SCHEMA_VERSION,
+        "state_label": fallback_state_label,
+        "baseline_kind": fallback_baseline_kind,
+        "receipt_backed": fallback_receipt_backed,
+    }
+
+
+def _with_structural_repair_marker(
+    metadata: Mapping[str, Any],
+    *,
+    timestamp: str,
+    repair_kind: str,
+    previous_state_label: str | None,
+    reason_code: str | None,
+    trust_effect: str,
+) -> dict:
+    payload = dict(metadata)
+    payload["updated_at"] = timestamp
+    payload["last_structural_repair"] = {
+        "repair_kind": repair_kind,
+        "receipt_backed": False,
+        "finalizes_mutating_receipt": False,
+        "updated_at": timestamp,
+        "trust_effect": trust_effect,
+    }
+    if previous_state_label is not None:
+        payload["last_structural_repair"]["previous_state_label"] = previous_state_label
+    if reason_code is not None:
+        payload["last_structural_repair"]["reason_code"] = reason_code
+        payload["reason_code"] = reason_code
+    return payload
+
+
+def structural_repair_metadata(
+    *,
+    timestamp: str,
+    repair_kind: str,
+    previous_state_label: str | None = None,
+    reason_code: str | None = None,
+) -> dict:
+    """Return non receipt-backed metadata for a structural sidecar repair."""
+
+    payload = {
+        "schema_version": PROVENANCE_METADATA_SCHEMA_VERSION,
+        "state_label": "structurally_valid",
+        "baseline_kind": "structural_repair",
+        "updated_at": timestamp,
+        "receipt_backed": False,
+    }
+    if previous_state_label is not None:
+        payload["previous_state_label"] = previous_state_label
+    if reason_code is not None:
+        payload["reason_code"] = reason_code
+    return _with_structural_repair_marker(
+        payload,
+        timestamp=timestamp,
+        repair_kind=repair_kind,
+        previous_state_label=previous_state_label,
+        reason_code=reason_code,
+        trust_effect="structural_only",
+    )
+
+
 def provenance_facts_from_state(
     state: Mapping[str, Any] | None,
     *,
@@ -343,6 +440,179 @@ def provenance_facts_from_state(
         "review_imported_baseline": False,
         "helper_evidenced": False,
         "inconsistent_evidence": False,
+    }
+
+
+def bounded_evidence_supports_helper_evidenced(
+    state: Mapping[str, Any] | None,
+    *,
+    bounded_receipt_evidence_verified: bool = False,
+    receipt_store_available: bool = False,
+) -> bool:
+    """Return whether current bounded evidence can preserve helper evidence.
+
+    This is a current-state check only. It is not a historical receipt-chain audit.
+    """
+
+    provenance_facts = provenance_facts_from_state(state, review_intent=True)
+    return bool(
+        provenance_facts["helper_evidenced"]
+        and bounded_receipt_evidence_verified
+        and receipt_store_available
+    )
+
+
+def cursor_repair_provenance_decision(
+    state: Mapping[str, Any] | None,
+    *,
+    timestamp: str,
+    bounded_evidence_supports_helper_evidenced: bool = False,
+    repair_kind: str = "daily_log_cursor_repair",
+    evidence_block_reason_code: str | None = None,
+) -> dict:
+    """Decide provenance metadata for non receipt-backed daily-log cursor repair.
+
+    `evidence_block_reason_code` is for independent safety findings such as receipt
+    mismatch, direct state/config edits, or tampered evidence. A plain cursor
+    mismatch that this helper is repairing should not be passed as that reason.
+    """
+
+    if repair_kind not in NON_RECEIPT_BACKED_STRUCTURAL_REPAIR_KINDS:
+        raise ValueError(f"Unsupported structural repair kind: {repair_kind}")
+
+    metadata = _state_provenance_metadata(state)
+    previous_state_label = (
+        metadata.get("state_label")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("state_label"), str)
+        else None
+    )
+    provenance_facts = provenance_facts_from_state(state, review_intent=True)
+    result = {
+        "allowed": True,
+        "repair_kind": repair_kind,
+        "receipt_backed": False,
+        "receipt_store_write_allowed": False,
+        "finalizes_mutating_receipt": False,
+        "requires_full_receipt_chain_audit": False,
+        "bounded_evidence_supports_helper_evidenced": bounded_evidence_supports_helper_evidenced,
+        "previous_state_label": previous_state_label,
+        "metadata_status": provenance_facts["metadata_status"],
+        "blocked_reason_code": None,
+        "route": "apply_structural_repair",
+    }
+
+    if evidence_block_reason_code is not None:
+        return {
+            **result,
+            "allowed": False,
+            "blocked_reason_code": evidence_block_reason_code,
+            "route": "validate_and_repair_review",
+            "result_state_label": "inconsistent_or_tampered_evidence",
+            "provenance_metadata": None,
+            "trust_effect": "none",
+            "note": (
+                "Structural repair must not proceed while independent evidence checks "
+                "report tampering, receipt mismatch, or direct state/config edits."
+            ),
+        }
+
+    if provenance_facts["inconsistent_evidence"]:
+        return {
+            **result,
+            "allowed": False,
+            "blocked_reason_code": "provenance_evidence_inconsistent",
+            "route": "validate_and_repair_review",
+            "result_state_label": "inconsistent_or_tampered_evidence",
+            "provenance_metadata": None,
+            "trust_effect": "none",
+            "note": "Inconsistent provenance evidence must be reviewed before repair.",
+        }
+
+    if provenance_facts["review_required"] or provenance_facts["legacy_sidecar"]:
+        return {
+            **result,
+            "allowed": False,
+            "blocked_reason_code": "legacy_import_review_required",
+            "route": "review_or_repair_import",
+            "result_state_label": "review_required",
+            "provenance_metadata": None,
+            "trust_effect": "none",
+            "note": "Legacy or unknown provenance must route through review/repair import first.",
+        }
+
+    if provenance_facts["review_imported_baseline"]:
+        preserved = _copy_current_provenance_metadata(
+            state,
+            fallback_state_label="review_imported_baseline",
+            fallback_baseline_kind="review_import",
+            fallback_receipt_backed=False,
+        )
+        preserved["state_label"] = "review_imported_baseline"
+        preserved["receipt_backed"] = False
+        metadata_payload = _with_structural_repair_marker(
+            preserved,
+            timestamp=timestamp,
+            repair_kind=repair_kind,
+            previous_state_label=previous_state_label,
+            reason_code="review_imported_baseline_preserved",
+            trust_effect="structural_only",
+        )
+        return {
+            **result,
+            "result_state_label": "review_imported_baseline",
+            "provenance_metadata": metadata_payload,
+            "trust_effect": "structural_only",
+            "note": "Reviewed import baseline is preserved as non receipt-backed provenance.",
+        }
+
+    if provenance_facts["helper_evidenced"] and bounded_evidence_supports_helper_evidenced:
+        preserved = _copy_current_provenance_metadata(
+            state,
+            fallback_state_label="helper_evidenced",
+            fallback_baseline_kind="helper_receipt_finalized",
+            fallback_receipt_backed=True,
+        )
+        preserved["state_label"] = "helper_evidenced"
+        preserved["receipt_backed"] = True
+        metadata_payload = _with_structural_repair_marker(
+            preserved,
+            timestamp=timestamp,
+            repair_kind=repair_kind,
+            previous_state_label=previous_state_label,
+            reason_code="bounded_evidence_preserved_helper_evidenced",
+            trust_effect="helper_evidence_preserved_by_bounded_check",
+        )
+        return {
+            **result,
+            "result_state_label": "helper_evidenced",
+            "provenance_metadata": metadata_payload,
+            "trust_effect": "helper_evidence_preserved_by_bounded_check",
+            "note": (
+                "Helper-evidenced provenance is preserved only because current bounded "
+                "evidence independently supports it."
+            ),
+        }
+
+    reason_code = (
+        "bounded_evidence_missing_for_helper_evidenced"
+        if provenance_facts["helper_evidenced"]
+        else "non_receipt_backed_structural_repair"
+    )
+    metadata_payload = structural_repair_metadata(
+        timestamp=timestamp,
+        repair_kind=repair_kind,
+        previous_state_label=previous_state_label,
+        reason_code=reason_code,
+    )
+    return {
+        **result,
+        "result_state_label": "structurally_valid",
+        "provenance_metadata": metadata_payload,
+        "trust_effect": "structural_only",
+        "note": (
+            "Cursor repair restores structural cursor metadata only; it does not prove "
+            "historical daily-log origin or finalize helper receipt evidence."
+        ),
     }
 
 

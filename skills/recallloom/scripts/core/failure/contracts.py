@@ -590,6 +590,8 @@ def _append_input_source_args(details: dict | None) -> list[str] | None:
         return None
     input_mode = _prepared_input_mode(details)
     entry_path = details.get("entry_path")
+    if input_mode == "json-string":
+        return ["--entry-json", "'<prepared-entry-json>'"]
     if input_mode == "json-file":
         entry_arg = _quote_or_placeholder(
             entry_path if isinstance(entry_path, str) else None,
@@ -605,8 +607,64 @@ def _append_input_source_args(details: dict | None) -> list[str] | None:
     return None
 
 
+def _append_placeholder_args(details: dict | None) -> list[str]:
+    input_mode = _prepared_input_mode(details)
+    input_format = details.get("input_format") if isinstance(details, dict) else None
+    if input_mode == "json-string":
+        return ["--entry-json", "'<prepared-entry-json>'"]
+    if input_mode == "json-file":
+        return ["--entry-file", "<entry.json>", "--input-format", "json"]
+    if input_mode == "json-stdin":
+        return ["--stdin", "--input-format", "json"]
+    if input_mode == "stdin":
+        args = ["--stdin"]
+        if input_format == "json":
+            args.extend(["--input-format", "json"])
+        return args
+    if input_mode == "file":
+        args = ["--entry-file", "<prepared-entry.md>"]
+        if input_format == "json":
+            args = ["--entry-file", "<entry.json>", "--input-format", "json"]
+        return args
+    if input_mode in {"ambiguous", "missing"}:
+        return ["--entry-json", "'<prepared-entry-json>'"]
+    return ["--entry-file", "<prepared-entry.md>"]
+
+
 def _invalid_prepared_input_suggestion(language: str, details: dict | None) -> str:
     input_mode = _prepared_input_mode(details)
+    command = details.get("command") if isinstance(details, dict) else None
+    operation = details.get("operation") if isinstance(details, dict) else None
+    if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
+        return _localized_text(
+            language,
+            en=(
+                "Fix the reviewed rolling-summary JSON payload on stdin, then rerun "
+                "sync-current-state-after-append with --stdin --input-format json."
+            ),
+            zh_cn=(
+                "请先修正 stdin 中已复核的 rolling-summary JSON payload，再用 "
+                "sync-current-state-after-append --stdin --input-format json 重试。"
+            ),
+        )
+    if command == "archive" or operation == "daily_log_archive":
+        return _localized_text(
+            language,
+            en="Fix the archive arguments, then rerun archive preview or status.",
+            zh_cn="请先修正 archive 参数，再重新运行 archive preview 或 status。",
+        )
+    if command == "write" or operation == "managed_file_commit":
+        return _localized_text(
+            language,
+            en=(
+                "Fix the managed-file source selection, then rerun write with one "
+                "explicit --type and exactly one of --source-file or --stdin."
+            ),
+            zh_cn=(
+                "请先修正 managed-file 输入源选择，再用一个明确的 --type，"
+                "并在 --source-file 或 --stdin 中二选一重试 write。"
+            ),
+        )
     if _is_rolling_summary_json_builder(details):
         if input_mode == "json-file":
             return _localized_text(
@@ -694,6 +752,17 @@ def _invalid_prepared_input_recovery_action(
     details: dict | None,
 ) -> str | None:
     helper_name = _normalize_script_name(script_name) or "append_daily_log_entry.py"
+    command = details.get("command") if isinstance(details, dict) else None
+    operation = details.get("operation") if isinstance(details, dict) else None
+    if (
+        helper_name == "repair_daily_log_cursor.py"
+        or command == "repair-daily-log-cursor"
+        or operation == "repair_daily_log_cursor"
+    ):
+        return (
+            "Fix the repair cursor arguments, then re-run recallloom.py "
+            "repair-daily-log-cursor <project-path> --json."
+        )
     input_mode = _prepared_input_mode(details)
     if _is_rolling_summary_json_builder(details):
         source_path = details.get("source_path") if details else None
@@ -847,6 +916,53 @@ def _public_failure_error(error: str | None, details: dict | None) -> str | None
     return redact_public_text(public_error, project_root=project_root, private=False)
 
 
+def _is_archive_before_date_invalid(details: dict | None) -> bool:
+    if not isinstance(details, dict):
+        return False
+    if details.get("reason_code") == "archive_before_date_invalid":
+        return True
+    return details.get("operation") == "daily_log_archive" and "before" in details
+
+
+def _archive_before_invalid_value(details: dict | None) -> str | None:
+    if not _is_archive_before_date_invalid(details):
+        return None
+    for key in ("invalid_value", "before"):
+        value = details.get(key) if isinstance(details, dict) else None
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _archive_before_recovery_command(details: dict | None) -> str:
+    return _script_command(
+        "archive_logs.py",
+        _dispatcher_project_arg(details),
+        "--before",
+        "<valid-before-date>",
+        "--json",
+    )
+
+
+def _archive_before_single_next_command(details: dict | None) -> str:
+    return (
+        f"archive_logs.py {_dispatcher_project_arg(details)} "
+        "--before <valid-before-date> --json"
+    )
+
+
+def _augment_archive_before_details(reason: str, details: dict | None) -> None:
+    if reason != "invalid_date" or not isinstance(details, dict):
+        return
+    invalid_value = _archive_before_invalid_value(details)
+    if invalid_value is None:
+        return
+    details.setdefault("invalid_value", invalid_value)
+    details.setdefault("argument", "--before")
+    details.setdefault("expected_format", "YYYY-MM-DD")
+    details.setdefault("replacement_placeholder", "<valid-before-date>")
+
+
 def _python_runtime_stage(error: str | None) -> str:
     lowered = (error or "").casefold()
     bootstrap_markers = (
@@ -957,6 +1073,31 @@ def _failure_suggestion(
             language,
             en="Review update_protocol.md and confirm the intended date before writing again.",
             zh_cn="请先检查 update_protocol.md，并确认目标日期后再继续写入。",
+        )
+    if reason == "invalid_date" and _is_archive_before_date_invalid(details):
+        invalid_value = _archive_before_invalid_value(details)
+        if invalid_value is not None:
+            return _localized_text(
+                language,
+                en=(
+                    f"Replace the invalid --before value {invalid_value!r} with a YYYY-MM-DD "
+                    "date, then rerun archive_logs.py with --before <valid-before-date>."
+                ),
+                zh_cn=(
+                    f"请把无效的 --before 值 {invalid_value!r} 替换为 YYYY-MM-DD 日期，"
+                    "再使用 archive_logs.py --before <valid-before-date> 重试。"
+                ),
+            )
+        return _localized_text(
+            language,
+            en=(
+                "Replace the invalid --before value with a YYYY-MM-DD date, then rerun "
+                "archive_logs.py with --before <valid-before-date>."
+            ),
+            zh_cn=(
+                "请把无效的 --before 值替换为 YYYY-MM-DD 日期，"
+                "再使用 archive_logs.py --before <valid-before-date> 重试。"
+            ),
         )
     if reason == "invalid_prepared_input":
         return _invalid_prepared_input_suggestion(language, details)
@@ -1098,6 +1239,14 @@ def _failure_recovery_command(
     if reason == "attach_scan_blocked":
         return "Edit the prepared text to remove blocked content, then rerun the same helper command."
     if reason == "invalid_date":
+        command = details.get("command") if details else None
+        operation = details.get("operation") if details else None
+        if (
+            command == "archive"
+            or operation == "daily_log_archive"
+            or _is_archive_before_date_invalid(details)
+        ):
+            return _archive_before_recovery_command(details)
         return _script_command(script_name, project_arg, "--date", "YYYY-MM-DD", "--json")
     if reason == "invalid_tool_name":
         return _script_command(script_name, project_arg, "--writer-id", "RecallLoom", "--json")
@@ -1116,6 +1265,28 @@ def _failure_recovery_command(
             return _script_command("unlock_write_lock.py", project_arg, "--json")
         return "Wait for the active writer to finish, then rerun the helper after the lock clears."
     if reason == "invalid_prepared_input":
+        command = details.get("command") if details else None
+        operation = details.get("operation") if details else None
+        if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
+            return (
+                "Fix the reviewed rolling-summary JSON payload on stdin, then rerun "
+                "recallloom.py sync-current-state-after-append <project-path> "
+                "--stdin --input-format json --json."
+            )
+        if command == "archive" or operation == "daily_log_archive":
+            return (
+                "Fix the archive arguments, then rerun archive_logs.py <project-path> "
+                "--max-active <non-negative-count> --json."
+            )
+        if command == "write" or operation == "managed_file_commit":
+            write_type = details.get("write_type") if details else None
+            if not isinstance(write_type, str) or not write_type.strip():
+                write_type = "current-state"
+            return (
+                f"Fix the prepared managed-file input, then rerun recallloom.py write "
+                f"<project-path> --type {write_type} --source-file <prepared-file> "
+                "--dry-run --json."
+            )
         if _is_rolling_summary_json_builder(details):
             source_action = _invalid_prepared_input_recovery_action(script_name, details)
             if source_action is not None:
@@ -1180,6 +1351,276 @@ def _failure_recovery_command(
     return "Review the error details, fix the blocking issue, and rerun the same helper command."
 
 
+def _dispatcher_project_arg(details: dict | None) -> str:
+    return "<project-path>"
+
+
+_SAFE_ROUTING_COMMANDS = {
+    "append",
+    "archive",
+    "bridge",
+    "init",
+    "quick-summary",
+    "repair-daily-log-cursor",
+    "resume",
+    "status",
+    "sync-current-state-after-append",
+    "validate",
+    "write",
+}
+_SAFE_ROUTING_OPERATIONS = {
+    "daily_log_append",
+    "daily_log_archive",
+    "managed_file_commit",
+    "package_support_gate",
+    "post_append_summary_sync",
+    "repair_daily_log_cursor",
+}
+_SAFE_ROUTING_INPUT_MODES = {
+    "ambiguous",
+    "file",
+    "json-file",
+    "json-stdin",
+    "json-string",
+    "missing",
+    "stdin",
+}
+_SAFE_ROUTING_INPUT_FORMATS = {"auto", "json", "markdown"}
+_SAFE_ROUTING_FILE_KEYS = {"context_brief", "daily_log", "rolling_summary", "update_protocol"}
+_SAFE_ROUTING_WRITE_TYPES = {"current-state", "protocol-rules", "stable-context"}
+_SAFE_ROUTING_PREPARED_BUILDERS = {"rolling_summary_json"}
+_SAFE_ROUTING_SIDE_EFFECTS = {"none", "partial", "write_attempted", "unknown"}
+_SAFE_ROUTING_REASON_CODES = {
+    "all_sections_empty",
+    "archive_before_date_invalid",
+    "archive_input_invalid",
+    "archive_max_active_invalid",
+    "both_input_sources",
+    "empty_section_list",
+    "empty_section_list_item",
+    "empty_section_string",
+    "invalid_section_list_item_type",
+    "invalid_section_value_type",
+    "malformed_json",
+    "missing_input_source",
+    "missing_section_key",
+    "missing_write_type",
+    "reserved_marker_injection",
+    "source_selection_invalid",
+    "source_file_not_supported",
+    "stdin_required",
+    "top_level_not_object",
+    "unknown_section_key",
+    "unsupported_write_type",
+    "write_argument_invalid",
+    "json_input_requires_current_state",
+}
+
+
+def _safe_enum_value(value: object, allowed: set[str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped if stripped in allowed else None
+
+
+def _safe_command_value(value: object) -> str | None:
+    direct = _safe_enum_value(value, _SAFE_ROUTING_COMMANDS)
+    if direct is not None:
+        return direct
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        tokens = value.split()
+    for token in tokens:
+        candidate = Path(token).name.strip()
+        if candidate in _SAFE_ROUTING_COMMANDS:
+            return candidate
+    return None
+
+
+def _failure_routing_details(details: dict | None) -> dict | None:
+    if not isinstance(details, dict):
+        return None
+    routed: dict[str, str] = {}
+    command = _safe_command_value(details.get("command"))
+    if command is not None:
+        routed["command"] = command
+    safe_fields = {
+        "operation": _SAFE_ROUTING_OPERATIONS,
+        "input_mode": _SAFE_ROUTING_INPUT_MODES,
+        "input_format": _SAFE_ROUTING_INPUT_FORMATS,
+        "file_key": _SAFE_ROUTING_FILE_KEYS,
+        "write_type": _SAFE_ROUTING_WRITE_TYPES,
+        "prepared_input_builder": _SAFE_ROUTING_PREPARED_BUILDERS,
+        "side_effect": _SAFE_ROUTING_SIDE_EFFECTS,
+        "reason_code": _SAFE_ROUTING_REASON_CODES,
+        "section_key": ROLLING_SUMMARY_JSON_SECTION_KEYS,
+    }
+    for key, allowed in safe_fields.items():
+        value = _safe_enum_value(details.get(key), allowed)
+        if value is not None:
+            routed[key] = value
+    return routed or None
+
+
+def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
+    project_arg = _dispatcher_project_arg(details)
+    command = details.get("command") if isinstance(details, dict) else None
+    operation = details.get("operation") if isinstance(details, dict) else None
+    if command == "repair-daily-log-cursor" or operation == "repair_daily_log_cursor":
+        return f"recallloom.py repair-daily-log-cursor {project_arg} --json"
+    if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
+        return (
+            f"recallloom.py sync-current-state-after-append {project_arg} "
+            "--stdin --input-format json --json"
+        )
+    if command == "archive" or operation == "daily_log_archive":
+        return f"archive_logs.py {project_arg} --max-active <non-negative-count> --json"
+    input_mode = _prepared_input_mode(details)
+    if _is_rolling_summary_json_builder(details):
+        if input_mode == "json-file":
+            return (
+                f"recallloom.py write {project_arg} --type current-state "
+                "--source-file <rolling-summary.json> --input-format json --dry-run --json"
+            )
+        return (
+            f"recallloom.py write {project_arg} --type current-state "
+            "--stdin --input-format json --dry-run --json"
+        )
+    managed_markdown_route = _managed_markdown_write_route(details)
+    if managed_markdown_route is not None:
+        write_type = managed_markdown_route["write_type"]
+        source_placeholder = managed_markdown_route["source_placeholder"]
+        if input_mode == "stdin":
+            return (
+                f"recallloom.py write {project_arg} --type {write_type} "
+                "--stdin --dry-run --json"
+            )
+        return (
+            f"recallloom.py write {project_arg} --type {write_type} "
+            f"--source-file {source_placeholder} --dry-run --json"
+        )
+    command = details.get("command") if isinstance(details, dict) else None
+    if command == "write":
+        write_type = details.get("write_type") if isinstance(details, dict) else None
+        if not isinstance(write_type, str) or not write_type.strip():
+            write_type = "current-state"
+        return (
+            f"recallloom.py write {project_arg} --type {write_type} "
+            "--source-file <prepared-file> --dry-run --json"
+        )
+    if command == "append":
+        return (
+            f"recallloom.py append {project_arg} "
+            + " ".join(_append_placeholder_args(details))
+            + " --json"
+        )
+    if input_mode == "json-string":
+        return f"recallloom.py append {project_arg} --entry-json '<prepared-entry-json>' --json"
+    if input_mode == "json-stdin":
+        return f"recallloom.py append {project_arg} --stdin --input-format json --json"
+    if input_mode == "json-file":
+        return (
+            f"recallloom.py append {project_arg} --entry-file <entry.json> "
+            "--input-format json --json"
+        )
+    if input_mode == "stdin":
+        return f"recallloom.py append {project_arg} --stdin --json"
+    return f"recallloom.py append {project_arg} --entry-file <prepared-entry.md> --json"
+
+
+def _single_next_for_confirmation_required(details: dict | None) -> str:
+    project_arg = _dispatcher_project_arg(details)
+    command = details.get("command") if isinstance(details, dict) else None
+    if command == "append":
+        return (
+            f"recallloom.py append {project_arg} "
+            + " ".join(_append_placeholder_args(details))
+            + " "
+            "--confirm-review-imported-baseline --json"
+        )
+    if command == "sync-current-state-after-append":
+        return (
+            f"recallloom.py sync-current-state-after-append {project_arg} "
+            "--stdin --input-format json --confirm-review-imported-baseline --json"
+        )
+    return (
+        f"recallloom.py write {project_arg} --type current-state "
+        "--source-file <prepared-file> --confirm-review-imported-baseline --json"
+    )
+
+
+def _failure_single_next_command(
+    reason: str,
+    *,
+    details: dict | None,
+) -> str:
+    project_arg = _dispatcher_project_arg(details)
+    command = details.get("command") if isinstance(details, dict) else None
+    operation = details.get("operation") if isinstance(details, dict) else None
+    if reason in {"not_project_root", "no_project_root", "invalid_storage_boundary"}:
+        return f"recallloom.py init {project_arg} --json"
+    if reason in {"damaged_sidecar", "dual_sidecar_conflict", "malformed_managed_file"}:
+        return f"recallloom.py validate {project_arg} --json"
+    if reason == "invalid_date":
+        if (
+            command == "archive"
+            or operation == "daily_log_archive"
+            or _is_archive_before_date_invalid(details)
+        ):
+            return _archive_before_single_next_command(details)
+        return f"recallloom.py status {project_arg} --json"
+    if reason == "invalid_prepared_input":
+        return _single_next_for_invalid_prepared_input(details)
+    if reason == "stale_write_context":
+        return f"recallloom.py status {project_arg} --json"
+    if reason == "trust_review_required":
+        return f"recallloom.py validate {project_arg} --json"
+    if reason == "review_imported_baseline_confirmation_required":
+        return _single_next_for_confirmation_required(details)
+    if reason == "continuity_drift_review_required":
+        return f"recallloom.py status {project_arg} --json"
+    if reason == "package_support_blocked":
+        return f"recallloom.py status {project_arg} --json"
+    if reason == "write_lock_busy":
+        return f"recallloom.py status {project_arg} --json"
+    if reason == "python_runtime_unavailable":
+        return f"recallloom.py status {project_arg} --json"
+    return f"recallloom.py status {project_arg} --json"
+
+
+def _explicit_side_effect(payload: dict, details: dict | None) -> str | None:
+    side_effect = payload.get("side_effect")
+    if isinstance(side_effect, str) and side_effect.strip():
+        return side_effect
+    if isinstance(details, dict):
+        side_effect = details.get("side_effect")
+        if isinstance(side_effect, str) and side_effect.strip():
+            return side_effect
+    return None
+
+
+def _apply_additive_failure_fields(
+    payload: dict,
+    *,
+    reason: str,
+    details: dict | None,
+) -> None:
+    side_effect = _explicit_side_effect(payload, details)
+    if side_effect is not None:
+        payload.setdefault("side_effect", side_effect)
+    payload["single_next_command"] = _failure_single_next_command(reason, details=details)
+    payload["safe_to_retry"] = (
+        side_effect == "none"
+        and payload.get("trust_effect") == "none"
+    )
+    if reason == "invalid_date" and _is_archive_before_date_invalid(details):
+        payload["next_actions"] = ["replace_invalid_before_date", "retry_archive"]
+
+
 def preferred_failure_language(env: dict[str, str] | None = None) -> str:
     env = env or os.environ
     lang = env.get("LC_ALL") or env.get("LC_MESSAGES") or env.get("LANG") or ""
@@ -1211,6 +1652,8 @@ def failure_payload(
     contract = failure_reason_contract(normalized_reason)
     normalized_script_name = _normalize_script_name(script_name)
     normalized_details = _public_failure_details(details)
+    _augment_archive_before_details(normalized_reason, normalized_details)
+    routing_details = _failure_routing_details(details)
     normalized_error = _public_failure_error(error, details)
     payload = {
         "ok": False,
@@ -1273,9 +1716,19 @@ def failure_payload(
             error=error,
             details=normalized_details,
         )
+    _apply_additive_failure_fields(
+        payload,
+        reason=normalized_reason,
+        details=routing_details,
+    )
     publicized_payload = publicize_json_value(
         payload,
         project_root=_infer_project_root(details) or (details or {}).get("project_root"),
         private=private_json_paths_enabled(),
     )
+    if isinstance(publicized_payload, dict):
+        public_details = publicized_payload.get("details")
+        safe_command = _safe_command_value((details or {}).get("command"))
+        if isinstance(public_details, dict) and safe_command is not None:
+            public_details["command"] = safe_command
     return publicized_payload if isinstance(publicized_payload, dict) else payload

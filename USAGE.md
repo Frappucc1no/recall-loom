@@ -17,7 +17,8 @@ the installed skill, and native wrappers:
 - `rl-init`, `rl-resume`, `rl-status`, and `rl-validate` are stable operator
   action names
 - `init`, `resume`, `status`, `validate`, `quick-summary`, `append`, `write`,
-  `sync-current-state-after-append`, and `bridge` are dispatcher subcommands
+  `sync-current-state-after-append`, `repair-daily-log-cursor`, and `bridge`
+  are dispatcher subcommands
 - native wrappers are convenience entrypoints only
 - the package does not promise a second logic set in bridge files or wrapper
   text
@@ -83,6 +84,7 @@ The dispatcher command surface includes:
 - `append`
 - `write`
 - `sync-current-state-after-append`
+- `repair-daily-log-cursor`
 - `bridge`
 
 Typical use:
@@ -95,8 +97,15 @@ python skills/recallloom/scripts/recallloom.py quick-summary /absolute/path/to/p
 python skills/recallloom/scripts/recallloom.py append /absolute/path/to/project --entry-json '{"work_completed":"Recorded the milestone.","confirmed_facts":"The prepared entry was reviewed before append.","key_decisions":"Keep the entry scoped to current work.","risks_blockers":"None.","recommended_next_step":"Continue from the refreshed summary."}' --json
 python skills/recallloom/scripts/recallloom.py write /absolute/path/to/project --type current-state --source-file /absolute/path/to/prepared-current-state.md --dry-run --json
 python skills/recallloom/scripts/recallloom.py sync-current-state-after-append /absolute/path/to/project --stdin --input-format json --json
+python skills/recallloom/scripts/recallloom.py repair-daily-log-cursor /absolute/path/to/project --json
+python skills/recallloom/scripts/recallloom.py repair-daily-log-cursor /absolute/path/to/project --apply --yes --expected-workspace-revision 12 --json
 python skills/recallloom/scripts/recallloom.py bridge /absolute/path/to/project --file AGENTS.md --yes
 ```
+
+`repair-daily-log-cursor` previews by default. Use apply mode only after
+reviewing the preview and confirming the current `workspace_revision`; apply
+repairs `state.json.daily_logs` from the parsed latest active daily log and
+does not create helper receipts or rewrite daily-log content.
 
 ## Native Wrappers
 
@@ -135,6 +144,7 @@ formal write.
 - `commit_context_file.py`
 - `archive_logs.py`
 - `manage_entry_bridge.py`
+- `repair_daily_log_cursor.py`
 
 Use the concrete helper scripts for managed sidecar writes. Preserve revision
 checks and the shared failure contract.

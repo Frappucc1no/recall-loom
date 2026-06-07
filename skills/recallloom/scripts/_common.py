@@ -1259,10 +1259,60 @@ class ValidationFinding:
     path: Path
 
 
+@dataclass(frozen=True)
+class DailyLogCursor:
+    latest_file: str | None
+    latest_entry_id: str | None
+    latest_entry_seq: int | None
+    entry_count: int
+    latest_path: Path | None = None
+
+    def as_state_fields(self) -> dict[str, object]:
+        return {
+            "latest_file": self.latest_file,
+            "latest_entry_id": self.latest_entry_id,
+            "latest_entry_seq": self.latest_entry_seq,
+            "entry_count": self.entry_count,
+        }
+
+
+DAILY_LOG_CURSOR_STATE_KEYS = (
+    "latest_file",
+    "latest_entry_id",
+    "latest_entry_seq",
+    "entry_count",
+)
+
+
 StorageResolutionError = core_errors.StorageResolutionError
 ConfigContractError = core_errors.ConfigContractError
 EnvironmentContractError = core_errors.EnvironmentContractError
 LockBusyError = core_errors.LockBusyError
+
+
+class DailyLogCursorError(Exception):
+    """Structured refusal for damaged latest daily-log cursor evidence."""
+
+    failure_reason = "malformed_managed_file"
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        message: str,
+        path: Path | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.path = path
+        self.details = {
+            "reason_code": reason_code,
+            "side_effect": "none",
+            **(details or {}),
+        }
+        if path is not None:
+            self.details.setdefault("path", str(path))
 
 
 class ManagedDirectorySafetyError(Exception):
@@ -1500,6 +1550,28 @@ def exit_with_cli_error(
             body.update(payload)
         project_root = body.get("project_root") if isinstance(body.get("project_root"), str) else None
         public_body = publicize_json_value(body, project_root=project_root)
+        if isinstance(public_body, dict) and isinstance(payload, dict):
+            raw_details = payload.get("details")
+            public_details = public_body.get("details")
+            raw_command = raw_details.get("command") if isinstance(raw_details, dict) else None
+            if (
+                isinstance(public_details, dict)
+                and isinstance(raw_command, str)
+                and raw_command in {
+                    "append",
+                    "archive",
+                    "bridge",
+                    "init",
+                    "quick-summary",
+                    "repair-daily-log-cursor",
+                    "resume",
+                    "status",
+                    "sync-current-state-after-append",
+                    "validate",
+                    "write",
+                }
+            ):
+                public_details["command"] = raw_command
         print(json.dumps(public_body if isinstance(public_body, dict) else body, ensure_ascii=False, indent=2))
         raise SystemExit(exit_code)
     public_message = shared_redact_public_text(message, project_root=None) or message
@@ -1608,13 +1680,21 @@ def _public_package_support_update_hints(value: object) -> dict:
     if not isinstance(value, dict):
         return {}
     public: dict[str, str] = {}
+    safe_hint_fallbacks = {
+        "directory_install": (
+            "Replace the installed RecallLoom skill directory with the latest package copy."
+        ),
+    }
     for raw_key, raw_hint in value.items():
         if not isinstance(raw_key, str):
             continue
         key = raw_key.strip()
         if not PACKAGE_SUPPORT_PUBLIC_HINT_KEY_RE.match(key):
             continue
-        public[key] = _public_package_support_text(raw_hint, fallback="redacted")
+        public[key] = _public_package_support_text(
+            raw_hint,
+            fallback=safe_hint_fallbacks.get(key, "redacted"),
+        )
     return public
 
 
@@ -1731,7 +1811,16 @@ def enforce_package_support_gate(
         payload=cli_failure_payload(
             "package_support_blocked",
             error=message,
-            details={"package_support": public_support},
+            details={
+                "operation": "package_support_gate",
+                "reason_code": (
+                    public_support.get("reason_code")
+                    if isinstance(public_support, dict)
+                    else None
+                ),
+                "side_effect": "none",
+                "package_support": public_support,
+            },
             extra={"package_support": public_support},
         ),
     )
@@ -1899,12 +1988,18 @@ def initial_workspace_state(
     tool_name: str,
     timestamp: str,
     git_exclude_mode: str,
+    daily_log_cursor: dict[str, object] | None = None,
 ) -> dict:
-    return workspace_runtime.initial_workspace_state(
+    state = workspace_runtime.initial_workspace_state(
         tool_name=tool_name,
         timestamp=timestamp,
         git_exclude_mode=git_exclude_mode,
     )
+    if daily_log_cursor is not None:
+        state["daily_logs"].update(
+            {key: daily_log_cursor.get(key) for key in DAILY_LOG_CURSOR_STATE_KEYS}
+        )
+    return state
 
 
 def load_workspace_state(path: Path) -> dict:
@@ -2260,12 +2355,17 @@ def daily_log_entries(text: str) -> list[DailyLogEntryInfo]:
     return entries
 
 
+def malformed_daily_log_entry_marker_lines(text: str) -> list[int]:
+    malformed: list[int] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        candidate = line.strip()
+        if candidate.startswith("<!-- daily-log-entry:") and parse_daily_log_entry_line(candidate) is None:
+            malformed.append(line_number)
+    return malformed
+
+
 def sorted_active_daily_log_files(logs_dir: Path) -> list[Path]:
-    active: list[Path] = []
-    for path in sorted_daily_log_files(logs_dir):
-        if daily_log_entries(read_text(path)):
-            active.append(path)
-    return active
+    return sorted_daily_log_files(logs_dir)
 
 
 def latest_active_daily_log(logs_dir: Path) -> Path | None:
@@ -2273,6 +2373,356 @@ def latest_active_daily_log(logs_dir: Path) -> Path | None:
     if not active:
         return None
     return active[-1]
+
+
+def _daily_log_cursor_sequence_error(
+    entries: list[DailyLogEntryInfo],
+    *,
+    path: Path,
+) -> DailyLogCursorError | None:
+    if not entries:
+        return None
+
+    sequences = [entry.entry_seq for entry in entries]
+    duplicate_sequences = sorted(
+        seq for seq in set(sequences) if sequences.count(seq) > 1
+    )
+    if duplicate_sequences:
+        return DailyLogCursorError(
+            reason_code="duplicate_daily_log_entry_sequence",
+            message=(
+                "Refusing to calculate the daily-log cursor because the latest active "
+                f"daily log has duplicate entry-seq values: {duplicate_sequences}."
+            ),
+            path=path,
+            details={
+                "duplicate_entry_seq": duplicate_sequences,
+                "actual_sequences": sequences,
+            },
+        )
+
+    entry_ids = [entry.entry_id for entry in entries]
+    duplicate_entry_ids = sorted(
+        entry_id for entry_id in set(entry_ids) if entry_ids.count(entry_id) > 1
+    )
+    if duplicate_entry_ids:
+        return DailyLogCursorError(
+            reason_code="duplicate_daily_log_entry_id",
+            message=(
+                "Refusing to calculate the daily-log cursor because the latest active "
+                f"daily log has duplicate entry ids: {duplicate_entry_ids}."
+            ),
+            path=path,
+            details={
+                "duplicate_entry_ids": duplicate_entry_ids,
+                "actual_entry_ids": entry_ids,
+            },
+        )
+
+    noncanonical_entry_ids = [
+        {
+            "entry_seq": entry.entry_seq,
+            "entry_id": entry.entry_id,
+            "expected_entry_id": f"entry-{entry.entry_seq}",
+        }
+        for entry in entries
+        if entry.entry_id != f"entry-{entry.entry_seq}"
+    ]
+    if noncanonical_entry_ids:
+        return DailyLogCursorError(
+            reason_code="noncanonical_daily_log_entry_id",
+            message=(
+                "Refusing to calculate the daily-log cursor because the latest active "
+                "daily log entry ids do not match their entry-seq values."
+            ),
+            path=path,
+            details={
+                "noncanonical_entry_ids": noncanonical_entry_ids,
+                "actual_entry_ids": entry_ids,
+                "actual_sequences": sequences,
+            },
+        )
+
+    expected = list(range(1, len(entries) + 1))
+    if sequences != expected:
+        reason_code = (
+            "out_of_order_daily_log_entry_sequence"
+            if sorted(sequences) == expected
+            else "noncontiguous_daily_log_entry_sequence"
+        )
+        return DailyLogCursorError(
+            reason_code=reason_code,
+            message=(
+                "Refusing to calculate the daily-log cursor because the latest active "
+                f"daily log entry sequence is not canonical. Expected {expected}, "
+                f"found {sequences}."
+            ),
+            path=path,
+            details={
+                "expected_sequences": expected,
+                "actual_sequences": sequences,
+            },
+        )
+    return None
+
+
+def daily_log_cursor_from_text(
+    text: str,
+    *,
+    path: Path,
+    latest_file: str | None,
+) -> DailyLogCursor:
+    file_marker_info = parse_file_marker(text)
+    if file_marker_info is None or file_marker_info.file_key != "daily_log":
+        raise DailyLogCursorError(
+            reason_code="malformed_latest_daily_log_file_marker",
+            message=(
+                "Refusing to calculate the daily-log cursor because the daily log is "
+                "missing the required daily_log file marker."
+            ),
+            path=path,
+            details={
+                "latest_file": latest_file,
+                "file_key": file_marker_info.file_key if file_marker_info else None,
+            },
+        )
+
+    malformed_lines = malformed_daily_log_entry_marker_lines(text)
+    if malformed_lines:
+        raise DailyLogCursorError(
+            reason_code="malformed_daily_log_entry_marker",
+            message=(
+                "Refusing to calculate the daily-log cursor because the daily log has "
+                f"malformed daily-log-entry markers on lines {malformed_lines}."
+            ),
+            path=path,
+            details={
+                "latest_file": latest_file,
+                "malformed_lines": malformed_lines,
+            },
+        )
+
+    entries = daily_log_entries(text)
+    scaffold = parse_daily_log_scaffold_marker(text)
+    if scaffold and entries:
+        raise DailyLogCursorError(
+            reason_code="scaffold_daily_log_has_entries",
+            message=(
+                "Refusing to calculate the daily-log cursor because the daily log has "
+                "both a scaffold marker and entry markers."
+            ),
+            path=path,
+            details={"latest_file": latest_file},
+        )
+    if not entries:
+        if not scaffold:
+            raise DailyLogCursorError(
+                reason_code="missing_daily_log_entry_marker",
+                message=(
+                    "Refusing to calculate the daily-log cursor because the daily log has "
+                    "no entry markers and is not an empty scaffold."
+                ),
+                path=path,
+                details={"latest_file": latest_file},
+            )
+        return DailyLogCursor(
+            latest_file=latest_file,
+            latest_entry_id=None,
+            latest_entry_seq=None,
+            entry_count=0,
+            latest_path=path,
+        )
+
+    sequence_error = _daily_log_cursor_sequence_error(entries, path=path)
+    if sequence_error is not None:
+        raise sequence_error
+
+    latest_entry_seq = entries[-1].entry_seq
+    return DailyLogCursor(
+        latest_file=latest_file,
+        latest_entry_id=f"entry-{latest_entry_seq}",
+        latest_entry_seq=latest_entry_seq,
+        entry_count=len(entries),
+        latest_path=path,
+    )
+
+
+def latest_active_daily_log_cursor(storage_root: Path) -> DailyLogCursor:
+    logs_dir = storage_root / DAILY_LOGS_DIRNAME
+    latest_path = latest_active_daily_log(logs_dir)
+    if latest_path is None:
+        return DailyLogCursor(
+            latest_file=None,
+            latest_entry_id=None,
+            latest_entry_seq=0,
+            entry_count=0,
+            latest_path=None,
+        )
+
+    latest_file = latest_path.relative_to(storage_root).as_posix()
+    try:
+        text = read_text(latest_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DailyLogCursorError(
+            reason_code="unreadable_latest_daily_log",
+            message=f"Could not read latest active daily log {latest_path}: {exc}",
+            path=latest_path,
+        ) from exc
+
+    return daily_log_cursor_from_text(
+        text,
+        path=latest_path,
+        latest_file=latest_file,
+    )
+
+
+def state_claims_entry_bearing_latest_daily_log(state: dict) -> bool:
+    daily_logs = state.get("daily_logs")
+    if not isinstance(daily_logs, dict):
+        return False
+    entry_count = daily_logs.get("entry_count")
+    return isinstance(entry_count, int) and not isinstance(entry_count, bool) and entry_count > 0
+
+
+def validate_state_entry_bearing_latest_daily_log(
+    *,
+    storage_root: Path,
+    state: dict,
+) -> DailyLogCursor | None:
+    if not state_claims_entry_bearing_latest_daily_log(state):
+        return None
+
+    daily_logs = state.get("daily_logs")
+    if not isinstance(daily_logs, dict):
+        raise DailyLogCursorError(
+            reason_code="state_daily_logs_missing",
+            message=(
+                "Refusing to treat continuity as seeded because state.json does not "
+                "contain a valid daily_logs cursor object."
+            ),
+        )
+
+    latest_file = daily_logs.get("latest_file")
+    if not isinstance(latest_file, str) or not latest_file.strip():
+        raise DailyLogCursorError(
+            reason_code="state_latest_daily_log_missing",
+            message=(
+                "Refusing to treat continuity as seeded because state.json claims "
+                "daily-log entries but does not name a latest daily log."
+            ),
+            details=daily_log_cursor_state_fields(daily_logs),
+        )
+
+    latest_path = storage_root / latest_file
+    try:
+        text = read_text(latest_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise DailyLogCursorError(
+            reason_code="unreadable_latest_daily_log",
+            message=f"Could not read latest daily log named by state.json {latest_path}: {exc}",
+            path=latest_path,
+            details={
+                "latest_file": latest_file,
+                **daily_log_cursor_state_fields(daily_logs),
+            },
+        ) from exc
+
+    cursor = daily_log_cursor_from_text(text, path=latest_path, latest_file=latest_file)
+    if cursor.entry_count <= 0:
+        raise DailyLogCursorError(
+            reason_code="state_entry_bearing_daily_log_has_no_entries",
+            message=(
+                "Refusing to treat continuity as seeded because state.json claims "
+                "daily-log entries but the latest daily log parsed as an empty scaffold."
+            ),
+            path=latest_path,
+            details={
+                "latest_file": latest_file,
+                "state_cursor": daily_log_cursor_state_fields(daily_logs),
+                "parsed_cursor": cursor.as_state_fields(),
+            },
+        )
+
+    state_cursor = daily_log_cursor_state_fields(daily_logs)
+    parsed_cursor = cursor.as_state_fields()
+    if not daily_log_cursors_equivalent(state_cursor, parsed_cursor, actual_cursor=parsed_cursor):
+        raise DailyLogCursorError(
+            reason_code="state_daily_log_cursor_mismatch",
+            message=(
+                "Refusing to treat continuity as seeded because state.json daily-log "
+                "cursor fields do not match the strictly parsed latest daily log."
+            ),
+            path=latest_path,
+            details={
+                "latest_file": latest_file,
+                "state_cursor": state_cursor,
+                "parsed_cursor": parsed_cursor,
+            },
+        )
+
+    return cursor
+
+
+def daily_log_cursor_state_fields(state_or_daily_logs: dict) -> dict[str, object]:
+    daily_logs = state_or_daily_logs.get("daily_logs")
+    if not isinstance(daily_logs, dict):
+        daily_logs = state_or_daily_logs
+    return {key: daily_logs.get(key) for key in DAILY_LOG_CURSOR_STATE_KEYS}
+
+
+def daily_log_cursor_is_legacy_empty(cursor: dict[str, object]) -> bool:
+    return (
+        cursor.get("latest_file") is None
+        and cursor.get("latest_entry_id") is None
+        and cursor.get("latest_entry_seq") in {0, None}
+        and cursor.get("entry_count") == 0
+    )
+
+
+def daily_log_cursor_is_empty_scaffold(cursor: dict[str, object]) -> bool:
+    latest_file = cursor.get("latest_file")
+    return (
+        isinstance(latest_file, str)
+        and bool(latest_file)
+        and cursor.get("latest_entry_id") is None
+        and cursor.get("latest_entry_seq") in {0, None}
+        and cursor.get("entry_count") == 0
+    )
+
+
+def daily_log_cursor_matches_empty_scaffold(
+    cursor: dict[str, object],
+    *,
+    scaffold_latest_file: str,
+) -> bool:
+    if daily_log_cursor_is_legacy_empty(cursor):
+        return True
+    return (
+        daily_log_cursor_is_empty_scaffold(cursor)
+        and cursor.get("latest_file") == scaffold_latest_file
+    )
+
+
+def daily_log_cursors_equivalent(
+    left: dict[str, object],
+    right: dict[str, object],
+    *,
+    actual_cursor: dict[str, object] | None = None,
+) -> bool:
+    if left == right:
+        return True
+    if actual_cursor is None or not daily_log_cursor_is_empty_scaffold(actual_cursor):
+        return False
+    scaffold_latest_file = actual_cursor.get("latest_file")
+    if not isinstance(scaffold_latest_file, str) or not scaffold_latest_file:
+        return False
+    return daily_log_cursor_matches_empty_scaffold(
+        left,
+        scaffold_latest_file=scaffold_latest_file,
+    ) and daily_log_cursor_matches_empty_scaffold(
+        right,
+        scaffold_latest_file=scaffold_latest_file,
+    )
 
 
 def continuity_confidence_level(
@@ -2337,6 +2787,7 @@ def evaluate_continuity_freshness(
     summary_base_workspace_revision: int,
     latest_daily_log_exists: bool,
     scan_mode: str = "quick",
+    state: dict | None = None,
 ) -> dict:
     return continuity_freshness.evaluate_continuity_freshness(
         project_root=project_root,
@@ -2346,6 +2797,7 @@ def evaluate_continuity_freshness(
         summary_base_workspace_revision=summary_base_workspace_revision,
         latest_daily_log_exists=latest_daily_log_exists,
         scan_mode=scan_mode,
+        state=state,
     )
 
 
@@ -2356,6 +2808,17 @@ def daily_log_sequence_error(entries: list[DailyLogEntryInfo]) -> str | None:
     actual = [entry.entry_seq for entry in entries]
     if actual != expected:
         return f"Expected contiguous entry_seq values {expected}, found {actual}."
+    noncanonical = [
+        f"{entry.entry_id} for entry_seq {entry.entry_seq}"
+        for entry in entries
+        if entry.entry_id != f"entry-{entry.entry_seq}"
+    ]
+    if noncanonical:
+        return (
+            "Expected canonical entry ids matching entry_seq values, found "
+            + ", ".join(noncanonical)
+            + "."
+        )
     return None
 
 
