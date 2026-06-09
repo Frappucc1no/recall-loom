@@ -1,6 +1,6 @@
 # RecallLoom Entry Index
 
-This file is the full repository map for RecallLoom v0.4.4.
+This file is the full repository map for RecallLoom v0.4.5.
 Start with the short README front doors:
 
 - [README.md](./README.md)

@@ -60,19 +60,18 @@ def now_iso_timestamp() -> str:
 
 
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return path.read_bytes().decode("utf-8")
 
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
+        "wb",
         dir=path.parent,
         prefix=f".{path.name}.tmp-",
         delete=False,
     ) as handle:
-        handle.write(text)
+        handle.write(text.encode("utf-8"))
         handle.flush()
         os.fsync(handle.fileno())
         temp_path = Path(handle.name)
@@ -855,7 +854,7 @@ def ensure_git_exclude_entry(project_root: Path, entry: str = f"{CONTEXT_DIRNAME
         protocol_contracts.EXCLUDE_BLOCK_END,
     ]
     if exclude_path.exists():
-        current = exclude_path.read_text(encoding="utf-8")
+        current = read_text(exclude_path)
         ok, reason = bridge_blocks.exclude_block_integrity(current)
         if not ok:
             detail_map = {
@@ -887,7 +886,7 @@ def remove_git_exclude_block(project_root: Path) -> bool:
     if not exclude_path.exists():
         return False
 
-    current = exclude_path.read_text(encoding="utf-8")
+    current = read_text(exclude_path)
     ok, reason = bridge_blocks.exclude_block_integrity(current)
     if not ok:
         detail_map = {

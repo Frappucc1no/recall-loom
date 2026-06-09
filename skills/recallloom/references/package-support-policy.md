@@ -38,7 +38,7 @@ The current advisory shape is:
 
 ```json
 {
-  "latest_version": "0.4.4",
+  "latest_version": "0.4.5",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
   "advisory_level": "supported",

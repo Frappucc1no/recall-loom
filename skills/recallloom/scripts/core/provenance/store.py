@@ -325,14 +325,13 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
+            "wb",
             dir=path.parent,
             prefix=f".{path.name}.tmp-",
             delete=False,
         ) as handle:
             temp_path = Path(handle.name)
-            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.write((json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)

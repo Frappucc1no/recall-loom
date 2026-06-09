@@ -12,7 +12,7 @@
 
 <p>RecallLoom 是给 AI 协作使用的文件化项目记忆层：把背景、进展、关键决策和下一步保存到项目旁边/项目内的 Markdown / JSON 文件里，不需要数据库、RAG 或后台服务。换会话、换模型、换工具，下一次 AI 协作更容易接上当前状态。</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.4-111827?style=flat-square)](./docs/releases/v0.4.4.md)
+[![Version](https://img.shields.io/badge/version-v0.4.5-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- 包版本：`0.4.4`
+- 包版本：`0.4.5`
 - 协议版本：`1.0`
 - 当前支持的协议版本：
   - `1.0`
@@ -309,6 +309,7 @@ RecallLoom 的工程原则很简单：项目事实留在项目里，AI 工具只
 
 | 版本 | 重点更新 | 对用户的价值 |
 |---|---|---|
+| `v0.4.5` | Windows stdin / CRLF 换行修复；managed text 写入使用显式 LF，receipt post-hash 读回保留真实 bytes 差异 | PowerShell / Windows 管道输入不再因平台换行转换触发 post-hash mismatch；已有 blocked workspace 仍需按恢复边界处理 |
 | `v0.4.4` | daily-log cursor 修复、空 scaffold / legacy 无日志兼容、失败 UX 与 provenance guard 加固 | 可先预览再显式修复 cursor，不必手写 `state.json`；恢复、归档和读取路径对 daily-log 解析更一致 |
 | `v0.4.3` | 恢复导入输入通道 hotfix；recovery proposal / review helpers 支持 `--stdin`，文件输入继续保持安全拦截 | 旧项目记忆需要 review import 时，可以走标准恢复链路，不必绕过 helper 或手写 sidecar 文件 |
 | `v0.4.2` | 本地 provenance 核心、helper receipt 绑定、写入前新鲜度检查、显式 provenance 验证 lane 和非侵入式 UX gate | 让受控项目记忆写入更可追溯，降低篡改/陈旧状态被误当作可信当前状态的风险，同时保持协议兼容 |

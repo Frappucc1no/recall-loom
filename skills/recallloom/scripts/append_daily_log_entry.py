@@ -60,6 +60,7 @@ from _common import (
     EnvironmentContractError,
     LockBusyError,
     StorageResolutionError,
+    canonicalize_managed_text_newlines,
     daily_log_cursors_equivalent,
     daily_log_cursor_from_text,
     daily_log_cursor_is_legacy_empty,
@@ -1256,7 +1257,7 @@ def normalize_json_section_value(
     recovery_details: dict | None = None,
 ) -> str:
     if isinstance(value, str):
-        normalized = value.strip()
+        normalized = canonicalize_managed_text_newlines(value.strip())
         if normalized:
             reject_json_reserved_markers(
                 parser,
@@ -1306,7 +1307,7 @@ def normalize_json_section_value(
                     expected_type="non_empty_string",
                     reason_code="invalid_section_list_item_type",
                 )
-            normalized_item = item.strip()
+            normalized_item = canonicalize_managed_text_newlines(item.strip())
             if not normalized_item:
                 invalid_json_section_value(
                     parser,
@@ -1494,7 +1495,7 @@ def prepare_entry_text(
             input_mode,
         )
 
-    return raw_text, source_kind
+    return canonicalize_managed_text_newlines(raw_text), source_kind
 
 
 def build_entry_block(body_text: str, *, writer_id: str, entry_seq: int) -> str:
@@ -1504,7 +1505,7 @@ def build_entry_block(body_text: str, *, writer_id: str, entry_seq: int) -> str:
         writer_id=writer_id,
         entry_seq=entry_seq,
     )
-    body = body_text.strip("\n")
+    body = canonicalize_managed_text_newlines(body_text).strip("\n")
     return marker if not body else marker + "\n\n" + body
 
 
@@ -2153,13 +2154,14 @@ def main() -> None:
                         details=exc.details,
                     )
                 next_seq = target_cursor.entry_count + 1
-                scaffold = parse_daily_log_scaffold_marker(current_text)
+                managed_current_text = canonicalize_managed_text_newlines(current_text)
+                scaffold = parse_daily_log_scaffold_marker(managed_current_text)
                 if scaffold and target_cursor.entry_count == 0:
                     header = file_marker("daily_log", workspace.workspace_language)
                     updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
                 else:
                     updated_text = (
-                        current_text.rstrip("\n")
+                        managed_current_text.rstrip("\n")
                         + "\n\n"
                         + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq)
                         + "\n"

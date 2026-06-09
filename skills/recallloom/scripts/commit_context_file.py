@@ -61,6 +61,7 @@ from _common import (
     LockBusyError,
     StorageResolutionError,
     atomic_write_if_unchanged,
+    canonicalize_managed_text_newlines,
     dump_json,
     enforce_package_support_gate,
     ensure_supported_python_version,
@@ -680,7 +681,7 @@ def normalize_json_section_value(
     recovery_details: dict | None = None,
 ) -> str:
     if isinstance(value, str):
-        normalized = value.strip()
+        normalized = canonicalize_managed_text_newlines(value.strip())
         if normalized.casefold() in NOT_PROVIDED_SENTINELS:
             return ""
         if normalized:
@@ -722,7 +723,7 @@ def normalize_json_section_value(
                     expected_type="non_empty_string",
                     reason_code="invalid_section_list_item_type",
                 )
-            normalized_item = item.strip()
+            normalized_item = canonicalize_managed_text_newlines(item.strip())
             if normalized_item.casefold() in NOT_PROVIDED_SENTINELS:
                 continue
             if not normalized_item:
@@ -960,6 +961,7 @@ def prepare_body_text(
     project_root: Path | None = None,
     route_details: dict | None = None,
 ) -> tuple[str, str]:
+    source_text = canonicalize_managed_text_newlines(source_text)
     if input_format == "markdown":
         return (
             strip_managed_headers(
@@ -1033,7 +1035,7 @@ def build_managed_text(
             base_workspace_revision=base_workspace_revision,
         )
     )
-    body = body_text.rstrip("\n")
+    body = canonicalize_managed_text_newlines(body_text).rstrip("\n")
     if body:
         parts.extend(["", body])
     return "\n".join(parts) + "\n"

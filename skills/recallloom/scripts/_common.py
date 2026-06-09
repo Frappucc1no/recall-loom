@@ -1508,19 +1508,22 @@ def now_iso_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def canonicalize_managed_text_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
+            "wb",
             dir=path.parent,
             prefix=f".{path.name}.tmp-",
             delete=False,
         ) as handle:
             temp_path = Path(handle.name)
-            handle.write(text)
+            handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
@@ -1532,7 +1535,7 @@ def write_text(path: Path, text: str) -> None:
 
 
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return path.read_bytes().decode("utf-8")
 
 
 def exit_with_cli_error(

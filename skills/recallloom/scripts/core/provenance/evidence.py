@@ -36,7 +36,7 @@ def _sha256_text_digest(text: str) -> str:
 
 
 def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return path.read_bytes().decode("utf-8")
 
 
 def _is_json_int(value: Any) -> bool:
