@@ -103,6 +103,32 @@ def latest_daily_log_marker_summary(path: Path | None) -> tuple[object | None, i
     return latest_entry, entry_count, parse_daily_log_scaffold_marker(text)
 
 
+def latest_daily_log_entry_text_digest(text: str, latest_entry) -> str | None:
+    if latest_entry is None:
+        return None
+    lines = text.splitlines()
+    start_index = None
+    end_index = len(lines)
+    for index, line in enumerate(lines):
+        entry = parse_daily_log_entry_line(line)
+        if entry is None:
+            continue
+        if start_index is None:
+            if (
+                entry.entry_id == latest_entry.entry_id
+                and entry.entry_seq == latest_entry.entry_seq
+                and entry.created_at == latest_entry.created_at
+            ):
+                start_index = index
+        else:
+            end_index = index
+            break
+    if start_index is None:
+        return None
+    entry_text = "\n".join(lines[start_index:end_index]).rstrip("\n") + "\n"
+    return sha256_text_digest(entry_text)
+
+
 def file_state_marker_from_path(path: Path):
     with path.open("r", encoding="utf-8") as handle:
         for index, line in enumerate(handle):
@@ -181,6 +207,52 @@ def recommended_actions_for_preflight(
     return actions
 
 
+def managed_body_digest(text: str) -> str:
+    """Digest managed markdown body excluding RecallLoom header metadata."""
+
+    lines = text.splitlines()
+    if (
+        len(lines) >= 3
+        and lines[0].strip().startswith("<!-- recallloom:file=rolling_summary ")
+        and lines[1].strip().startswith("<!-- last-writer:")
+        and lines[2].strip().startswith("<!-- file-state:")
+    ):
+        body = "\n".join(lines[3:]).lstrip("\n").rstrip("\n") + "\n"
+    else:
+        body = text.rstrip("\n") + "\n"
+    return "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def post_append_assertion_binding_seed(
+    *,
+    expected_workspace_revision: int,
+    expected_file_revision: int,
+    summary_base_workspace_revision: int | None,
+    latest_daily_log_entry,
+    latest_daily_log_digest: str | None,
+    latest_daily_log_entry_hash: str | None,
+    body_digest_before: str,
+) -> dict:
+    latest_created_at = latest_daily_log_entry.created_at if latest_daily_log_entry else None
+    return {
+        "assertion_kind": "post_append_summary_metadata_only_semantic_unchanged",
+        "expected_workspace_revision": expected_workspace_revision,
+        "expected_file_revision": expected_file_revision,
+        "summary_base_workspace_revision": summary_base_workspace_revision,
+        "latest_daily_log_entry_id": (
+            latest_daily_log_entry.entry_id if latest_daily_log_entry else None
+        ),
+        "latest_daily_log_entry_seq": (
+            latest_daily_log_entry.entry_seq if latest_daily_log_entry else None
+        ),
+        "latest_daily_log_entry_created_at": latest_created_at,
+        "latest_daily_log_entry_date": latest_created_at[:10] if latest_created_at else None,
+        "latest_daily_log_entry_hash": latest_daily_log_entry_hash,
+        "latest_daily_log_digest": latest_daily_log_digest,
+        "body_digest_before": body_digest_before,
+    }
+
+
 def build_post_append_summary_sync_contract(
     *,
     workspace,
@@ -210,6 +282,8 @@ def build_post_append_summary_sync_contract(
         "suggested_handoff_sections": rolling_summary_handoff.get("suggested_handoff_sections", []),
     }
     target_path = summary_path.relative_to(workspace.project_root).as_posix()
+    summary_text = read_text(summary_path) if summary_path.is_file() else ""
+    body_digest_before = managed_body_digest(summary_text) if summary_text else None
     latest_daily_log_path = (
         latest_daily_log.relative_to(workspace.project_root).as_posix()
         if latest_daily_log is not None
@@ -294,13 +368,38 @@ def build_post_append_summary_sync_contract(
     elif not latest_daily_log_not_older_than_summary:
         reason_code = "stale_cause_not_append_only"
 
+    latest_entry_created_at = latest_daily_log_entry.created_at if latest_daily_log_entry else None
+    latest_daily_log_entry_hash = (
+        latest_daily_log_entry_text_digest(
+            read_text(latest_daily_log) if latest_daily_log is not None else "",
+            latest_daily_log_entry,
+        )
+        if latest_daily_log_entry is not None
+        else None
+    )
     append_cursor = {
         "latest_file": latest_file_from_state if isinstance(daily_state, dict) else None,
         "latest_entry_id": latest_daily_log_entry.entry_id if latest_daily_log_entry else None,
         "latest_entry_seq": latest_daily_log_entry.entry_seq if latest_daily_log_entry else None,
+        "latest_entry_created_at": latest_entry_created_at,
+        "latest_entry_date": latest_entry_created_at[:10] if latest_entry_created_at else None,
+        "latest_entry_hash": latest_daily_log_entry_hash,
         "entry_count": latest_daily_log_entry_count if latest_daily_log is not None else None,
         "latest_file_digest": latest_daily_log_digest,
     }
+    assertion_binding_seed = (
+        post_append_assertion_binding_seed(
+            expected_workspace_revision=workspace_revision,
+            expected_file_revision=summary_state.revision,
+            summary_base_workspace_revision=summary_base_workspace_revision,
+            latest_daily_log_entry=latest_daily_log_entry,
+            latest_daily_log_digest=latest_daily_log_digest,
+            latest_daily_log_entry_hash=latest_daily_log_entry_hash,
+            body_digest_before=body_digest_before,
+        )
+        if summary_state is not None and body_digest_before is not None
+        else None
+    )
 
     contract = {
         "contract_type": "post_append_summary_sync",
@@ -313,6 +412,28 @@ def build_post_append_summary_sync_contract(
         "expected_file_revision": summary_state.revision if summary_state else None,
         "expected_workspace_revision": workspace_revision,
         "append_cursor": append_cursor,
+        "managed_body_digest_before": body_digest_before,
+        "metadata_only_refresh": {
+            "allowed_assertion_sources": [
+                "record_plan_output_id",
+                "explicit_operator_confirmation",
+            ],
+            "requires_semantic_unchanged_assertion": True,
+            "assertion_binding_seed": assertion_binding_seed,
+            "assertion_binding_seed_digest": (
+                "sha256:"
+                + hashlib.sha256(
+                    json.dumps(
+                        assertion_binding_seed,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if assertion_binding_seed is not None
+                else None
+            ),
+        },
         "provenance_guard": {
             "summary_base_workspace_revision": summary_base_workspace_revision,
             "workspace_revision": workspace_revision,

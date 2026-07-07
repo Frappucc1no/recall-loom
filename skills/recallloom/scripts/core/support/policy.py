@@ -44,6 +44,7 @@ DISPATCHER_ACTION_LEVELS = {
     "status": "diagnostic",
     "resume": "readonly",
     "quick-summary": "diagnostic",
+    "record": "readonly",
     "init": "mutating",
     "bridge": "mutating",
     "append": "mutating",

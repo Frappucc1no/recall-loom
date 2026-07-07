@@ -11,10 +11,12 @@ import tempfile
 from typing import Any
 
 from core.provenance.receipts import (
+    accepted_receipt_contract_identities,
     RECEIPT_ALLOWED_FIELDS,
     RECEIPT_REDACTION_POLICY_VERSION,
     RECEIPT_SCHEMA_VERSION,
     assert_public_safe_json,
+    legacy_v045_receipt_contract_identity,
     ReceiptContractError,
     ReceiptPrivacyError,
     receipt_contract_identity,
@@ -90,12 +92,12 @@ def receipt_store_path(storage_root: str | Path) -> Path:
     return Path(storage_root) / RECEIPT_STORE_RELATIVE_PATH
 
 
-def receipt_store_contract_identity() -> dict:
+def _receipt_store_contract_identity_for_receipt_contract(receipt_contract: dict) -> dict:
     payload = {
         "schema_version": RECEIPT_STORE_SCHEMA_VERSION,
         "store_type": RECEIPT_STORE_TYPE,
         "store_file": RECEIPT_STORE_RELATIVE_PATH,
-        "receipt_contract": receipt_contract_identity(),
+        "receipt_contract": receipt_contract,
         "redaction_policy_version": RECEIPT_REDACTION_POLICY_VERSION,
     }
     digest = hashlib.sha256(
@@ -106,6 +108,23 @@ def receipt_store_contract_identity() -> dict:
         "contract_version": RECEIPT_STORE_SCHEMA_VERSION,
         "contract_hash": f"sha256:{digest}",
     }
+
+
+def receipt_store_contract_identity() -> dict:
+    return _receipt_store_contract_identity_for_receipt_contract(receipt_contract_identity())
+
+
+def legacy_v045_receipt_store_contract_identity() -> dict:
+    """Return the v0.4.5 store identity accepted for read/append compatibility."""
+
+    return _receipt_store_contract_identity_for_receipt_contract(legacy_v045_receipt_contract_identity())
+
+
+def accepted_receipt_store_contract_identities() -> tuple[dict, ...]:
+    return (
+        receipt_store_contract_identity(),
+        legacy_v045_receipt_store_contract_identity(),
+    )
 
 
 def _empty_store() -> dict:
@@ -164,7 +183,7 @@ def _load_store(path: Path, *, project_root: str | Path) -> dict:
         )
     if not isinstance(payload.get("receipts"), list) or not isinstance(payload.get("index"), dict):
         raise _receipt_store_contract_error("Receipt store must contain receipts and index collections.")
-    if payload.get("contract_identity") != receipt_store_contract_identity():
+    if payload.get("contract_identity") not in accepted_receipt_store_contract_identities():
         raise _receipt_store_contract_error(
             "Receipt store contract identity does not match the active store contract."
         )
@@ -208,6 +227,10 @@ def _has_exact_keys(value: Any, expected: tuple[str, ...]) -> bool:
     return isinstance(value, dict) and set(value) == set(expected)
 
 
+def _has_only_allowed_keys(value: Any, allowed: tuple[str, ...]) -> bool:
+    return isinstance(value, dict) and set(value).issubset(set(allowed))
+
+
 def _is_json_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -218,21 +241,34 @@ def _validate_contract_identity(value: Any) -> bool:
     return all(isinstance(value.get(key), str) for key in CONTRACT_IDENTITY_FIELDS)
 
 
-def _validate_store_binding(value: Any) -> bool:
+def _validate_store_binding(value: Any, *, expected_store_contract_identity: dict | None = None) -> bool:
+    expected_identity = expected_store_contract_identity or receipt_store_contract_identity()
     return (
         _has_exact_keys(value, STORE_BINDING_FIELDS)
         and value.get("store_file") == RECEIPT_STORE_RELATIVE_PATH
         and _is_json_int(value.get("store_revision"))
         and isinstance(value.get("index_key"), str)
         and isinstance(value.get("receipt_digest"), str)
-        and value.get("store_contract_identity") == receipt_store_contract_identity()
+        and value.get("store_contract_identity") == expected_identity
     )
+
+
+def _store_contract_identity_for_receipt(receipt: dict) -> dict | None:
+    receipt_contract = receipt.get("contract_identity")
+    if receipt_contract == receipt_contract_identity():
+        return receipt_store_contract_identity()
+    if receipt_contract == legacy_v045_receipt_contract_identity():
+        return legacy_v045_receipt_store_contract_identity()
+    return None
 
 
 def _validate_persisted_receipt_value(receipt: dict) -> bool:
     try:
         validate_receipt_payload(receipt)
     except (ReceiptContractError, ReceiptPrivacyError):
+        return False
+    expected_store_contract_identity = _store_contract_identity_for_receipt(receipt)
+    if expected_store_contract_identity is None:
         return False
     return (
         isinstance(receipt.get("digest"), str)
@@ -246,8 +282,11 @@ def _validate_persisted_receipt_value(receipt: dict) -> bool:
         and isinstance(receipt.get("state_digest"), str)
         and receipt["state_digest"].startswith("sha256:")
         and receipt.get("preflight_contract_identity") == provenance_contract_identity()
-        and receipt.get("contract_identity") == receipt_contract_identity()
-        and _validate_store_binding(receipt.get("store_binding"))
+        and receipt.get("contract_identity") in accepted_receipt_contract_identities()
+        and _validate_store_binding(
+            receipt.get("store_binding"),
+            expected_store_contract_identity=expected_store_contract_identity,
+        )
         and receipt["store_binding"].get("receipt_digest") == receipt["digest"]
         and receipt["store_binding"].get("index_key") == receipt["digest"]
         and receipt["store_binding"].get("store_revision") == receipt["revision"]
@@ -274,10 +313,13 @@ def _validate_loaded_store_payload(payload: dict, *, project_root: str | Path) -
     receipts_by_digest: dict[str, tuple[dict, int]] = {}
     for offset, receipt in enumerate(payload["receipts"]):
         if (
-            not _has_exact_keys(receipt, PERSISTED_RECEIPT_FIELDS)
+            not _has_only_allowed_keys(receipt, PERSISTED_RECEIPT_FIELDS)
             or not _validate_contract_identity(receipt.get("preflight_contract_identity"))
             or not _validate_contract_identity(receipt.get("contract_identity"))
-            or not _validate_store_binding(receipt.get("store_binding"))
+            or not _validate_store_binding(
+                receipt.get("store_binding"),
+                expected_store_contract_identity=_store_contract_identity_for_receipt(receipt),
+            )
             or not _validate_persisted_receipt_value(receipt)
         ):
             raise _receipt_store_contract_error(

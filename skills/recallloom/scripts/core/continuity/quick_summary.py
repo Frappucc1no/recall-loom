@@ -21,10 +21,17 @@ from _common import validate_state_entry_bearing_latest_daily_log
 
 PROJECT_VERSION_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_-]*)\s+v?\d+\.\d+(?:\.\d+)?\b")
 BACKTICK_PATH_RE = re.compile(r"`([^`]+)`")
+EXPLICIT_PROJECT_LABEL_RE = re.compile(
+    r"(?i)(?:^|\b)(?:project|product|workspace|repo|项目|产品|工作区|仓库)\s*[:：-]\s*(?P<value>.+)$"
+)
 PHASE_LABEL_RE = re.compile(
     r"(?i)(?:^|\b)(?:current phase|phase|当前阶段|阶段)\s*[:：-]\s*(?P<value>.+)$"
 )
 WHITESPACE_RE = re.compile(r"\s+")
+PROJECT_PATH_CUE_RE = re.compile(
+    r"(?i)(project root|workspace|repo|repository|项目根目录|工作区|仓库)"
+)
+VERSION_TOKEN_RE = re.compile(r"^v?\d+(?:\.\d+){1,3}$", re.I)
 
 PLACEHOLDER_NEXT_STEP_LINES = {
     "describe the handoff-first next move:",
@@ -82,17 +89,42 @@ def _compact(
     return shortened + "..."
 
 
+def _safe_project_label_candidate(value: str) -> str | None:
+    candidate = value.strip().strip("`'\" ")
+    if not candidate:
+        return None
+    candidate = candidate.split("|", 1)[0].split(" / ", 1)[0].strip()
+    if not candidate or VERSION_TOKEN_RE.match(candidate):
+        return None
+    if "/" in candidate or "\\" in candidate:
+        name = Path(candidate).name
+        candidate = name if name and not VERSION_TOKEN_RE.match(name) else ""
+    return candidate or None
+
+
 def _extract_project_label(current_state_text: str, project_root: Path) -> str:
-    for line in _meaningful_lines(current_state_text)[:6]:
+    root_label = redact_public_text(public_project_root_label(project_root), project_root=project_root) or "project"
+    for line in _meaningful_lines(current_state_text)[:8]:
+        explicit_match = EXPLICIT_PROJECT_LABEL_RE.search(line)
+        if explicit_match:
+            candidate = _safe_project_label_candidate(explicit_match.group("value"))
+            if candidate:
+                return _compact(candidate, max_chars=48, project_root=project_root) or root_label
+
+    for line in _meaningful_lines(current_state_text)[:8]:
+        if not EXPLICIT_PROJECT_LABEL_RE.search(line) and not PROJECT_PATH_CUE_RE.search(line):
+            continue
         version_match = PROJECT_VERSION_RE.search(line)
         if version_match:
-            return _compact(version_match.group(1), max_chars=48, project_root=project_root) or public_project_root_label(project_root)
+            candidate = _safe_project_label_candidate(version_match.group(1))
+            if candidate:
+                return _compact(candidate, max_chars=48, project_root=project_root) or root_label
         path_match = BACKTICK_PATH_RE.search(line)
         if path_match:
-            candidate = Path(path_match.group(1)).name
+            candidate = _safe_project_label_candidate(Path(path_match.group(1)).name)
             if candidate:
-                return _compact(candidate, max_chars=48, project_root=project_root) or public_project_root_label(project_root)
-    return redact_public_text(public_project_root_label(project_root), project_root=project_root) or "project"
+                return _compact(candidate, max_chars=48, project_root=project_root) or root_label
+    return root_label
 
 
 def _extract_phase(current_state_text: str, active_judgments_text: str, *, project_root: Path) -> str:

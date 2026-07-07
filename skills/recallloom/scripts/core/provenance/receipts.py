@@ -48,6 +48,27 @@ RECEIPT_ALLOWED_FIELDS = (
     "contract_identity",
     "store_binding",
     "created_at",
+    "assertion_source_kind",
+    "assertion_source_id",
+    "assertion_payload_digest",
+    "input_digest",
+    "preflight_binding_digest",
+    "managed_body_digest_before",
+    "assertion_binding_seed_digest",
+    "controlled_metadata_refresh",
+)
+RECEIPT_V045_ADDED_V046_FIELDS = (
+    "assertion_source_kind",
+    "assertion_source_id",
+    "assertion_payload_digest",
+    "input_digest",
+    "preflight_binding_digest",
+    "managed_body_digest_before",
+    "assertion_binding_seed_digest",
+    "controlled_metadata_refresh",
+)
+RECEIPT_V045_ALLOWED_FIELDS = tuple(
+    field for field in RECEIPT_ALLOWED_FIELDS if field not in RECEIPT_V045_ADDED_V046_FIELDS
 )
 
 RECEIPT_PROHIBITED_FIELDS = (
@@ -68,6 +89,15 @@ RECEIPT_PROHIBITED_FIELDS = (
     "source_path",
     "target_path",
     "token",
+)
+
+CONTROLLED_METADATA_REFRESH_ALLOWED_CHANGED_FIELDS = (
+    "rolling_summary_last_writer.tool",
+    "rolling_summary_last_writer.date",
+    "file_state.revision",
+    "file_state.updated_at",
+    "file_state.writer_id",
+    "file_state.base_workspace_revision",
 )
 
 RECEIPT_REDACTION_CONTRACT = {
@@ -117,12 +147,12 @@ class ReceiptContractError(ValueError):
         self.details = {"field_path": field_path, "reason_code": reason_code}
 
 
-def minimal_receipt_schema() -> dict:
+def _minimal_receipt_schema_for_allowed_fields(allowed_fields: tuple[str, ...]) -> dict:
     return {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "type": "object",
         "additionalProperties": False,
-        "allowed_fields": list(RECEIPT_ALLOWED_FIELDS),
+        "allowed_fields": list(allowed_fields),
         "required": [
             "schema_version",
             "receipt_type",
@@ -143,9 +173,13 @@ def minimal_receipt_schema() -> dict:
     }
 
 
-def receipt_contract_identity() -> dict:
+def minimal_receipt_schema() -> dict:
+    return _minimal_receipt_schema_for_allowed_fields(RECEIPT_ALLOWED_FIELDS)
+
+
+def _receipt_contract_identity_for_allowed_fields(allowed_fields: tuple[str, ...]) -> dict:
     payload = {
-        "schema": minimal_receipt_schema(),
+        "schema": _minimal_receipt_schema_for_allowed_fields(allowed_fields),
         "redaction_contract": RECEIPT_REDACTION_CONTRACT,
     }
     digest = hashlib.sha256(
@@ -156,6 +190,23 @@ def receipt_contract_identity() -> dict:
         "contract_version": RECEIPT_SCHEMA_VERSION,
         "contract_hash": f"sha256:{digest}",
     }
+
+
+def receipt_contract_identity() -> dict:
+    return _receipt_contract_identity_for_allowed_fields(RECEIPT_ALLOWED_FIELDS)
+
+
+def legacy_v045_receipt_contract_identity() -> dict:
+    """Return the v0.4.5 receipt identity accepted for read/append compatibility."""
+
+    return _receipt_contract_identity_for_allowed_fields(RECEIPT_V045_ALLOWED_FIELDS)
+
+
+def accepted_receipt_contract_identities() -> tuple[dict, ...]:
+    return (
+        receipt_contract_identity(),
+        legacy_v045_receipt_contract_identity(),
+    )
 
 
 def _is_prohibited_field(key: str) -> bool:
@@ -311,7 +362,143 @@ def validate_receipt_payload(
             reason_code="receipt_digest_mismatch",
             field_path="$.digest",
         )
+    _validate_controlled_metadata_refresh(payload)
     assert_public_safe_json(payload, project_root=project_root)
+
+
+def _is_sha256_reference(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+
+
+def _validate_metadata_snapshot(value: Any, *, field_path: str) -> None:
+    if not isinstance(value, Mapping):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh snapshot must be an object.",
+            reason_code="controlled_metadata_refresh_snapshot_invalid",
+            field_path=field_path,
+        )
+    allowed = {"file_marker", "file_state", "rolling_summary_last_writer"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ReceiptContractError(
+            "controlled_metadata_refresh snapshot contains unsupported fields.",
+            reason_code="controlled_metadata_refresh_snapshot_unknown_field",
+            field_path=f"{field_path}.{','.join(unknown)}",
+        )
+    file_marker = value.get("file_marker")
+    file_state = value.get("file_state")
+    if not isinstance(file_marker, Mapping) or not isinstance(file_state, Mapping):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh snapshot is missing file marker or file state.",
+            reason_code="controlled_metadata_refresh_snapshot_invalid",
+            field_path=field_path,
+        )
+    if set(file_marker) != {"file_key", "version", "language"}:
+        raise ReceiptContractError(
+            "controlled_metadata_refresh file marker shape is invalid.",
+            reason_code="controlled_metadata_refresh_file_marker_invalid",
+            field_path=f"{field_path}.file_marker",
+        )
+    if set(file_state) != {"revision", "updated_at", "writer_id", "base_workspace_revision"}:
+        raise ReceiptContractError(
+            "controlled_metadata_refresh file state shape is invalid.",
+            reason_code="controlled_metadata_refresh_file_state_invalid",
+            field_path=f"{field_path}.file_state",
+        )
+    if not all(isinstance(file_marker.get(key), str) and file_marker.get(key) for key in file_marker):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh file marker values must be non-empty strings.",
+            reason_code="controlled_metadata_refresh_file_marker_invalid",
+            field_path=f"{field_path}.file_marker",
+        )
+    for key in ("revision", "base_workspace_revision"):
+        if not isinstance(file_state.get(key), int) or isinstance(file_state.get(key), bool):
+            raise ReceiptContractError(
+                "controlled_metadata_refresh file state revisions must be integers.",
+                reason_code="controlled_metadata_refresh_file_state_invalid",
+                field_path=f"{field_path}.file_state.{key}",
+            )
+    for key in ("updated_at", "writer_id"):
+        if not isinstance(file_state.get(key), str) or not file_state.get(key):
+            raise ReceiptContractError(
+                "controlled_metadata_refresh file state metadata must be non-empty strings.",
+                reason_code="controlled_metadata_refresh_file_state_invalid",
+                field_path=f"{field_path}.file_state.{key}",
+            )
+    last_writer = value.get("rolling_summary_last_writer")
+    if last_writer is not None:
+        if not isinstance(last_writer, Mapping) or set(last_writer) != {"tool", "date"}:
+            raise ReceiptContractError(
+                "controlled_metadata_refresh rolling_summary_last_writer shape is invalid.",
+                reason_code="controlled_metadata_refresh_last_writer_invalid",
+                field_path=f"{field_path}.rolling_summary_last_writer",
+            )
+        if not all(isinstance(last_writer.get(key), str) and last_writer.get(key) for key in last_writer):
+            raise ReceiptContractError(
+                "controlled_metadata_refresh rolling_summary_last_writer values must be non-empty strings.",
+                reason_code="controlled_metadata_refresh_last_writer_invalid",
+                field_path=f"{field_path}.rolling_summary_last_writer",
+            )
+
+
+def _validate_controlled_metadata_refresh(payload: Mapping[str, Any]) -> None:
+    claim = payload.get("controlled_metadata_refresh")
+    if claim is None:
+        return
+    if payload.get("operation_class") != "post_append_summary_sync":
+        raise ReceiptContractError(
+            "controlled_metadata_refresh is only valid for post_append_summary_sync receipts.",
+            reason_code="controlled_metadata_refresh_operation_invalid",
+            field_path="$.controlled_metadata_refresh",
+        )
+    if not isinstance(claim, Mapping):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh must be an object.",
+            reason_code="controlled_metadata_refresh_invalid",
+            field_path="$.controlled_metadata_refresh",
+        )
+    expected_keys = {
+        "refresh_kind",
+        "allowed_changed_fields",
+        "body_digest_before",
+        "body_digest_after",
+        "before",
+        "after",
+    }
+    unknown = sorted(set(claim) - expected_keys)
+    missing = sorted(expected_keys - set(claim))
+    if unknown or missing:
+        raise ReceiptContractError(
+            "controlled_metadata_refresh fields do not match the active contract.",
+            reason_code="controlled_metadata_refresh_shape_invalid",
+            field_path="$.controlled_metadata_refresh",
+        )
+    if claim.get("refresh_kind") != "metadata_only":
+        raise ReceiptContractError(
+            "controlled_metadata_refresh refresh_kind is invalid.",
+            reason_code="controlled_metadata_refresh_kind_invalid",
+            field_path="$.controlled_metadata_refresh.refresh_kind",
+        )
+    if claim.get("allowed_changed_fields") != list(CONTROLLED_METADATA_REFRESH_ALLOWED_CHANGED_FIELDS):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh allowed_changed_fields changed unexpectedly.",
+            reason_code="controlled_metadata_refresh_allowed_fields_invalid",
+            field_path="$.controlled_metadata_refresh.allowed_changed_fields",
+        )
+    if not _is_sha256_reference(claim.get("body_digest_before")) or not _is_sha256_reference(claim.get("body_digest_after")):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh body digests must be sha256 references.",
+            reason_code="controlled_metadata_refresh_body_digest_invalid",
+            field_path="$.controlled_metadata_refresh",
+        )
+    if claim.get("body_digest_before") != claim.get("body_digest_after"):
+        raise ReceiptContractError(
+            "controlled_metadata_refresh body digest changed.",
+            reason_code="controlled_metadata_refresh_body_changed",
+            field_path="$.controlled_metadata_refresh.body_digest_after",
+        )
+    _validate_metadata_snapshot(claim.get("before"), field_path="$.controlled_metadata_refresh.before")
+    _validate_metadata_snapshot(claim.get("after"), field_path="$.controlled_metadata_refresh.after")
 
 
 def _public_claim_value(

@@ -1,6 +1,6 @@
 # RecallLoom Entry Index
 
-This file is the full repository map for RecallLoom v0.4.5.
+This file is the full repository map for RecallLoom v0.4.6.
 Start with the short README front doors:
 
 - [README.md](./README.md)
@@ -44,6 +44,7 @@ The dispatcher surface also includes:
 - `status`
 - `validate`
 - `quick-summary`
+- `record --plan`
 - `append`
 - `write`
 - `sync-current-state-after-append`
@@ -89,6 +90,17 @@ Read:
 Use this when you need the durable sidecar rules, helper safety rules, or
 runtime boundaries.
 
+### Recording workflow
+
+Read:
+
+- [USAGE.md](./USAGE.md)
+- [skills/recallloom/SKILL.md](./skills/recallloom/SKILL.md)
+- [skills/recallloom/references/recording-workflow.md](./skills/recallloom/references/recording-workflow.md)
+
+Use this when you need to classify a "record this progress" intent, inspect the
+ordered helper path, or prepare a metadata-only post-append refresh assertion.
+
 ### Package installation and agent entrypoint
 
 Read:
@@ -123,6 +135,7 @@ authority layer.
 
 ### Release notes
 
+- `docs/releases/v0.4.6.md`
 - `docs/releases/v0.4.4.md`
 - `docs/releases/v0.4.3.md`
 - `docs/releases/v0.4.2.md`

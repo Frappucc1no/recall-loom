@@ -38,14 +38,14 @@ The current advisory shape is:
 
 ```json
 {
-  "latest_version": "0.4.5",
+  "latest_version": "0.4.6",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
-  "advisory_level": "supported",
+  "advisory_level": "upgrade_recommended",
   "release_channel": "stable",
   "public_release_status": "released",
-  "reason_code": "current_release_supported",
-  "user_message": "This RecallLoom package version is currently supported.",
+  "reason_code": "v046_recording_workflow_recommended",
+  "user_message": "RecallLoom v0.4.6 is the recommended stable package. Users on older versions should update for the recording workflow fast lane and append/sync ergonomics improvements.",
   "support_advisory_url_status": "canonical_public_location",
   "remote_parity_rule": "The default support_advisory_url points at the canonical public origin/main location. Re-run remote support/readiness checks after publishing package updates.",
   "update_hints": {
@@ -57,6 +57,7 @@ The current advisory shape is:
 ```
 
 `advisory_level` may be `supported`, `upgrade_recommended`, `readonly_only`, `diagnostic_only`, or `upgrade_required`.
+`upgrade_recommended` is the default release-promotion posture for v0.4.6: users below `latest_version` should update, but actions remain allowed unless the minimum-version fields require a harder gate.
 `upgrade_recommended` and `upgrade_required` only become an upgrade state when the current package is below `latest_version`; hard blocking is controlled by `minimum_mutating_version` and `minimum_readonly_version`.
 `latest_version`, `minimum_mutating_version`, and `minimum_readonly_version` are required dotted numeric version strings.
 Additional current top-level advisory metadata may include:

@@ -35,12 +35,13 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 - `references/file-contracts.md`
 - `references/operation-playbooks.md`
 - `references/package-support-policy.md`
+- `references/recording-workflow.md`
 - `references/protocol.md`
 
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.5`
+- package version: `0.4.6`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -149,8 +150,8 @@ The others are operator-facing stable action names that can be interpreted by th
 `rl-bridge` remains the canonical dispatcher/helper action label for bridge work, but this package line does not promise a universal native wrapper or deterministic first-hop routing for that label.
 Natural language remains the default public phrasing for these actions.
 
-The dispatcher command surface also includes `quick-summary`, `append`, `write`, `sync-current-state-after-append`, and `repair-daily-log-cursor`.
-Use `quick-summary` for current-state snapshots, `append --entry-json` for milestone logging, `write --type ... --source-file <prepared-file> --dry-run` or `write --type ... --stdin --dry-run` before typed managed-file writes, and `sync-current-state-after-append --stdin --input-format json` only after preflight allows `post_append_summary_sync`.
+The dispatcher command surface also includes `quick-summary`, `record --plan`, `append`, `write`, `sync-current-state-after-append`, and `repair-daily-log-cursor`.
+Use `quick-summary` for current-state snapshots, `record --plan` to classify a recording intent and get the next safe helper step, `append --entry-json` for milestone logging, `write --type ... --source-file <prepared-file> --dry-run` or `write --type ... --stdin --dry-run` before typed managed-file writes, and `sync-current-state-after-append --reuse-current-summary --semantic-unchanged-assertion-json <json>` only after preflight allows metadata-only `post_append_summary_sync`; see `references/recording-workflow.md` for the bound assertion JSON skeleton.
 Use `repair-daily-log-cursor` in preview mode first when `state.json.daily_logs` no longer matches the parsed latest active daily log. Apply mode requires `--apply --yes`, should include `--expected-workspace-revision` after a fresh preview/status check, is support-gated as mutating, and repairs cursor fields without writing helper receipts or rewriting daily-log content.
 These dispatcher additions are optional for existing `v0.3.4` projects and do not change sidecar protocol `1.0`.
 

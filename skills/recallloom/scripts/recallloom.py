@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -13,6 +15,11 @@ from pathlib import Path
 
 
 _BOOTSTRAP_DEFAULT_MINIMUM_PYTHON_VERSION = "3.10"
+_SHA256_REFERENCE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_RECORD_PLAN_OUTPUT_ID_RE = re.compile(r"^record-plan-output:sha256:[0-9a-f]{64}$")
+_EXPLICIT_OPERATOR_CONFIRMATION_ID_RE = re.compile(
+    r"^explicit-operator-confirmation:sha256:[0-9a-f]{64}$"
+)
 
 
 def _bootstrap_failure_language() -> str:
@@ -129,6 +136,16 @@ from core.provenance.state import (
 )
 from core.protocol.contracts import FILE_KEYS, ROOT_ENTRY_CANDIDATES
 from core.protocol.markers import parse_file_state_marker
+from core.recording import (
+    digest_payload,
+    LAYER_NAMES,
+    RECORD_CLASSES,
+    RecordContractError,
+    normalize_layer_hint,
+    normalize_record_class_hint,
+    plan_record,
+    validate_record_plan_output,
+)
 from core.support.policy import action_level_for_dispatcher
 from core.trust.state import evaluate_trust_state
 
@@ -371,6 +388,80 @@ def build_parser() -> argparse.ArgumentParser:
     )
     quick_summary_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
+    record_parser = subparsers.add_parser(
+        "record",
+        help="Plan a side-effect-free recording workflow and return the next safe step.",
+    )
+    record_parser.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="Project path or a descendant path. Defaults to the current working directory.",
+    )
+    record_parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="Return a plan-only workflow. This is the only v0.4.6 record mode.",
+    )
+    record_parser.add_argument(
+        "--intent-text",
+        default="",
+        help="Original user or agent recording intent. Public-safe text only.",
+    )
+    record_parser.add_argument(
+        "--payload-json",
+        help="Prepared record payload JSON object. Do not include private raw payloads.",
+    )
+    record_parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the prepared record payload JSON object from UTF-8 stdin.",
+    )
+    record_parser.add_argument(
+        "--max-input-bytes",
+        type=positive_int,
+        help="Maximum prepared record payload size in bytes when reading stdin.",
+    )
+    record_parser.add_argument(
+        "--record-class",
+        help=(
+            "Optional classifier hint. Accepted canonical classes include: "
+            + ", ".join(RECORD_CLASSES)
+        ),
+    )
+    record_parser.add_argument(
+        "--layer-hint",
+        help=(
+            "Optional target layer hint. Accepted canonical layers include: "
+            + ", ".join(LAYER_NAMES)
+        ),
+    )
+    record_parser.add_argument(
+        "--privacy-safety-json",
+        help="Optional privacy/safety result JSON object such as {\"classification\":\"safe\"}.",
+    )
+    record_parser.add_argument(
+        "--expected-revision-json",
+        help="Optional expected revision binding JSON object. Usually supplied by preflight.",
+    )
+    semantic_group = record_parser.add_mutually_exclusive_group()
+    semantic_group.add_argument(
+        "--semantic-unchanged",
+        action="store_true",
+        help="Assert semantic unchanged for a later metadata-only refresh plan.",
+    )
+    semantic_group.add_argument(
+        "--semantic-changed",
+        action="store_true",
+        help="Assert semantic changed, blocking metadata-only refresh use.",
+    )
+    record_parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="With --json, print compact record-plan output with safety receipt.",
+    )
+    record_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+
     append_parser = subparsers.add_parser(
         "append",
         help="Append a prepared daily-log entry through append_daily_log_entry.py.",
@@ -527,6 +618,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin",
         action="store_true",
         help="Read reviewed rolling-summary JSON from UTF-8 stdin.",
+    )
+    post_append_sync_parser.add_argument(
+        "--reuse-current-summary",
+        action="store_true",
+        help=(
+            "Reuse the current rolling_summary managed body and refresh only metadata. "
+            "Requires --semantic-unchanged-assertion-json."
+        ),
+    )
+    post_append_sync_parser.add_argument(
+        "--semantic-unchanged-assertion-json",
+        help=(
+            "Bound semantic-unchanged assertion JSON for --reuse-current-summary. "
+            "Must echo the preflight metadata_only_refresh assertion binding seed."
+        ),
     )
     post_append_sync_parser.add_argument(
         "--input-format",
@@ -752,9 +858,10 @@ def _run_helper_json(
     json_mode_on_failure: bool,
     support: dict | None = None,
     package_support_on_failure: bool = False,
+    stdin_text: str | None = None,
 ) -> dict:
     cmd = [sys.executable, str(SCRIPT_DIR / helper_name), *helper_args, "--json"]
-    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    proc = subprocess.run(cmd, text=True, capture_output=True, input=stdin_text, check=False)
     if proc.returncode != 0:
         parsed_error = None
         if proc.stdout:
@@ -2053,6 +2160,7 @@ def _preflight_write_binding_json(
     contract_type: str | None = None,
     confirm_review_imported_baseline: bool = False,
     write_readiness_label: str | None = None,
+    extra_binding_fields: dict | None = None,
 ) -> str:
     write_readiness = preflight_payload.get("write_readiness")
     binding = {
@@ -2081,6 +2189,8 @@ def _preflight_write_binding_json(
         binding["expected_revisions"] = expected_revisions
     if contract_type is not None:
         binding["contract_type"] = contract_type
+    if extra_binding_fields:
+        binding.update(extra_binding_fields)
     binding["preflight_contract_hash"] = preflight_write_binding_hash(binding)
     return json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -2166,8 +2276,20 @@ def _post_append_sync_retry_payload(
         if safe_writer_id is not None:
             writer_fields["writer_id"] = safe_writer_id
 
-    input_ref = "resubmit_same_stdin_payload"
-    input_args = ["--stdin"]
+    if input_mode == "reuse-current-summary":
+        input_ref = "reissue_bound_semantic_unchanged_assertion"
+        input_format = "markdown"
+        input_contract = "metadata_only_refresh_assertion"
+        input_args = [
+            "--reuse-current-summary",
+            "--semantic-unchanged-assertion-json",
+            "same_bound_assertion_json",
+        ]
+    else:
+        input_ref = "resubmit_same_stdin_payload"
+        input_format = "json"
+        input_contract = "json-stdin"
+        input_args = ["--stdin", "--input-format", "json"]
     if args.max_input_bytes is not None:
         input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
     if getattr(args, "confirm_review_imported_baseline", False):
@@ -2179,14 +2301,13 @@ def _post_append_sync_retry_payload(
         "file_key": "rolling_summary",
         "input_mode": input_mode,
         "input_ref": input_ref,
-        "input_format": "json",
+        "input_format": input_format,
+        "input_contract": input_contract,
         "argv_template": [
             "recallloom.py",
             POST_APPEND_SYNC_COMMAND,
             "same_project",
             *input_args,
-            "--input-format",
-            "json",
             *writer_args,
             "--json",
         ],
@@ -2216,6 +2337,8 @@ def _post_append_sync_failure_payload(
         "surface_level": "operator",
         "trust_effect": "review_required",
         "command": POST_APPEND_SYNC_COMMAND,
+        "side_effect": "none",
+        "write_effect": "none",
         "contract_type": (
             contract.get("contract_type")
             if isinstance(contract, dict) and isinstance(contract.get("contract_type"), str)
@@ -2224,7 +2347,7 @@ def _post_append_sync_failure_payload(
         "write_type": "current-state",
         "file_key": "rolling_summary",
         "input_mode": input_mode,
-        "input_format": "json",
+        "input_format": _post_append_sync_input_format(args),
         "reason_code": reason_code,
         "error": message,
         "user_message": "Post-append summary sync is not allowed for the current sidecar state.",
@@ -2328,12 +2451,287 @@ def _post_append_sync_invalid_input_payload(
 
 
 def _post_append_sync_input_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "reuse_current_summary", False):
+        return "reuse-current-summary"
     return "json-stdin"
+
+
+def _post_append_sync_input_format(args: argparse.Namespace) -> str:
+    if getattr(args, "reuse_current_summary", False):
+        return "markdown"
+    return "json"
+
+
+def _sha256_json(value: object) -> str:
+    return "sha256:" + hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _post_append_sync_assertion_fields(
+    parser,
+    args: argparse.Namespace,
+    *,
+    contract: dict,
+    preflight_payload: dict,
+    support: dict,
+) -> dict:
+    try:
+        assertion = json.loads(args.semantic_unchanged_assertion_json)
+    except json.JSONDecodeError as exc:
+        message = f"--semantic-unchanged-assertion-json must be valid JSON: {exc.msg}."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload("invalid_prepared_input", error=message),
+            support=support,
+        )
+    if not isinstance(assertion, dict):
+        message = "--semantic-unchanged-assertion-json must be a JSON object."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload("invalid_prepared_input", error=message),
+            support=support,
+        )
+    metadata_only_refresh = contract.get("metadata_only_refresh")
+    if not isinstance(metadata_only_refresh, dict):
+        message = "Preflight did not return metadata_only_refresh binding details."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=_post_append_sync_failure_payload(
+                args,
+                input_mode="reuse-current-summary",
+                message=message,
+                reason_code="missing_metadata_only_refresh_contract",
+                contract=contract,
+            ),
+            support=support,
+        )
+    seed = metadata_only_refresh.get("assertion_binding_seed")
+    seed_digest = metadata_only_refresh.get("assertion_binding_seed_digest")
+    body_digest_before = contract.get("managed_body_digest_before")
+    if not isinstance(seed, dict) or not isinstance(seed_digest, str) or not isinstance(body_digest_before, str):
+        message = "Preflight metadata-only refresh binding details are incomplete."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=_post_append_sync_failure_payload(
+                args,
+                input_mode="reuse-current-summary",
+                message=message,
+                reason_code="metadata_only_refresh_binding_incomplete",
+                contract=contract,
+            ),
+            support=support,
+        )
+
+    def fail(message: str, reason_code: str) -> None:
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=_post_append_sync_failure_payload(
+                args,
+                input_mode="reuse-current-summary",
+                message=message,
+                reason_code=reason_code,
+                contract=contract,
+            ),
+            support=support,
+        )
+
+    source_kind = assertion.get("assertion_source_kind")
+    assertion_source_id = assertion.get("assertion_source_id")
+    input_digest = assertion.get("input_digest")
+    if assertion.get("semantic_unchanged") is not True:
+        fail(
+            "metadata-only refresh requires semantic_unchanged=true in the bound assertion.",
+            "semantic_unchanged_assertion_missing",
+        )
+    if source_kind not in {"record_plan_output_id", "explicit_operator_confirmation"}:
+        fail(
+            "metadata-only refresh assertion_source_kind is not allowed.",
+            "assertion_source_kind_invalid",
+        )
+    if "source_id" in assertion:
+        fail(
+            "metadata-only refresh assertions must use assertion_source_id, not source_id.",
+            "assertion_source_id_legacy_field",
+        )
+    if not isinstance(assertion_source_id, str) or not assertion_source_id:
+        fail(
+            "metadata-only refresh assertion_source_id is required.",
+            "assertion_source_id_missing",
+        )
+    if (
+        source_kind == "record_plan_output_id"
+        and _RECORD_PLAN_OUTPUT_ID_RE.fullmatch(assertion_source_id) is None
+    ):
+        fail(
+            "metadata-only refresh record_plan_output_id assertion_source_id is malformed.",
+            "assertion_source_id_invalid",
+        )
+    if (
+        source_kind == "explicit_operator_confirmation"
+        and _EXPLICIT_OPERATOR_CONFIRMATION_ID_RE.fullmatch(assertion_source_id) is None
+    ):
+        fail(
+            "metadata-only refresh explicit_operator_confirmation assertion_source_id is malformed.",
+            "assertion_source_id_invalid",
+        )
+    if not isinstance(input_digest, str) or _SHA256_REFERENCE_RE.fullmatch(input_digest) is None:
+        fail(
+            "metadata-only refresh assertion input_digest is required.",
+            "assertion_input_digest_missing",
+        )
+    if source_kind == "record_plan_output_id":
+        raw_record_plan_output = assertion.get("record_plan_output")
+        if not isinstance(raw_record_plan_output, dict):
+            fail(
+                "metadata-only refresh record_plan_output_id assertions must include the full record_plan_output.",
+                "record_plan_output_missing",
+            )
+        try:
+            record_plan_output = validate_record_plan_output(raw_record_plan_output)
+        except RecordContractError as exc:
+            fail(
+                f"metadata-only refresh record_plan_output is invalid: {exc}",
+                "record_plan_output_invalid",
+            )
+        if record_plan_output["record_plan_output_id"] != assertion_source_id:
+            fail(
+                "metadata-only refresh assertion_source_id does not match record_plan_output.record_plan_output_id.",
+                "record_plan_output_id_mismatch",
+            )
+        if record_plan_output["input_digest"] != input_digest:
+            fail(
+                "metadata-only refresh assertion input_digest does not match record_plan_output.input_digest.",
+                "record_plan_input_digest_mismatch",
+            )
+        if record_plan_output.get("record_class") != "metadata_refresh_only":
+            fail(
+                "metadata-only refresh assertion source must be a metadata_refresh_only record plan.",
+                "record_plan_class_not_metadata_refresh",
+            )
+        current_safe_command = record_plan_output.get("current_safe_command")
+        if not (
+            isinstance(current_safe_command, str)
+            and POST_APPEND_SYNC_COMMAND in current_safe_command
+            and "--reuse-current-summary" in current_safe_command
+        ):
+            fail(
+                "metadata-only refresh assertion source must point to the metadata refresh fast lane.",
+                "record_plan_command_not_metadata_refresh",
+            )
+        required_gates = record_plan_output.get("required_gates")
+        if not isinstance(required_gates, list) or not {"semantic_unchanged", "receipt_finalization"}.issubset(set(required_gates)):
+            fail(
+                "metadata-only refresh assertion source is missing required semantic or receipt gates.",
+                "record_plan_metadata_gates_missing",
+            )
+        expected_binding = record_plan_output.get("expected_revision_binding")
+        if not isinstance(expected_binding, dict) or expected_binding.get("preflight_digest") != digest_payload(preflight_payload):
+            fail(
+                "metadata-only refresh record_plan_output is not bound to the current preflight payload.",
+                "record_plan_preflight_digest_mismatch",
+            )
+    if assertion.get("assertion_binding_seed") != seed:
+        message = "metadata-only refresh assertion binding seed does not match preflight."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=_post_append_sync_failure_payload(
+                args,
+                input_mode="reuse-current-summary",
+                message=message,
+                reason_code="assertion_binding_seed_mismatch",
+                contract=contract,
+            ),
+            support=support,
+        )
+    if assertion.get("assertion_binding_seed_digest") != seed_digest:
+        message = "metadata-only refresh assertion binding seed digest does not match preflight."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=3,
+            message=message,
+            payload=_post_append_sync_failure_payload(
+                args,
+                input_mode="reuse-current-summary",
+                message=message,
+                reason_code="assertion_binding_seed_digest_mismatch",
+                contract=contract,
+            ),
+            support=support,
+        )
+    fields = {
+        "assertion_source_kind": source_kind,
+        "assertion_source_id": assertion_source_id,
+        "assertion_payload_digest": _sha256_json(assertion),
+        "managed_body_digest_before": body_digest_before,
+        "assertion_binding_seed_digest": seed_digest,
+        "input_digest": input_digest,
+    }
+    return fields
 
 
 def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support: dict) -> None:
     source_file_present = args.source_file is not None
     stdin_present = bool(args.stdin)
+    reuse_current_summary = bool(getattr(args, "reuse_current_summary", False))
+    if reuse_current_summary:
+        if source_file_present or stdin_present:
+            message = (
+                "sync-current-state-after-append --reuse-current-summary must not also "
+                "use --source-file or --stdin."
+            )
+            _exit_with_support(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=message,
+                payload=_post_append_sync_invalid_input_payload(
+                    args,
+                    message=message,
+                    source_file_present=source_file_present,
+                    stdin_present=stdin_present,
+                ),
+                support=support,
+            )
+        if not isinstance(args.semantic_unchanged_assertion_json, str):
+            message = (
+                "sync-current-state-after-append --reuse-current-summary requires "
+                "--semantic-unchanged-assertion-json."
+            )
+            _exit_with_support(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message=message,
+                payload=_post_append_sync_invalid_input_payload(
+                    args,
+                    message=message,
+                    source_file_present=source_file_present,
+                    stdin_present=stdin_present,
+                ),
+                support=support,
+            )
+        return
+
     if source_file_present or not stdin_present:
         if source_file_present:
             message = (
@@ -2412,6 +2810,58 @@ def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support
             ),
             support=support,
         )
+
+
+def _current_rolling_summary_text_for_reuse(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+) -> str:
+    try:
+        workspace = find_recallloom_root(args.target)
+    except (StorageResolutionError, ConfigContractError) as exc:
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=str(exc),
+            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+            support=support,
+        )
+    if workspace is None:
+        message = "Post-append summary sync target is not attached to RecallLoom."
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload("no_project_root", error=message),
+            support=support,
+        )
+    summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
+    try:
+        return read_text(summary_path)
+    except (OSError, UnicodeDecodeError) as exc:
+        message = f"Could not read current rolling_summary for metadata-only refresh: {exc}"
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                details={
+                    "command": POST_APPEND_SYNC_COMMAND,
+                    "operation": "post_append_summary_sync",
+                    "input_mode": "reuse-current-summary",
+                    "side_effect": "none",
+                },
+            ),
+            support=support,
+        )
+    raise AssertionError("unreachable")
 
 
 def _required_contract_bool_guard(
@@ -2500,6 +2950,8 @@ def _post_append_sync_commit_args(
     contract: dict,
     preflight_payload: dict,
     support: dict,
+    input_format: str = "json",
+    extra_binding_fields: dict | None = None,
 ) -> list[str]:
     helper_args = [
         args.target,
@@ -2510,7 +2962,7 @@ def _post_append_sync_commit_args(
         "--expected-workspace-revision",
         str(contract["expected_workspace_revision"]),
         "--input-format",
-        "json",
+        input_format,
     ]
     helper_args.append("--stdin")
     if args.max_input_bytes is not None:
@@ -2541,6 +2993,7 @@ def _post_append_sync_commit_args(
                     write_readiness_label=_ready_after_preflight_label_for_provenance(
                         preflight_payload.get("provenance_state")
                     ),
+                    extra_binding_fields=extra_binding_fields,
                 ),
                 support=support,
             ),
@@ -2593,6 +3046,18 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
 
     assert contract is not None
     provenance_guard = contract.get("provenance_guard")
+    input_format = _post_append_sync_input_format(args)
+    stdin_text = None
+    extra_binding_fields = None
+    if getattr(args, "reuse_current_summary", False):
+        extra_binding_fields = _post_append_sync_assertion_fields(
+            parser,
+            args,
+            contract=contract,
+            preflight_payload=preflight_payload,
+            support=support,
+        )
+        stdin_text = _current_rolling_summary_text_for_reuse(parser, args, support=support)
     review_imported_baseline_sync_confirmation_required = (
         preflight_payload.get("provenance_state") == "review_imported_baseline"
         or (
@@ -2630,10 +3095,13 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
             contract=contract,
             preflight_payload=preflight_payload,
             support=support,
+            input_format=input_format,
+            extra_binding_fields=extra_binding_fields,
         ),
         json_mode_on_failure=args.json,
         support=support,
         package_support_on_failure=True,
+        stdin_text=stdin_text,
     )
     result = {
         **payload,
@@ -2643,7 +3111,7 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
         "write_type": "current-state",
         "file_key": "rolling_summary",
         "input_mode": payload.get("input_mode", input_mode),
-        "input_format": "json",
+        "input_format": input_format,
         "expected_file_revision": contract["expected_file_revision"],
         "expected_workspace_revision": contract["expected_workspace_revision"],
         "append_cursor": contract.get("append_cursor"),
@@ -2904,6 +3372,368 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
     print("Next actions:")
     for action in payload["next_actions"]:
         print(f"  - {action}")
+
+
+def _record_invalid_input(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+    message: str,
+    reason_code: str,
+) -> None:
+    payload = {
+        "ok": False,
+        "schema_version": "1.1",
+        "command": "record",
+        "plan_mode": "plan-only",
+        "blocked": True,
+        "blocked_reason": "invalid_record_plan_input",
+        "reason_code": reason_code,
+        "recoverability": "user_input_required",
+        "surface_level": "user_safe",
+        "trust_effect": "none",
+        "workflow_status": "blocked_fixable",
+        "record_class": "ambiguous_needs_user",
+        "side_effect": "none",
+        "error": message,
+        "user_message": "The record plan input is not valid.",
+        "operator_note": "Fix the record --plan input shape, then rerun without using record --apply.",
+        "next_actions": ["revise_record_plan_input", "rerun_record_plan"],
+        "current_safe_command": None,
+        "single_next_command": None,
+        "safe_to_retry": True,
+    }
+    _exit_with_support(
+        parser,
+        json_mode=args.json,
+        exit_code=2,
+        message=message,
+        payload=payload,
+        support=support,
+    )
+
+
+def _record_json_object(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+    raw: str,
+    field_name: str,
+) -> dict:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message=f"{field_name} must be valid JSON: {exc.msg}.",
+            reason_code=f"malformed_{field_name}",
+        )
+    if not isinstance(payload, dict):
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message=f"{field_name} must be a JSON object.",
+            reason_code=f"{field_name}_not_object",
+        )
+    return payload
+
+
+def _record_payload_from_args(parser, args: argparse.Namespace, *, support: dict) -> dict:
+    if args.payload_json is not None and args.stdin:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message="record --plan accepts either --payload-json or --stdin, not both.",
+            reason_code="multiple_payload_sources",
+        )
+    if args.payload_json is not None:
+        return _record_json_object(
+            parser,
+            args,
+            support=support,
+            raw=args.payload_json,
+            field_name="payload_json",
+        )
+    if not args.stdin:
+        return {}
+    max_bytes = args.max_input_bytes
+    try:
+        raw_bytes = sys.stdin.buffer.read(max_bytes + 1 if max_bytes is not None else -1)
+    except OSError as exc:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message=f"Could not read record payload from stdin: {exc}",
+            reason_code="stdin_read_failed",
+        )
+    if max_bytes is not None and len(raw_bytes) > max_bytes:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message="Prepared record payload exceeded --max-input-bytes.",
+            reason_code="stdin_payload_too_large",
+        )
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message=f"Prepared record payload stdin must be UTF-8: {exc}.",
+            reason_code="stdin_not_utf8",
+        )
+    return _record_json_object(
+        parser,
+        args,
+        support=support,
+        raw=raw,
+        field_name="stdin_payload",
+    )
+
+
+def _semantic_unchanged_assertion(args: argparse.Namespace) -> bool | None:
+    if args.semantic_unchanged:
+        return True
+    if args.semantic_changed:
+        return False
+    return None
+
+
+def _record_input_contract(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+) -> tuple[dict, str | None]:
+    try:
+        record_class_hint = normalize_record_class_hint(args.record_class)
+        layer_hint = normalize_layer_hint(args.layer_hint)
+    except RecordContractError as exc:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message=str(exc),
+            reason_code="invalid_record_hint",
+        )
+    privacy_result = (
+        _record_json_object(
+            parser,
+            args,
+            support=support,
+            raw=args.privacy_safety_json,
+            field_name="privacy_safety_json",
+        )
+        if args.privacy_safety_json is not None
+        else {"classification": "unknown"}
+    )
+    expected_revision_binding = (
+        _record_json_object(
+            parser,
+            args,
+            support=support,
+            raw=args.expected_revision_json,
+            field_name="expected_revision_json",
+        )
+        if args.expected_revision_json is not None
+        else {}
+    )
+    input_contract = {
+        "intent_text": args.intent_text or "",
+        "prepared_record_payload": _record_payload_from_args(parser, args, support=support),
+        "optional_layer_hint": layer_hint,
+        "privacy_safety_result": privacy_result,
+        "expected_revision_binding": expected_revision_binding,
+        "semantic_unchanged_assertion": _semantic_unchanged_assertion(args),
+    }
+    return input_contract, record_class_hint
+
+
+def _print_record_plan_summary(payload: dict) -> None:
+    print("RecallLoom record plan")
+    print(f"Status: {payload['workflow_status']}")
+    print(f"Record class: {payload['record_class']}")
+    print(f"Write effect: {payload['write_effect']}")
+    current_safe_command = payload.get("current_safe_command")
+    if current_safe_command:
+        print(f"Current safe command: {current_safe_command}")
+    elif payload.get("blocked_reason"):
+        print(f"Stop reason: {payload['blocked_reason']}")
+    if payload.get("terminal_success_condition"):
+        print(f"Terminal success: {payload['terminal_success_condition']}")
+
+
+def _compact_record_plan_payload(payload: dict) -> dict:
+    current_safe_command = payload.get("current_safe_command")
+    blocked_reason = payload.get("blocked_reason")
+    if current_safe_command:
+        action_type = "run_command"
+        action_value = current_safe_command
+    elif payload.get("user_decision_required"):
+        action_type = "ask_user"
+        action_value = blocked_reason or "user_decision_required"
+    elif payload.get("workflow_status") in {"no_write", "complete"}:
+        action_type = "no_write"
+        action_value = payload.get("terminal_success_condition")
+    else:
+        action_type = "stop"
+        action_value = blocked_reason or payload.get("workflow_status")
+
+    expected_revision_binding = payload.get("expected_revision_binding")
+    expected_revisions = (
+        expected_revision_binding.get("expected_revisions")
+        if isinstance(expected_revision_binding, dict)
+        else None
+    )
+    input_contract = payload.get("input_contract")
+    privacy_safety_result = (
+        input_contract.get("privacy_safety_result")
+        if isinstance(input_contract, dict)
+        else None
+    )
+    privacy_safety_classification = (
+        privacy_safety_result.get("classification")
+        if isinstance(privacy_safety_result, dict)
+        else None
+    )
+    ready_to_run_current_command = (
+        action_type == "run_command"
+        and payload.get("workflow_status") == "ready_to_run"
+        and payload.get("side_effect") == "none"
+    )
+    return {
+        "schema_version": "1.1",
+        "ok": payload.get("workflow_status") not in {"blocked_fixable", "blocked_unsafe"},
+        "command": "record",
+        "record_class": payload.get("record_class"),
+        "workflow_status": payload.get("workflow_status"),
+        "side_effect": payload.get("side_effect"),
+        "ready_to_mutate": False,
+        "ready_to_run_current_command": ready_to_run_current_command,
+        "topline": (
+            f"record --plan classified this as {payload.get('record_class')} "
+            f"with status {payload.get('workflow_status')}."
+        ),
+        "next_action": {
+            "type": action_type,
+            "value": action_value,
+            "current_safe_command": current_safe_command,
+            "blocked_reason": blocked_reason,
+            "validation_hint": payload.get("validation_hint"),
+        },
+        "safety_receipt": {
+            "record_plan_output_id": payload.get("record_plan_output_id"),
+            "input_digest": payload.get("input_digest"),
+            "plan_mode": payload.get("plan_mode"),
+            "write_effect": payload.get("write_effect"),
+            "planned_layers": payload.get("planned_layers"),
+            "required_gates": payload.get("required_gates"),
+            "expected_revisions": expected_revisions,
+            "privacy_safety_classification": privacy_safety_classification,
+            "write_readiness": (
+                expected_revision_binding.get("write_readiness")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "allowed_operation_level": (
+                expected_revision_binding.get("allowed_operation_level")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "sidecar_trust_state": (
+                expected_revision_binding.get("sidecar_trust_state")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "provenance_state": (
+                expected_revision_binding.get("provenance_state")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "provenance_note": (
+                expected_revision_binding.get("provenance_note")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "freshness_risk_level": (
+                expected_revision_binding.get("freshness_risk_level")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "freshness_risk_note": (
+                expected_revision_binding.get("freshness_risk_note")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "continuity_drift_risk_level": (
+                expected_revision_binding.get("continuity_drift_risk_level")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "continuity_drift_review_required": (
+                expected_revision_binding.get("continuity_drift_review_required")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "summary_stale": (
+                expected_revision_binding.get("summary_stale")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "workspace_newer_than_summary": (
+                expected_revision_binding.get("workspace_newer_than_summary")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "preflight_contract_identity": (
+                expected_revision_binding.get("preflight_contract_identity")
+                if isinstance(expected_revision_binding, dict)
+                else None
+            ),
+            "validation_hint": payload.get("validation_hint"),
+        },
+    }
+
+
+def _handle_record_plan(parser, args: argparse.Namespace, *, support: dict) -> None:
+    if not args.plan:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message="record currently supports only --plan. record --apply is not part of v0.4.6 Core.",
+            reason_code="record_plan_required",
+        )
+    input_contract, record_class_hint = _record_input_contract(parser, args, support=support)
+    preflight_payload = _preflight_payload(parser, args, support=support)
+    try:
+        payload = plan_record(
+            input_contract=input_contract,
+            record_class_hint=record_class_hint,
+            preflight_payload=preflight_payload,
+        )
+    except RecordContractError as exc:
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message=str(exc),
+            reason_code="record_plan_contract_invalid",
+        )
+    if args.json:
+        output_payload = _compact_record_plan_payload(payload) if args.compact else payload
+        print(json.dumps(output_payload, ensure_ascii=False, indent=2))
+    else:
+        _print_record_plan_summary(payload)
 
 
 def _project_relative_path(path: Path, project_root: Path) -> str:
@@ -3667,6 +4497,10 @@ def main() -> None:
 
     if args.command == "quick-summary":
         _handle_quick_summary(parser, args, support=support)
+        return
+
+    if args.command == "record":
+        _handle_record_plan(parser, args, support=support)
         return
 
     if args.command == "append":

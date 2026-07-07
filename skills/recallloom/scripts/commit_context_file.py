@@ -140,6 +140,13 @@ PREFLIGHT_BINDING_ALLOWED_KEYS = {
     "ux_gate_requires_confirmation",
     "ux_gate_confirmation",
     "ux_gate_reason",
+    "assertion_source_kind",
+    "assertion_source_id",
+    "assertion_payload_digest",
+    "input_digest",
+    "preflight_binding_digest",
+    "managed_body_digest_before",
+    "assertion_binding_seed_digest",
 }
 PREFLIGHT_BINDING_REQUIRED_KEYS = {
     "binding_type",
@@ -1045,6 +1052,81 @@ def sha256_text_digest(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def managed_body_digest(text: str) -> str:
+    marker = parse_file_marker(text)
+    if marker is None:
+        body = text.rstrip("\n") + "\n"
+    else:
+        body = (
+            strip_managed_headers(
+                marker.file_key,
+                text,
+                expected_language=marker.language,
+            ).rstrip("\n")
+            + "\n"
+        )
+    return sha256_text_digest(body)
+
+
+def managed_metadata_snapshot(text: str) -> dict | None:
+    marker = parse_file_marker(text)
+    state = parse_file_state_marker(text)
+    if marker is None or state is None:
+        return None
+    snapshot = {
+        "file_marker": {
+            "file_key": marker.file_key,
+            "version": marker.version,
+            "language": marker.language,
+        },
+        "file_state": {
+            "revision": state.revision,
+            "updated_at": state.updated_at,
+            "writer_id": state.writer_id,
+            "base_workspace_revision": state.base_workspace_revision,
+        },
+    }
+    if marker.file_key == "rolling_summary":
+        lines = text.splitlines()
+        if len(lines) < 2:
+            return None
+        last_writer_match = LAST_WRITER_RE.match(lines[1].strip())
+        if last_writer_match is None:
+            return None
+        snapshot["rolling_summary_last_writer"] = {
+            "tool": last_writer_match.group("tool").strip(),
+            "date": last_writer_match.group("date"),
+        }
+    return snapshot
+
+
+def controlled_metadata_refresh_claim(
+    *,
+    before_text: str,
+    after_text: str,
+    body_digest_before: str,
+) -> dict | None:
+    before = managed_metadata_snapshot(before_text)
+    after = managed_metadata_snapshot(after_text)
+    if before is None or after is None:
+        return None
+    return {
+        "refresh_kind": "metadata_only",
+        "allowed_changed_fields": [
+            "rolling_summary_last_writer.tool",
+            "rolling_summary_last_writer.date",
+            "file_state.revision",
+            "file_state.updated_at",
+            "file_state.writer_id",
+            "file_state.base_workspace_revision",
+        ],
+        "body_digest_before": body_digest_before,
+        "body_digest_after": managed_body_digest(after_text),
+        "before": before,
+        "after": after,
+    }
+
+
 def expected_state_json_text(state: dict) -> str:
     return json.dumps(state, ensure_ascii=False, indent=2) + "\n"
 
@@ -1540,6 +1622,7 @@ def build_receipt_seed(
     state_digest: str,
     new_file_revision: int,
     new_workspace_revision: int,
+    controlled_metadata_refresh: dict | None = None,
 ) -> dict:
     operation_class = str(preflight_binding["operation_class"])
     operation = (
@@ -1547,6 +1630,27 @@ def build_receipt_seed(
         if operation_class == "post_append_summary_sync"
         else str(preflight_binding.get("write_type") or WRITE_TYPE_BY_FILE_KEY.get(args.file_key))
     )
+    optional_binding_fields = {
+        key: preflight_binding[key]
+        for key in (
+            "assertion_source_kind",
+            "assertion_source_id",
+            "assertion_payload_digest",
+            "input_digest",
+            "managed_body_digest_before",
+            "assertion_binding_seed_digest",
+        )
+        if key in preflight_binding
+    }
+    if (
+        operation_class == "post_append_summary_sync"
+        and "managed_body_digest_before" in preflight_binding
+    ):
+        optional_binding_fields["preflight_binding_digest"] = preflight_binding[
+            "preflight_contract_hash"
+        ]
+    if controlled_metadata_refresh is not None:
+        optional_binding_fields["controlled_metadata_refresh"] = controlled_metadata_refresh
     return {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "receipt_type": "helper_write",
@@ -1567,6 +1671,7 @@ def build_receipt_seed(
         "expected_file_revision": args.expected_file_revision,
         "result_file_revision": new_file_revision,
         "created_at": timestamp,
+        **optional_binding_fields,
     }
 
 
@@ -1717,6 +1822,26 @@ def main() -> None:
                 )
 
             current_text = read_text(target_path)
+            expected_body_digest = (
+                preflight_binding.get("managed_body_digest_before")
+                if isinstance(preflight_binding, dict)
+                else None
+            )
+            controlled_metadata_refresh = None
+            if isinstance(expected_body_digest, str):
+                current_body_digest = managed_body_digest(current_text)
+                if current_body_digest != expected_body_digest:
+                    preflight_binding_failure(
+                        parser,
+                        json_mode=args.json,
+                        message="Current managed body digest no longer matches the preflight-bound metadata-only refresh assertion.",
+                        reason_code="managed_body_digest_before_mismatch",
+                        field_path="$.managed_body_digest_before",
+                        extra={
+                            "expected_body_digest": expected_body_digest,
+                            "current_body_digest": current_body_digest,
+                        },
+                    )
             current_marker = parse_file_marker(current_text)
             if current_marker is None:
                 exit_with_failure_contract(
@@ -1842,6 +1967,20 @@ def main() -> None:
                 file_key=args.file_key,
                 write_type=WRITE_TYPE_BY_FILE_KEY.get(args.file_key),
             )
+            if isinstance(expected_body_digest, str):
+                prepared_body_digest = sha256_text_digest(body_text.rstrip("\n") + "\n")
+                if prepared_body_digest != expected_body_digest:
+                    preflight_binding_failure(
+                        parser,
+                        json_mode=args.json,
+                        message="Prepared metadata-only refresh body does not match the preflight-bound managed body digest.",
+                        reason_code="metadata_only_prepared_body_changed",
+                        field_path="$.managed_body_digest_before",
+                        extra={
+                            "expected_body_digest": expected_body_digest,
+                            "prepared_body_digest": prepared_body_digest,
+                        },
+                    )
             validate_prepared_body(
                 parser,
                 json_mode=args.json,
@@ -1922,6 +2061,32 @@ def main() -> None:
                 base_workspace_revision=new_workspace_revision,
                 timestamp=timestamp,
             )
+            if isinstance(expected_body_digest, str):
+                controlled_metadata_refresh = controlled_metadata_refresh_claim(
+                    before_text=current_text,
+                    after_text=new_text,
+                    body_digest_before=expected_body_digest,
+                )
+                if controlled_metadata_refresh is None:
+                    preflight_binding_failure(
+                        parser,
+                        json_mode=args.json,
+                        message="Metadata-only refresh could not build a controlled metadata before/after receipt claim.",
+                        reason_code="controlled_metadata_refresh_snapshot_invalid",
+                        field_path="$.managed_body_digest_before",
+                    )
+                if controlled_metadata_refresh["body_digest_after"] != expected_body_digest:
+                    preflight_binding_failure(
+                        parser,
+                        json_mode=args.json,
+                        message="Metadata-only refresh would change the managed body after rebuilding controlled metadata.",
+                        reason_code="metadata_only_rebuilt_body_changed",
+                        field_path="$.managed_body_digest_before",
+                        extra={
+                            "expected_body_digest": expected_body_digest,
+                            "body_digest_after": controlled_metadata_refresh["body_digest_after"],
+                        },
+                    )
             try:
                 atomic_write_if_unchanged(target_path, expected_text=current_text, new_text=new_text)
             except OSError as exc:
@@ -2004,6 +2169,7 @@ def main() -> None:
                     state_digest=state_digest,
                     new_file_revision=new_file_revision,
                     new_workspace_revision=new_workspace_revision,
+                    controlled_metadata_refresh=controlled_metadata_refresh,
                 )
                 try:
                     receipt_finalization = finalize_receipt_in_store(
