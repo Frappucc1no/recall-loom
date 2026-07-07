@@ -179,6 +179,33 @@ def _has_no_write_language(text: str) -> bool:
             "还没形成结论",
             "defer",
             "no write",
+            "no need to record",
+            "no need to log",
+            "no record needed",
+            "do not record",
+            "don't record",
+            "dont record",
+            "do not log",
+            "don't log",
+            "dont log",
+            "do not save this",
+            "don't save this",
+            "dont save this",
+            "do not write this",
+            "don't write this",
+            "dont write this",
+            "do not write this down",
+            "don't write this down",
+            "dont write this down",
+            "do not append this",
+            "don't append this",
+            "dont append this",
+            "just confirm",
+            "just confirming",
+            "confirmation only",
+            "for confirmation only",
+            "only confirming",
+            "just checking",
             "无需记录",
             "不用记录",
             "不要记录",
@@ -211,11 +238,16 @@ def classify_record_plan_input(
     normalized = normalize_record_plan_input(input_contract)
     if _privacy_classification(normalized) in {"unsafe", "blocked", "block"}:
         return "unsafe_blocked", "high"
-    if record_class_hint is not None:
-        return normalize_record_class_hint(record_class_hint), "high"
+    normalized_hint = normalize_record_class_hint(record_class_hint)
+    if normalized_hint == "unsafe_blocked":
+        return normalized_hint, "high"
 
-    if _has_no_write_language(combined):
+    intent_text = str(input_contract.get("intent_text") or "").casefold()
+    if _has_no_write_language(intent_text):
         return "defer_no_write", "medium"
+
+    if normalized_hint is not None:
+        return normalized_hint, "high"
 
     layer_hint = normalized.get("optional_layer_hint")
     if layer_hint == "daily_log":

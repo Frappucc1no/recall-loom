@@ -635,6 +635,18 @@ def _invalid_prepared_input_suggestion(language: str, details: dict | None) -> s
     input_mode = _prepared_input_mode(details)
     command = details.get("command") if isinstance(details, dict) else None
     operation = details.get("operation") if isinstance(details, dict) else None
+    if command == "validate":
+        return _localized_text(
+            language,
+            en=(
+                "Fix the validate flag combination, then rerun validate. Use "
+                "--require-provenance with exactly one scope flag: --changed-only or --full."
+            ),
+            zh_cn=(
+                "请先修正 validate 参数组合，再重新运行 validate。使用 "
+                "--require-provenance 时必须且只能选择 --changed-only 或 --full。"
+            ),
+        )
     if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
         return _localized_text(
             language,
@@ -1273,6 +1285,11 @@ def _failure_recovery_command(
                 "recallloom.py sync-current-state-after-append <project-path> "
                 "--stdin --input-format json --json."
             )
+        if command == "validate":
+            return (
+                "Fix the validate flag combination, then rerun recallloom.py validate "
+                "<project-path> --require-provenance --changed-only --json."
+            )
         if command == "archive" or operation == "daily_log_archive":
             return (
                 "Fix the archive arguments, then rerun archive_logs.py <project-path> "
@@ -1405,6 +1422,8 @@ _SAFE_ROUTING_REASON_CODES = {
     "missing_input_source",
     "missing_section_key",
     "missing_write_type",
+    "provenance_scope_required",
+    "provenance_scope_without_requirement",
     "reserved_marker_injection",
     "source_selection_invalid",
     "source_file_not_supported",
@@ -1470,6 +1489,11 @@ def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
     project_arg = _dispatcher_project_arg(details)
     command = details.get("command") if isinstance(details, dict) else None
     operation = details.get("operation") if isinstance(details, dict) else None
+    reason_code = details.get("reason_code") if isinstance(details, dict) else None
+    if command == "validate":
+        if reason_code in {"provenance_scope_required", "provenance_scope_without_requirement"}:
+            return f"recallloom.py validate {project_arg} --require-provenance --changed-only --json"
+        return f"recallloom.py validate {project_arg} --json"
     if command == "repair-daily-log-cursor" or operation == "repair_daily_log_cursor":
         return f"recallloom.py repair-daily-log-cursor {project_arg} --json"
     if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
@@ -1529,6 +1553,8 @@ def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
         )
     if input_mode == "stdin":
         return f"recallloom.py append {project_arg} --stdin --json"
+    if input_mode is None:
+        return f"recallloom.py status {project_arg} --json"
     return f"recallloom.py append {project_arg} --entry-file <prepared-entry.md> --json"
 
 
@@ -1654,6 +1680,10 @@ def failure_payload(
     normalized_details = _public_failure_details(details)
     _augment_archive_before_details(normalized_reason, normalized_details)
     routing_details = _failure_routing_details(details)
+    suggestion_details = dict(normalized_details or {})
+    if routing_details:
+        suggestion_details.update(routing_details)
+    suggestion_details = suggestion_details or None
     normalized_error = _public_failure_error(error, details)
     payload = {
         "ok": False,
@@ -1674,13 +1704,13 @@ def failure_payload(
             normalized_reason,
             language=language,
             error=error,
-            details=normalized_details,
+            details=suggestion_details,
         ),
         "recovery_command": _failure_recovery_command(
             normalized_reason,
             script_name=normalized_script_name,
             error=error,
-            details=normalized_details,
+            details=suggestion_details,
         ),
     }
     if normalized_error is not None:
@@ -1707,14 +1737,14 @@ def failure_payload(
             normalized_reason,
             language=language,
             error=error,
-            details=normalized_details,
+            details=suggestion_details,
         )
     if not payload.get("recovery_command"):
         payload["recovery_command"] = _failure_recovery_command(
             normalized_reason,
             script_name=normalized_script_name,
             error=error,
-            details=normalized_details,
+            details=suggestion_details,
         )
     _apply_additive_failure_fields(
         payload,

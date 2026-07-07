@@ -401,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument(
         "--plan",
         action="store_true",
-        help="Return a plan-only workflow. This is the only v0.4.6 record mode.",
+        help="Return a plan-only workflow. This is the current v0.4.6-line record mode.",
     )
     record_parser.add_argument(
         "--intent-text",
@@ -1098,7 +1098,11 @@ def _validate_provenance_scope_failure_payload(message: str, *, reason_code: str
     return cli_failure_payload(
         "invalid_prepared_input",
         error=message,
-        details={"reason_code": reason_code},
+        details={
+            "command": "validate",
+            "reason_code": reason_code,
+            "side_effect": "none",
+        },
         extra={
             "next_actions": ["choose_validate_provenance_scope", "retry_validate"],
             "suggestion": (
@@ -3710,7 +3714,7 @@ def _handle_record_plan(parser, args: argparse.Namespace, *, support: dict) -> N
             parser,
             args,
             support=support,
-            message="record currently supports only --plan. record --apply is not part of v0.4.6 Core.",
+            message="record currently supports only --plan. record --apply is not part of the current v0.4.6-line package.",
             reason_code="record_plan_required",
         )
     input_contract, record_class_hint = _record_input_contract(parser, args, support=support)

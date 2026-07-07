@@ -43,7 +43,6 @@ TRUSTED_INHERITED_FIELDS = (
     "reason_code",
     "update_hints",
     "checked_date",
-    "package_path",
     "support_diagnostic_reason",
     "user_message",
     "fetch_error",
@@ -290,70 +289,60 @@ def package_support_result(
     package_root = package_root.resolve()
     disable_shortcuts = env.get(SUPPORT_DISABLE_ENV) == "1"
 
-    if not disable_shortcuts:
-        inherited = inherited_support_state(
+    cache_path = cache_path_for_package(package_root, env)
+    cached = load_cached_support(cache_path)
+
+    inherited = (
+        None
+        if disable_shortcuts
+        else inherited_support_state(
             package_root=package_root,
             package_version=package_version,
             checked_date=checked_date,
             env=env,
         )
-    else:
-        inherited = None
-
+    )
     if inherited is not None:
         result = inherited
     else:
-        cache_path = cache_path_for_package(package_root, env)
-        same_day_cached = trusted_cached_support(
-            package_root=package_root,
-            package_version=package_version,
-            checked_date=checked_date,
-            env=env,
-        )
-        cached = load_cached_support(cache_path)
-        if not disable_shortcuts and same_day_cached is not None:
-            result = dict(same_day_cached)
-            result["cache_hit"] = True
-            result["source"] = "cache_today"
+        advisory, source, fetch_error, advisory_invalid = read_advisory(env, default_url=advisory_url)
+        if advisory is None and advisory_invalid:
+            advisory = invalid_advisory(package_version)
+        if advisory is None and fetch_error is None and source == "no_advisory_config":
+            fetch_error = source
+        if advisory is None and fetch_error and cached is not None:
+            stale_advisory = (
+                None
+                if action_level == "mutating"
+                else advisory_from_cached_support(cached)
+            )
+            result = result_from_advisory(
+                package_root=package_root,
+                package_version=package_version,
+                checked_date=checked_date,
+                source="stale_cache",
+                advisory=stale_advisory,
+                fetch_error=fetch_error,
+                cache_path=cache_path,
+                cache_hit=True,
+            )
+            cached_message = stale_cached_user_message(cached, result["package_support_state"])
+            if cached_message is not None:
+                result["user_message"] = cached_message
+            result["support_diagnostic_reason"] = "offline_cached_state_used"
         else:
-            advisory, source, fetch_error, advisory_invalid = read_advisory(env, default_url=advisory_url)
-            if advisory is None and advisory_invalid:
-                advisory = invalid_advisory(package_version)
-            if advisory is None and fetch_error is None and source == "no_advisory_config":
-                fetch_error = source
-            if advisory is None and fetch_error and cached is not None:
-                stale_advisory = (
-                    None
-                    if action_level == "mutating"
-                    else advisory_from_cached_support(cached)
-                )
-                result = result_from_advisory(
-                    package_root=package_root,
-                    package_version=package_version,
-                    checked_date=checked_date,
-                    source="stale_cache",
-                    advisory=stale_advisory,
-                    fetch_error=fetch_error,
-                    cache_path=cache_path,
-                    cache_hit=True,
-                )
-                cached_message = stale_cached_user_message(cached, result["package_support_state"])
-                if cached_message is not None:
-                    result["user_message"] = cached_message
-                result["support_diagnostic_reason"] = "offline_cached_state_used"
-            else:
-                result = result_from_advisory(
-                    package_root=package_root,
-                    package_version=package_version,
-                    checked_date=checked_date,
-                    source=source,
-                    advisory=advisory,
-                    fetch_error=fetch_error,
-                    cache_path=cache_path,
-                )
-            cache_error = write_cached_support(cache_path, result)
-            if cache_error:
-                result["cache_write_error"] = cache_error
+            result = result_from_advisory(
+                package_root=package_root,
+                package_version=package_version,
+                checked_date=checked_date,
+                source=source,
+                advisory=advisory,
+                fetch_error=fetch_error,
+                cache_path=cache_path,
+            )
+        cache_error = write_cached_support(cache_path, result)
+        if cache_error:
+            result["cache_write_error"] = cache_error
 
     if disable_shortcuts:
         result["disabled"] = True

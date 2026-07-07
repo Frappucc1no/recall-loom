@@ -25,7 +25,7 @@ HEADING_NUMBER_PREFIX_RE = re.compile(r"^\s*[0-9]+(?:\.[0-9]+)*[.)、:：-]?\s*"
 INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u2060\u2066-\u2069\ufeff]")
 PACKAGE_SUPPORT_PUBLIC_REASON_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 PACKAGE_SUPPORT_PUBLIC_HINT_KEY_RE = re.compile(r"^[a-z0-9_]{1,64}$")
-PACKAGE_SUPPORT_PUBLIC_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._,;:()'+-]{0,159}$")
+PACKAGE_SUPPORT_PUBLIC_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._,;:()'+-]{0,239}$")
 PACKAGE_SUPPORT_PRIVATE_TEXT_RE = re.compile(
     r"(?i)(?:https?://|file://|/|\\|@|\b(?:api[_-]?key|token|secret|password|credential)\b|"
     r"\bsk-[A-Za-z0-9_-]{6,}\b|"
@@ -1725,8 +1725,9 @@ def public_package_support_payload(support: dict | None) -> dict | None:
         "disabled",
     )
     public = {key: support[key] for key in allowed_keys if key in support}
-    public["user_message"] = user_message_for_state(
-        str(public.get("package_support_state") or "unknown_offline")
+    public["user_message"] = _public_package_support_text(
+        support.get("user_message"),
+        fallback=user_message_for_state(str(public.get("package_support_state") or "unknown_offline")),
     )
     public["reason_code"] = _public_package_support_reason_code(public.get("reason_code"))
     public["update_hints"] = _public_package_support_update_hints(public.get("update_hints"))
