@@ -12,7 +12,7 @@
 
 <p>RecallLoom is a file-based project memory layer for AI collaboration. It stores background, progress, key decisions, and next steps in Markdown / JSON files beside or inside the project, with no database, RAG layer, or background service required; the next session, model, or tool can more easily start from the current state.</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.6-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.4.6.1-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 <summary>Version and compatibility</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.6`
+- package version: `0.4.6.1`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -309,6 +309,7 @@ Detailed script entrypoints, protocol notes, and file contracts live in [`USAGE.
 
 | Version | Highlights | User value |
 |---|---|---|
+| `v0.4.6.1` | Emergency v0.4.6-line bugfix: upgraded legacy receipt stores can append safely again; `record --plan` recognizes no-write confirmation language more accurately; blocked preflight no longer exposes an executable write command | Users already on v0.4.6 should update too; real projects no longer get stuck on historical receipt-contract identity drift, and recording plans are less misleading |
 | `v0.4.6` | Recommended update for all users: recording workflow fast lane with `record --plan`, record classification, safe next-step guidance, controlled metadata-only refresh after append, compact output, and recording templates | "Record this" can start with a clear plan and current safe command instead of tool archaeology; common append/sync tails no longer default to rewriting full current-state JSON |
 | `v0.4.5` | Windows stdin / CRLF newline fix; managed text writes use explicit LF and receipt post-hash reads preserve real byte differences | PowerShell / Windows pipe input should no longer trip post-hash mismatch through platform newline translation; existing blocked workspaces still require the documented recovery boundary |
 | `v0.4.4` | Daily-log cursor repair, empty scaffold / legacy no-log compatibility, failure UX fields, and provenance guard hardening | Operators can preview then explicitly repair cursor state without hand-editing `state.json`; restore, archive, and read surfaces parse daily logs more consistently |

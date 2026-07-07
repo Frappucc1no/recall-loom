@@ -664,6 +664,25 @@ def provenance_contract_identity() -> dict:
     }
 
 
+def legacy_v046_pre_recording_provenance_contract_identity() -> dict:
+    """Return the v0.4.6 pre-recording identity accepted for stored receipts."""
+
+    return {
+        "contract_name": "recallloom.provenance_core",
+        "contract_version": PROVENANCE_CONTRACT_VERSION,
+        "contract_hash": "sha256:48dfffb1deaa3d8421c93b22fa9af727658efc1bf9e153e52c18713b6411b0ba",
+    }
+
+
+def accepted_preflight_contract_identities_for_receipts() -> tuple[dict, ...]:
+    """Return preflight identities accepted for already-finalized receipts."""
+
+    return (
+        provenance_contract_identity(),
+        legacy_v046_pre_recording_provenance_contract_identity(),
+    )
+
+
 def preflight_write_binding_hash(binding: Mapping[str, Any]) -> str:
     payload = {
         key: value

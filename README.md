@@ -12,7 +12,7 @@
 
 <p>RecallLoom 是给 AI 协作使用的文件化项目记忆层：把背景、进展、关键决策和下一步保存到项目旁边/项目内的 Markdown / JSON 文件里，不需要数据库、RAG 或后台服务。换会话、换模型、换工具，下一次 AI 协作更容易接上当前状态。</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.6-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.4.6.1-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- 包版本：`0.4.6`
+- 包版本：`0.4.6.1`
 - 协议版本：`1.0`
 - 当前支持的协议版本：
   - `1.0`
@@ -309,6 +309,7 @@ RecallLoom 的工程原则很简单：项目事实留在项目里，AI 工具只
 
 | 版本 | 重点更新 | 对用户的价值 |
 |---|---|---|
+| `v0.4.6.1` | 0.4.6 线内紧急修复：升级后的历史 receipt store 可以继续安全 append；`record --plan` 更准确识别“不用记录/只是确认”等 no-write 意图；blocked preflight 不再展示可执行写命令 | 已更新到 v0.4.6 的用户也建议升级；真实项目不会因历史收据契约差异卡死，记录计划更少误导 |
 | `v0.4.6` | 推荐所有用户更新的 recording workflow fast lane：新增 `record --plan`、记录分类和安全下一步；append 后支持受控 metadata-only refresh；compact 输出和记录模板同步更新 | “帮我记一下”从多轮工具考古变成先拿清晰计划和当前安全命令；append/sync 高频尾部不再默认要求手工重写完整 current-state JSON |
 | `v0.4.5` | Windows stdin / CRLF 换行修复；managed text 写入使用显式 LF，receipt post-hash 读回保留真实 bytes 差异 | PowerShell / Windows 管道输入不再因平台换行转换触发 post-hash mismatch；已有 blocked workspace 仍需按恢复边界处理 |
 | `v0.4.4` | daily-log cursor 修复、空 scaffold / legacy 无日志兼容、失败 UX 与 provenance guard 加固 | 可先预览再显式修复 cursor，不必手写 `state.json`；恢复、归档和读取路径对 daily-log 解析更一致 |

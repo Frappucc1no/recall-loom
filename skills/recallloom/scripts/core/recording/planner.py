@@ -71,6 +71,20 @@ METADATA_REFRESH_COMMAND = (
     "recallloom.py sync-current-state-after-append same_project --reuse-current-summary "
     "--semantic-unchanged-assertion-json same_bound_assertion_json --json"
 )
+MUTATING_READY_RECORD_CLASSES = frozenset(
+    {
+        "append_only",
+        "current_state_update",
+        "metadata_refresh_only",
+    }
+)
+READY_AFTER_PREFLIGHT_LABELS = frozenset(
+    {
+        "structural_only_ready_after_preflight",
+        "helper_evidenced_ready_after_preflight",
+        "review_imported_baseline_ready_after_preflight",
+    }
+)
 
 UNSAFE_RECORD_TEXT_TOKENS = (
     "<!-- recallloom:",
@@ -157,6 +171,33 @@ def _privacy_classification(input_contract: Mapping[str, Any]) -> str:
     return value.strip().casefold().replace("-", "_") if isinstance(value, str) else "unknown"
 
 
+def _has_no_write_language(text: str) -> bool:
+    return _contains_any(
+        text,
+        (
+            "只是探索",
+            "还没形成结论",
+            "defer",
+            "no write",
+            "无需记录",
+            "不用记录",
+            "不要记录",
+            "不需要记录",
+            "不必记录",
+            "无需写入",
+            "不用写入",
+            "不要写入",
+            "不用写",
+            "不要写",
+            "只是确认",
+            "仅确认",
+            "只是核对",
+            "只是检查",
+            "只是问一下",
+        ),
+    )
+
+
 def classify_record_plan_input(
     input_contract: Mapping[str, Any],
     *,
@@ -173,6 +214,9 @@ def classify_record_plan_input(
     if record_class_hint is not None:
         return normalize_record_class_hint(record_class_hint), "high"
 
+    if _has_no_write_language(combined):
+        return "defer_no_write", "medium"
+
     layer_hint = normalized.get("optional_layer_hint")
     if layer_hint == "daily_log":
         return "append_only", "medium"
@@ -187,8 +231,6 @@ def classify_record_plan_input(
 
     if _contains_any(combined, ("已经记过", "duplicate", "already recorded", "重复")):
         return "duplicate_noop", "medium"
-    if _contains_any(combined, ("只是探索", "还没形成结论", "defer", "no write", "无需记录")):
-        return "defer_no_write", "medium"
     if _contains_any(combined, ("刚才那条", "改一下", "覆盖上一条", "amend", "overwrite")):
         return "amend_last", "medium"
     if _contains_any(combined, ("记录规则", "protocol rule", "update_protocol", "规则改成")):
@@ -326,6 +368,36 @@ def _blocked_reason_for_class(record_class: str) -> str | None:
     return None
 
 
+def _preflight_readiness_label(preflight_payload: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(preflight_payload, Mapping):
+        return None
+    write_readiness = preflight_payload.get("write_readiness")
+    if not isinstance(write_readiness, Mapping):
+        return None
+    readiness = write_readiness.get("readiness")
+    return readiness if isinstance(readiness, str) else None
+
+
+def _preflight_blocks_mutating_plan(
+    record_class: str,
+    preflight_payload: Mapping[str, Any] | None,
+) -> bool:
+    if record_class not in MUTATING_READY_RECORD_CLASSES:
+        return False
+    if not isinstance(preflight_payload, Mapping) or not preflight_payload:
+        return False
+    if preflight_payload.get("write_context_authorized") is False:
+        return True
+    allowed_operation_level = preflight_payload.get("allowed_operation_level")
+    if (
+        allowed_operation_level is not None
+        and allowed_operation_level != "write_current_state_after_preflight"
+    ):
+        return True
+    readiness_label = _preflight_readiness_label(preflight_payload)
+    return readiness_label is not None and readiness_label not in READY_AFTER_PREFLIGHT_LABELS
+
+
 def plan_record(
     *,
     input_contract: Mapping[str, Any],
@@ -364,12 +436,20 @@ def plan_record(
     else:
         workflow_status = "ready_to_run"
 
+    preflight_blocks_write = _preflight_blocks_mutating_plan(record_class, preflight_payload)
+    if workflow_status == "ready_to_run" and preflight_blocks_write:
+        workflow_status = "blocked_fixable"
+        blocked_reason = "preflight_write_not_ready"
+        path = ()
+
     current_safe_command = path[0] if workflow_status == "ready_to_run" and path else None
     recommended_action = (
         "stop_and_redact_input"
         if record_class == "unsafe_blocked"
         else "ask_one_user_confirmation"
         if workflow_status == "needs_user_confirmation"
+        else "resolve_preflight_write_readiness"
+        if workflow_status == "blocked_fixable"
         else "no_write_needed"
         if workflow_status in {"no_write", "complete"}
         else "run_current_safe_command"
@@ -382,6 +462,7 @@ def plan_record(
         record_class=record_class,
         workflow_status=workflow_status,
         confidence=confidence,
+        write_effect="planned_only" if preflight_blocks_write else None,
         ordered_executable_path=path,
         current_safe_command=current_safe_command,
         single_next_command=current_safe_command,

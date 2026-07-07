@@ -23,7 +23,7 @@ from core.provenance.receipts import (
     receipt_payload_digest,
     validate_receipt_payload,
 )
-from core.provenance.state import provenance_contract_identity
+from core.provenance.state import accepted_preflight_contract_identities_for_receipts
 
 
 RECEIPT_STORE_SCHEMA_VERSION = "0.1"
@@ -281,7 +281,8 @@ def _validate_persisted_receipt_value(receipt: dict) -> bool:
         and receipt["target_digest"].startswith("sha256:")
         and isinstance(receipt.get("state_digest"), str)
         and receipt["state_digest"].startswith("sha256:")
-        and receipt.get("preflight_contract_identity") == provenance_contract_identity()
+        and receipt.get("preflight_contract_identity")
+        in accepted_preflight_contract_identities_for_receipts()
         and receipt.get("contract_identity") in accepted_receipt_contract_identities()
         and _validate_store_binding(
             receipt.get("store_binding"),

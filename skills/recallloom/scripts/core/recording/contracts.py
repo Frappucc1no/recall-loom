@@ -85,6 +85,7 @@ BLOCKED_REASONS = (
     "package_support_blocked",
     "unsupported_record_class",
     "no_safe_command",
+    "preflight_write_not_ready",
 )
 BLOCKED_REASON_SET = frozenset(BLOCKED_REASONS)
 
