@@ -31,6 +31,12 @@ from core.provenance.bindings import (
     PreflightBindingLeaseError,
     verify_preflight_binding_lease,
 )
+from core.provenance.evidence import (
+    strict_gate_current_receipts_verified,
+    strict_sidecar_no_write_failure_extra_from_summary,
+    strict_sidecar_integrity_gate,
+    strict_sidecar_integrity_gate_public_summary,
+)
 from core.provenance.receipts import RECEIPT_SCHEMA_VERSION, assert_public_safe_json, public_receipt_claim
 from core.provenance.state import (
     helper_evidenced_metadata,
@@ -302,6 +308,46 @@ def preflight_binding_failure(
         message=message,
         reason="invalid_prepared_input",
         details=details,
+    )
+
+
+def enforce_strict_sidecar_integrity_gate(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: Path,
+    storage_root: Path,
+) -> dict:
+    gate = strict_sidecar_integrity_gate(
+        project_root=project_root,
+        storage_root=storage_root,
+    )
+    if gate.get("allowed_for_mutation") is True:
+        return gate
+    gate_summary = strict_sidecar_integrity_gate_public_summary(gate)
+    message = (
+        "Strict sidecar integrity gate blocked this daily-log append. "
+        "Review or repair sidecar evidence before writing."
+    )
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=message,
+        reason="trust_review_required",
+        details={
+            "reason_code": "strict_sidecar_integrity_failed",
+            "strict_gate_reason_code": gate_summary.get("reason_code"),
+            "strict_sidecar_integrity_gate": gate_summary,
+            "command": "append",
+            "operation": "daily_log_append",
+            "side_effect": "none",
+        },
+        extra=strict_sidecar_no_write_failure_extra_from_summary(
+            gate_summary,
+            continuity_confidence="broken",
+            include_recovery_actions=False,
+        ),
     )
 
 
@@ -704,13 +750,21 @@ def enforce_provenance_write_gate(
     json_mode: bool,
     state: dict,
     preflight_binding: dict | None,
+    strict_gate: dict | None = None,
 ) -> None:
+    receipts_verified = (
+        strict_gate_current_receipts_verified(strict_gate)
+        if isinstance(strict_gate, dict)
+        else False
+    )
     gate = helper_write_gate_from_state(
         state,
         helper_name="append_daily_log_entry.py",
         operation_class="daily_log_append",
         preflight_binding_present=preflight_binding is not None,
         require_preflight_for_review_imported_baseline=True,
+        receipt_chain_verified=receipts_verified,
+        receipt_store_available=receipts_verified,
     )
     if preflight_binding is not None:
         binding_state = preflight_binding.get("provenance_state")
@@ -1842,6 +1896,12 @@ def main() -> None:
     receipt_finalization = None
     try:
         with workspace_write_lock(workspace.project_root, "append_daily_log_entry.py"):
+            strict_gate = enforce_strict_sidecar_integrity_gate(
+                parser,
+                json_mode=args.json,
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+            )
             state_path = workspace.storage_root / FILE_KEYS["state"]
             state = load_workspace_state(state_path)
             binding_expected_workspace_revision = (
@@ -1868,6 +1928,7 @@ def main() -> None:
                 json_mode=args.json,
                 state=state,
                 preflight_binding=preflight_binding,
+                strict_gate=strict_gate,
             )
             logs_dir = workspace.storage_root / DAILY_LOGS_DIRNAME
             latest_existing = latest_active_daily_log(logs_dir)

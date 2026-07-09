@@ -16,6 +16,10 @@ from core.coldstart.structured import (
     promotion_ready_for_action,
 )
 from core.protocol.contracts import FILE_KEYS
+from core.provenance.evidence import (
+    strict_sidecar_integrity_gate,
+    strict_sidecar_integrity_gate_public_summary,
+)
 from core.provenance.state import review_imported_baseline_metadata
 from core.safety.prepared_input import (
     PreparedInputSafetyError,
@@ -88,6 +92,44 @@ def exit_prepared_input_safety_error(
         message=error.message,
         reason="invalid_prepared_input",
         details=error.details,
+    )
+
+
+def enforce_recovery_import_strict_gate(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: Path,
+    storage_root: Path,
+) -> dict:
+    gate = strict_sidecar_integrity_gate(
+        project_root=project_root,
+        storage_root=storage_root,
+    )
+    gate_summary = strict_sidecar_integrity_gate_public_summary(gate)
+    if (
+        gate.get("allowed_for_mutation") is True
+        or gate.get("reason_code") == "provenance_review_required"
+    ):
+        return gate_summary
+    message = (
+        "Strict sidecar integrity gate blocked recovery review promotion. "
+        "Repair lower-level sidecar evidence before recording review_imported_baseline."
+    )
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=message,
+        reason="trust_review_required",
+        details={
+            "reason_code": "strict_sidecar_integrity_failed",
+            "strict_gate_reason_code": gate_summary.get("reason_code"),
+            "strict_sidecar_integrity_gate": gate_summary,
+            "command": "record_recovery_review",
+            "operation": "recovery_review_promotion",
+            "side_effect": "none",
+        },
     )
 
 
@@ -388,9 +430,16 @@ def main() -> None:
     recorded_at = now_iso_timestamp()
     provenance_state_after = None
     new_workspace_revision = None
+    strict_gate_summary = None
 
     try:
         with workspace_write_lock(workspace.project_root, "record_recovery_review.py"):
+            strict_gate_summary = enforce_recovery_import_strict_gate(
+                parser,
+                json_mode=args.json,
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+            )
             proposals_dir = ensure_managed_directory_chain(
                 workspace.storage_root,
                 ("companion", "recovery", "proposals"),
@@ -526,6 +575,7 @@ def main() -> None:
         "provenance_state_after": provenance_state_after,
         "new_workspace_revision": new_workspace_revision,
         "workspace_revision_bumped": new_workspace_revision is not None,
+        "strict_sidecar_integrity_gate": strict_gate_summary,
         "recorded_at": recorded_at,
     }
     if args.json:

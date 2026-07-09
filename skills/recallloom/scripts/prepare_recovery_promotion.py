@@ -18,6 +18,10 @@ from core.coldstart.structured import (
 )
 from core.protocol.contracts import FILE_KEYS
 from core.protocol.markers import parse_file_state_marker
+from core.provenance.evidence import (
+    strict_sidecar_integrity_gate,
+    strict_sidecar_integrity_gate_public_summary,
+)
 from core.provenance.state import provenance_facts_from_state
 
 from _common import (
@@ -92,6 +96,21 @@ def latest_daily_log_entry_info(latest_daily_log: Path | None):
     return latest_entry
 
 
+def recovery_promotion_write_context_blocked_reason(
+    *,
+    promotion_ready: bool,
+    review_imported_baseline: bool,
+    strict_gate_allows_write: bool,
+) -> str | None:
+    if promotion_ready and review_imported_baseline and strict_gate_allows_write:
+        return None
+    if promotion_ready and review_imported_baseline:
+        return "strict_sidecar_integrity_failed"
+    if promotion_ready:
+        return "review_import_not_recorded"
+    return "promotion_not_ready"
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -125,6 +144,11 @@ def main() -> None:
             message="No RecallLoom project root found.",
             payload=cli_failure_payload("no_project_root", error="No RecallLoom project root found."),
         )
+    strict_gate = strict_sidecar_integrity_gate(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
+    strict_gate_summary = strict_sidecar_integrity_gate_public_summary(strict_gate)
 
     try:
         proposals_dir = ensure_managed_directory_chain(
@@ -423,7 +447,14 @@ def main() -> None:
             json_mode=args.json,
             exit_code=2,
             message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+            payload=cli_failure_payload_for_exception(
+                exc,
+                default_reason="damaged_sidecar",
+                extra={
+                    "strict_sidecar_integrity_gate": strict_gate_summary,
+                    "side_effect": "none",
+                },
+            ),
         )
     except (OSError, UnicodeDecodeError) as exc:
         message = "Filesystem error while preparing recovery promotion context."
@@ -440,7 +471,14 @@ def main() -> None:
         )
 
     safe_write_context_allowed = (
-        promotion_ready and provenance_facts["review_imported_baseline"]
+        promotion_ready
+        and provenance_facts["review_imported_baseline"]
+        and strict_gate.get("allowed_for_mutation") is True
+    )
+    write_context_blocked_reason = recovery_promotion_write_context_blocked_reason(
+        promotion_ready=promotion_ready,
+        review_imported_baseline=provenance_facts["review_imported_baseline"],
+        strict_gate_allows_write=strict_gate.get("allowed_for_mutation") is True,
     )
     payload = {
         "ok": True,
@@ -469,6 +507,7 @@ def main() -> None:
             else "structurally_valid"
         ),
         "review_import_does_not_claim_helper_evidenced": True,
+        "strict_sidecar_integrity_gate": strict_gate_summary,
         "safe_write_context": ({
             "workspace_revision": state["workspace_revision"],
             "commit_context_file": {
@@ -497,13 +536,7 @@ def main() -> None:
                 "expected_workspace_revision": state["workspace_revision"],
             },
         } if safe_write_context_allowed else None),
-        "write_context_blocked_reason": (
-            None
-            if safe_write_context_allowed
-            else "review_import_not_recorded"
-            if promotion_ready
-            else "promotion_not_ready"
-        ),
+        "write_context_blocked_reason": write_context_blocked_reason,
         "notes": [
             "This helper does not promote any content into core continuity files.",
             "Only rolling_summary.md, context_brief.md, and daily log appends are valid promotion targets for reviewed recovery content.",
@@ -525,7 +558,14 @@ def main() -> None:
         public_review = public_project_path(review_path, project_root=workspace.project_root) or review_path.name
         print(f"Prepared recovery promotion context for: {public_proposal}")
         print(f"Review record: {public_review}")
-        print("Use the returned safe_write_context with the normal write helpers after content review.")
+        if safe_write_context_allowed:
+            print("Use the returned safe_write_context with the normal write helpers after content review.")
+        else:
+            print("No safe_write_context was emitted; keep the sidecar read-only and resolve the reported gate first.")
+            if write_context_blocked_reason:
+                print(f"Write context blocked reason: {write_context_blocked_reason}")
+            if strict_gate_summary.get("reason_code"):
+                print(f"Gate reason: {strict_gate_summary['reason_code']}")
 
 
 if __name__ == "__main__":

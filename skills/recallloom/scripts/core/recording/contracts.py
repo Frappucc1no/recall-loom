@@ -86,6 +86,7 @@ BLOCKED_REASONS = (
     "unsupported_record_class",
     "no_safe_command",
     "preflight_write_not_ready",
+    "strict_sidecar_integrity_failed",
 )
 BLOCKED_REASON_SET = frozenset(BLOCKED_REASONS)
 
@@ -599,7 +600,15 @@ def _validate_output_constraints(payload: Mapping[str, Any]) -> None:
             raise RecordContractError(f"{record_class} must not expose executable write commands.")
     if workflow_status == "needs_user_confirmation" and not user_decision_required:
         raise RecordContractError("needs_user_confirmation outputs must require a user decision.")
-    if record_class in CONFIRMATION_REQUIRED_RECORD_CLASS_SET and not user_decision_required:
+    strict_integrity_blocked = (
+        workflow_status == "blocked_fixable"
+        and blocked_reason == "strict_sidecar_integrity_failed"
+    )
+    if (
+        record_class in CONFIRMATION_REQUIRED_RECORD_CLASS_SET
+        and not user_decision_required
+        and not strict_integrity_blocked
+    ):
         raise RecordContractError(f"{record_class} must require a user decision.")
     if workflow_status in {"blocked_fixable", "blocked_unsafe"} and blocked_reason is None:
         raise RecordContractError(f"{workflow_status} outputs must include blocked_reason.")

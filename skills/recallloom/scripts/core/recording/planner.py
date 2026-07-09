@@ -337,6 +337,8 @@ def _expected_revision_binding(preflight_payload: Mapping[str, Any] | None) -> d
         "continuity_drift_risk_level",
         "continuity_drift_review_required",
         "continuity_drift_note",
+        "write_context_blocked_reason",
+        "strict_sidecar_integrity_gate",
         "preflight_contract_identity",
     ):
         if key in preflight_payload:
@@ -410,6 +412,16 @@ def _preflight_readiness_label(preflight_payload: Mapping[str, Any] | None) -> s
     return readiness if isinstance(readiness, str) else None
 
 
+def _preflight_allows_metadata_refresh(preflight_payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(preflight_payload, Mapping):
+        return False
+    safe_write_context = preflight_payload.get("safe_write_context")
+    if not isinstance(safe_write_context, Mapping):
+        return False
+    contract = safe_write_context.get("post_append_summary_sync")
+    return isinstance(contract, Mapping) and contract.get("allowed") is True
+
+
 def _preflight_blocks_mutating_plan(
     record_class: str,
     preflight_payload: Mapping[str, Any] | None,
@@ -417,6 +429,8 @@ def _preflight_blocks_mutating_plan(
     if record_class not in MUTATING_READY_RECORD_CLASSES:
         return False
     if not isinstance(preflight_payload, Mapping) or not preflight_payload:
+        return False
+    if record_class == "metadata_refresh_only" and _preflight_allows_metadata_refresh(preflight_payload):
         return False
     if preflight_payload.get("write_context_authorized") is False:
         return True
@@ -428,6 +442,15 @@ def _preflight_blocks_mutating_plan(
         return True
     readiness_label = _preflight_readiness_label(preflight_payload)
     return readiness_label is not None and readiness_label not in READY_AFTER_PREFLIGHT_LABELS
+
+
+def _preflight_strict_gate_blocks_write(preflight_payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(preflight_payload, Mapping):
+        return False
+    strict_gate = preflight_payload.get("strict_sidecar_integrity_gate")
+    if isinstance(strict_gate, Mapping) and strict_gate.get("allowed_for_mutation") is False:
+        return True
+    return preflight_payload.get("write_context_blocked_reason") == "strict_sidecar_integrity_failed"
 
 
 def plan_record(
@@ -469,9 +492,24 @@ def plan_record(
         workflow_status = "ready_to_run"
 
     preflight_blocks_write = _preflight_blocks_mutating_plan(record_class, preflight_payload)
-    if workflow_status == "ready_to_run" and preflight_blocks_write:
+    preflight_strict_blocks_write = _preflight_strict_gate_blocks_write(preflight_payload)
+    strict_gate_blocks_mutating_plan = preflight_strict_blocks_write and record_class not in {
+        "duplicate_noop",
+        "defer_no_write",
+        "no_write_success",
+        "unsafe_blocked",
+    }
+    if strict_gate_blocks_mutating_plan:
         workflow_status = "blocked_fixable"
-        blocked_reason = "preflight_write_not_ready"
+        blocked_reason = "strict_sidecar_integrity_failed"
+        path = ()
+    elif workflow_status == "ready_to_run" and preflight_blocks_write:
+        workflow_status = "blocked_fixable"
+        blocked_reason = (
+            "strict_sidecar_integrity_failed"
+            if preflight_strict_blocks_write
+            else "preflight_write_not_ready"
+        )
         path = ()
 
     current_safe_command = path[0] if workflow_status == "ready_to_run" and path else None
@@ -480,6 +518,8 @@ def plan_record(
         if record_class == "unsafe_blocked"
         else "ask_one_user_confirmation"
         if workflow_status == "needs_user_confirmation"
+        else "review_or_repair_sidecar_before_write"
+        if workflow_status == "blocked_fixable" and preflight_strict_blocks_write
         else "resolve_preflight_write_readiness"
         if workflow_status == "blocked_fixable"
         else "no_write_needed"
@@ -490,14 +530,24 @@ def plan_record(
         "record --plan is side-effect-free",
         "commands are placeholders and do not include user payload",
     )
+    planned_layers = () if preflight_strict_blocks_write else None
+    write_effect = (
+        "none"
+        if preflight_strict_blocks_write
+        else "planned_only"
+        if preflight_blocks_write
+        else None
+    )
     return build_record_plan_output(
         record_class=record_class,
         workflow_status=workflow_status,
         confidence=confidence,
-        write_effect="planned_only" if preflight_blocks_write else None,
+        write_effect=write_effect,
+        planned_layers=planned_layers,
         ordered_executable_path=path,
         current_safe_command=current_safe_command,
         single_next_command=current_safe_command,
+        user_decision_required=False if strict_gate_blocks_mutating_plan else None,
         required_gates=_required_gates_for_class(record_class),
         terminal_success_condition=_terminal_condition(record_class),
         blocked_reason=blocked_reason,

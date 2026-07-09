@@ -863,6 +863,8 @@ def helper_write_gate_from_state(
     operation_class: str,
     preflight_binding_present: bool = False,
     require_preflight_for_review_imported_baseline: bool = False,
+    receipt_chain_verified: bool = False,
+    receipt_store_available: bool = False,
 ) -> dict:
     """Return the provenance gate for a helper that is about to mutate sidecar state."""
 
@@ -877,6 +879,8 @@ def helper_write_gate_from_state(
     state_label = classify_provenance_state(
         sidecar_trust_state=sidecar_trust_state,
         continuity_state=None,
+        receipt_chain_verified=receipt_chain_verified,
+        receipt_store_available=receipt_store_available,
         helper_evidenced_baseline=provenance_facts["helper_evidenced"],
         legacy_sidecar=provenance_facts["legacy_sidecar"],
         review_required=provenance_facts["review_required"],
@@ -889,6 +893,8 @@ def helper_write_gate_from_state(
         ),
         summary_stale=False if preflight_binding_present else None,
         expected_revisions=None,
+        receipt_chain_verified=receipt_chain_verified,
+        receipt_store_available=receipt_store_available,
     )
 
     allowed = True

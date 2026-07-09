@@ -38,14 +38,14 @@ The current advisory shape is:
 
 ```json
 {
-  "latest_version": "0.4.6.1",
+  "latest_version": "0.4.6.2",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
   "advisory_level": "upgrade_recommended",
   "release_channel": "stable",
   "public_release_status": "released",
-  "reason_code": "v0461_emergency_bugfix_recommended",
-  "user_message": "RecallLoom v0.4.6.1 is the recommended stable v0.4.6-line bugfix package. Users on v0.4.6 or older should update for upgraded-workspace receipt-store compatibility and recording workflow planning fixes.",
+  "reason_code": "v0462_emergency_bugfix_recommended",
+  "user_message": "RecallLoom v0.4.6.2 is the recommended stable v0.4.6-line bugfix package. Users on v0.4.6.1 or older should update for stricter write-readiness gates that stop append, write, sync, and recovery follow-up actions when sidecar integrity checks fail.",
   "support_advisory_url_status": "canonical_public_location",
   "remote_parity_rule": "The default support_advisory_url points at the canonical public origin/main location. Re-run remote support/readiness checks after publishing package updates.",
   "update_hints": {

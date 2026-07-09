@@ -23,6 +23,12 @@ from core.continuity.workday import (
     detect_closure_signal,
 )
 from core.trust.state import evaluate_trust_state
+from core.provenance.evidence import (
+    strict_gate_current_receipts_verified,
+    strict_sidecar_no_write_failure_extra,
+    strict_sidecar_integrity_gate,
+    strict_sidecar_integrity_gate_public_summary,
+)
 from core.provenance.state import (
     build_provenance_report,
     expected_revisions_payload,
@@ -205,6 +211,28 @@ def recommended_actions_for_preflight(
     ):
         actions.append("consider_refresh_summary")
     return actions
+
+
+def strict_gate_preflight_actions(actions: list[str], *, strict_gate_allows_write: bool) -> list[str]:
+    if strict_gate_allows_write:
+        return actions
+    blocked_write_actions = {
+        "seed_initial_continuity",
+        "update_rolling_summary",
+        "consider_refresh_summary",
+    }
+    return [
+        "review_or_repair_sidecar_before_write",
+        *(action for action in actions if action not in blocked_write_actions),
+    ]
+
+
+def strict_gate_preflight_failure_extra(workspace) -> dict[str, object]:
+    return strict_sidecar_no_write_failure_extra(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        continuity_confidence="broken",
+    )
 
 
 def managed_body_digest(text: str) -> str:
@@ -491,7 +519,11 @@ def main() -> None:
             json_mode=args.json,
             exit_code=2,
             message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
+            payload=cli_failure_payload_for_exception(
+                exc,
+                default_reason="damaged_sidecar",
+                extra=strict_sidecar_no_write_failure_extra(continuity_confidence="broken"),
+            ),
         )
     if workspace is None:
         exit_with_cli_error(
@@ -503,6 +535,10 @@ def main() -> None:
                 "no_project_root",
                 error="No RecallLoom project root found.",
                 details={"project_root": str(Path(args.path).expanduser().resolve())},
+                extra=strict_sidecar_no_write_failure_extra(
+                    continuity_confidence="broken",
+                    include_recovery_actions=False,
+                ),
             ),
         )
     startup_residue_report = None
@@ -529,6 +565,7 @@ def main() -> None:
                 payload=cli_failure_payload(
                     "malformed_managed_file",
                     error=f"Missing required file: {summary_path}",
+                    extra=strict_gate_preflight_failure_extra(workspace),
                 ),
             )
 
@@ -548,6 +585,7 @@ def main() -> None:
                         "Refusing preflight because one or more daily log filenames match the date pattern but are invalid ISO dates:\n"
                         + "\n".join(str(path) for path in invalid_daily_logs)
                     ),
+                    extra=strict_gate_preflight_failure_extra(workspace),
                 ),
             )
 
@@ -571,6 +609,7 @@ def main() -> None:
                         **exc.details,
                         "project_root": str(workspace.project_root),
                     },
+                    extra=strict_gate_preflight_failure_extra(workspace),
                 ),
             )
         latest_daily_log = (
@@ -593,6 +632,7 @@ def main() -> None:
                 payload=cli_failure_payload(
                     "malformed_managed_file",
                     error=f"Missing required file-state metadata marker: {summary_path}",
+                    extra=strict_gate_preflight_failure_extra(workspace),
                 ),
             )
         context_brief_state = None
@@ -607,6 +647,7 @@ def main() -> None:
                     payload=cli_failure_payload(
                         "malformed_managed_file",
                         error=f"Missing required file-state metadata marker: {context_brief_path}",
+                        extra=strict_gate_preflight_failure_extra(workspace),
                     ),
                 )
         update_protocol_state = None
@@ -621,6 +662,7 @@ def main() -> None:
                     payload=cli_failure_payload(
                         "malformed_managed_file",
                         error=f"Missing required file-state metadata marker: {update_protocol_path}",
+                        extra=strict_gate_preflight_failure_extra(workspace),
                     ),
                 )
 
@@ -636,14 +678,15 @@ def main() -> None:
                     json_mode=args.json,
                     exit_code=2,
                     message=str(exc),
-                    payload=cli_failure_payload(
-                        "malformed_managed_file",
-                        error=str(exc),
-                        details={
-                            **exc.details,
-                            "project_root": str(workspace.project_root),
-                        },
-                    ),
+                        payload=cli_failure_payload(
+                            "malformed_managed_file",
+                            error=str(exc),
+                            details={
+                                **exc.details,
+                                "project_root": str(workspace.project_root),
+                            },
+                            extra=strict_gate_preflight_failure_extra(workspace),
+                        ),
                 )
         if latest_daily_log is not None:
             (
@@ -666,6 +709,7 @@ def main() -> None:
                             "Missing required daily-log-entry metadata marker in the latest ISO-dated daily log: "
                             f"{latest_daily_log}"
                         ),
+                        extra=strict_gate_preflight_failure_extra(workspace),
                     ),
                 )
             latest_daily_log_has_entries = latest_daily_log_entry_count > 0
@@ -775,19 +819,46 @@ def main() -> None:
                 update_protocol_state.revision if update_protocol_state else None
             ),
         )
-        provenance_write_context_blocked = trust_state["provenance_state"] in {
+        strict_gate = strict_sidecar_integrity_gate(
+            project_root=workspace.project_root,
+            storage_root=workspace.storage_root,
+        )
+        strict_gate_summary = strict_sidecar_integrity_gate_public_summary(strict_gate)
+        strict_gate_allows_write = strict_gate.get("allowed_for_mutation") is True
+        strict_gate_receipts_verified = strict_gate_current_receipts_verified(strict_gate)
+        provenance_write_context_blocked_by_state = trust_state["provenance_state"] in {
             "review_required",
             "structurally_valid_legacy",
             "inconsistent_or_tampered_evidence",
         }
+        provenance_write_context_blocked = (
+            provenance_write_context_blocked_by_state or not strict_gate_allows_write
+        )
+        effective_allowed_operation_level = trust_state["allowed_operation_level"]
+        if (
+            not strict_gate_allows_write
+            and effective_allowed_operation_level == "write_current_state_after_preflight"
+        ):
+            effective_allowed_operation_level = "read_current_state"
+        if provenance_write_context_blocked_by_state:
+            write_context_blocked_reason = "provenance_review_required"
+        elif not strict_gate_allows_write:
+            write_context_blocked_reason = "strict_sidecar_integrity_failed"
+        else:
+            write_context_blocked_reason = None
+        recommended_actions = strict_gate_preflight_actions(
+            recommended_actions,
+            strict_gate_allows_write=strict_gate_allows_write,
+        )
         write_expected_revisions = None if provenance_write_context_blocked else expected_revisions
         provenance = build_provenance_report(
             sidecar_trust_state=trust_state["sidecar_trust_state"],
             continuity_state=continuity_state,
-            allowed_operation_level=trust_state["allowed_operation_level"],
+            allowed_operation_level=effective_allowed_operation_level,
             summary_stale=summary_stale,
             expected_revisions=write_expected_revisions,
-            receipt_chain_verified=False,
+            receipt_chain_verified=strict_gate_receipts_verified,
+            receipt_store_available=strict_gate_receipts_verified,
             legacy_sidecar=provenance_facts["legacy_sidecar"],
             review_required=provenance_facts["review_required"],
             review_imported_baseline=provenance_facts["review_imported_baseline"],
@@ -800,9 +871,14 @@ def main() -> None:
             failure_contract = cli_failure_payload(
                 getattr(exc, "failure_reason", None) or "damaged_sidecar",
                 error=message,
+                extra=strict_gate_preflight_failure_extra(workspace),
             )
         else:
-            failure_contract = cli_failure_payload("damaged_sidecar", error=message)
+            failure_contract = cli_failure_payload(
+                "damaged_sidecar",
+                error=message,
+                extra=strict_gate_preflight_failure_extra(workspace),
+            )
         exit_with_cli_error(
             parser,
             json_mode=args.json,
@@ -915,11 +991,10 @@ def main() -> None:
         "preflight_contract_identity": provenance_contract_identity(),
         "expected_revisions": write_expected_revisions,
         "write_context_authorized": not provenance_write_context_blocked,
-        "write_context_blocked_reason": (
-            "provenance_review_required" if provenance_write_context_blocked else None
-        ),
+        "write_context_blocked_reason": write_context_blocked_reason,
         "write_readiness": provenance["write_readiness"],
-        "allowed_operation_level": trust_state["allowed_operation_level"],
+        "allowed_operation_level": effective_allowed_operation_level,
+        "strict_sidecar_integrity_gate": strict_gate_summary,
         "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
         "freshness_risk_level": freshness_risk["level"],
         "freshness_risk_note": freshness_risk["note"],
@@ -1038,7 +1113,7 @@ def main() -> None:
             summary_revision_is_stale=summary_revision_is_stale,
             summary_stale=summary_stale,
             workspace_is_newer=workspace_is_newer,
-            allowed_operation_level=trust_state["allowed_operation_level"],
+            allowed_operation_level=effective_allowed_operation_level,
             rolling_summary_handoff=rolling_summary_handoff,
         )
 
@@ -1070,7 +1145,7 @@ def main() -> None:
             for action in recommended_actions:
                 print(f"  - {action}")
         print("Recommended write targets:")
-        for target in recommended_write_targets:
+        for target in payload["recommended_write_targets"]:
             print(f"  - {target}")
         if conditional_review_targets:
             print("Conditional review targets:")
@@ -1089,7 +1164,8 @@ def main() -> None:
             )
             print("  - use append_daily_log_entry.py for revision-checked daily-log milestone entries")
         else:
-            print("Safe write context: unavailable pending provenance review")
+            reason = payload.get("write_context_blocked_reason") or "provenance_review_required"
+            print(f"Safe write context: unavailable ({reason})")
 
     raise SystemExit(3 if args.fail_on_stale and workspace_is_newer else 0)
 

@@ -127,6 +127,13 @@ from core.provenance.bindings import (
     PreflightBindingLeaseError,
     write_preflight_binding_lease,
 )
+from core.provenance.evidence import (
+    strict_gate_current_receipts_verified,
+    strict_sidecar_no_write_failure_extra,
+    strict_sidecar_no_write_failure_extra_from_summary,
+    strict_sidecar_integrity_gate,
+    strict_sidecar_integrity_gate_public_summary,
+)
 from core.provenance.state import (
     build_provenance_report,
     expected_revisions_payload,
@@ -1551,6 +1558,43 @@ def _issue_preflight_binding_json(
             payload=cli_failure_payload("no_project_root", error=message),
             support=support,
         )
+    strict_gate = strict_sidecar_integrity_gate(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
+    if strict_gate.get("allowed_for_mutation") is not True:
+        gate_summary = strict_sidecar_integrity_gate_public_summary(strict_gate)
+        message = (
+            "Strict sidecar integrity gate blocked preflight binding issuance. "
+            "Review or repair sidecar evidence before any mutating helper write."
+        )
+        _exit_with_support(
+            parser,
+            json_mode=getattr(args, "json", False),
+            exit_code=3,
+            message=message,
+            payload=cli_failure_payload(
+                "trust_review_required",
+                error=message,
+                details={
+                    **_preflight_gate_details(preflight_payload),
+                    "reason_code": "strict_sidecar_integrity_failed",
+                    "strict_gate_reason_code": gate_summary.get("reason_code"),
+                    "strict_sidecar_integrity_gate": gate_summary,
+                    "command": getattr(args, "command", None),
+                    "operation_class": binding.get("operation_class"),
+                    "file_key": binding.get("file_key"),
+                    "side_effect": "none",
+                    "lease_store": "derived/preflight-bindings.json",
+                },
+                extra=strict_sidecar_no_write_failure_extra_from_summary(
+                    gate_summary,
+                    continuity_confidence="broken",
+                    include_recovery_actions=False,
+                ),
+            ),
+            support=support,
+        )
     try:
         write_preflight_binding_lease(
             storage_root=workspace.storage_root,
@@ -1592,11 +1636,137 @@ def _preflight_gate_details(preflight_payload: dict) -> dict:
         "provenance_state",
         "write_readiness",
         "expected_revisions",
+        "strict_sidecar_integrity_gate",
         "preflight_contract_identity",
         "workspace_newer_than_summary",
         "summary_revision_stale",
     )
     return {key: preflight_payload.get(key) for key in detail_keys if key in preflight_payload}
+
+
+def _strict_preflight_blocked(preflight_payload: dict) -> bool:
+    strict_gate = preflight_payload.get("strict_sidecar_integrity_gate")
+    if isinstance(strict_gate, dict) and strict_gate.get("allowed_for_mutation") is False:
+        return True
+    return preflight_payload.get("write_context_blocked_reason") == "strict_sidecar_integrity_failed"
+
+
+def _effective_allowed_operation_level_for_strict_gate(
+    allowed_operation_level: str,
+    strict_gate: dict,
+) -> str:
+    if (
+        strict_gate.get("allowed_for_mutation") is not True
+        and allowed_operation_level == "write_current_state_after_preflight"
+    ):
+        return "read_current_state"
+    return allowed_operation_level
+
+
+def _strict_gate_read_actions(actions: list[str], *, strict_gate_allows_write: bool) -> list[str]:
+    if strict_gate_allows_write:
+        return actions
+    blocked_write_actions = {
+        "seed_initial_continuity",
+        "update_rolling_summary",
+        "consider_refresh_summary",
+        "refresh_or_review_summary_before_write",
+    }
+    review_action = "review_or_repair_sidecar_before_write"
+    return [
+        review_action,
+        *(
+            action
+            for action in actions
+            if action not in blocked_write_actions
+            and action != review_action
+        ),
+    ]
+
+
+def _strict_gate_read_failure_extra(workspace) -> dict[str, object]:
+    return strict_sidecar_no_write_failure_extra(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        continuity_confidence="broken",
+    )
+
+
+def _strict_preflight_failure_details(
+    preflight_payload: dict,
+    *,
+    command: str,
+    operation: str,
+    file_key: str,
+    extra_details: dict | None = None,
+) -> dict:
+    strict_gate = preflight_payload.get("strict_sidecar_integrity_gate")
+    strict_gate_reason_code = (
+        strict_gate.get("reason_code") if isinstance(strict_gate, dict) else None
+    )
+    return {
+        **_preflight_gate_details(preflight_payload),
+        "reason_code": "strict_sidecar_integrity_failed",
+        "strict_gate_reason_code": strict_gate_reason_code,
+        "command": command,
+        "operation": operation,
+        "file_key": file_key,
+        "side_effect": "none",
+        **(extra_details or {}),
+    }
+
+
+def _strict_preflight_failure_extra(preflight_payload: dict) -> dict[str, object]:
+    strict_gate = preflight_payload.get("strict_sidecar_integrity_gate")
+    gate_summary = strict_gate if isinstance(strict_gate, dict) else {
+        "allowed_for_mutation": False,
+        "blocked_reason": "strict_sidecar_integrity_failed",
+        "reason_code": "strict_gate_unavailable",
+        "safe_next_action": (
+            "Keep the sidecar read-only until the integrity mismatch is reviewed and repaired."
+        ),
+    }
+    return strict_sidecar_no_write_failure_extra_from_summary(
+        gate_summary,
+        continuity_confidence=str(preflight_payload.get("continuity_confidence") or "broken"),
+        include_recovery_actions=False,
+    )
+
+
+def _exit_strict_preflight_failure(
+    parser,
+    args: argparse.Namespace,
+    *,
+    preflight_payload: dict,
+    support: dict,
+    command: str,
+    operation: str,
+    file_key: str,
+    extra_details: dict | None = None,
+) -> None:
+    message = (
+        "Strict sidecar integrity gate blocked this mutating action. "
+        "Review or repair sidecar evidence before append/write/sync."
+    )
+    _exit_with_support(
+        parser,
+        json_mode=getattr(args, "json", False),
+        exit_code=3,
+        message=message,
+        payload=cli_failure_payload(
+            "trust_review_required",
+            error=message,
+            details=_strict_preflight_failure_details(
+                preflight_payload,
+                command=command,
+                operation=operation,
+                file_key=file_key,
+                extra_details=extra_details,
+            ),
+            extra=_strict_preflight_failure_extra(preflight_payload),
+        ),
+        support=support,
+    )
 
 
 def _write_retry_payload(
@@ -1710,6 +1880,17 @@ def _enforce_write_preflight_gate(
         "helper_evidenced_ready_after_preflight",
         "review_imported_baseline_ready_after_preflight",
     }
+    if _strict_preflight_blocked(preflight_payload):
+        _exit_strict_preflight_failure(
+            parser,
+            args,
+            preflight_payload=preflight_payload,
+            support=support,
+            command="write",
+            operation="managed_file_commit",
+            file_key=file_key,
+            extra_details={"input_mode": input_mode},
+        )
     current_state_refresh_allowed = _current_state_refresh_allowed(
         file_key=file_key,
         write_type=args.write_type,
@@ -1789,6 +1970,16 @@ def _enforce_append_preflight_gate(
     preflight_payload: dict,
     support: dict,
 ) -> None:
+    if _strict_preflight_blocked(preflight_payload):
+        _exit_strict_preflight_failure(
+            parser,
+            args,
+            preflight_payload=preflight_payload,
+            support=support,
+            command="append",
+            operation="daily_log_append",
+            file_key="daily_log",
+        )
     provenance_state = preflight_payload.get("provenance_state")
     readiness_label = _write_readiness_label(preflight_payload)
     if provenance_state == "review_imported_baseline":
@@ -3025,6 +3216,17 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
             support=support,
         )
     preflight_payload = _preflight_payload(parser, args, support=support)
+    if _strict_preflight_blocked(preflight_payload):
+        _exit_strict_preflight_failure(
+            parser,
+            args,
+            preflight_payload=preflight_payload,
+            support=support,
+            command=POST_APPEND_SYNC_COMMAND,
+            operation="post_append_summary_sync",
+            file_key="rolling_summary",
+            extra_details={"input_mode": input_mode},
+        )
     contract = _post_append_sync_contract_from_preflight(preflight_payload)
     reason_code = _post_append_sync_contract_reason(contract)
     if reason_code is not None:
@@ -3255,7 +3457,11 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
             json_mode=args.json,
             exit_code=2,
             message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="not_project_root"),
+            payload=cli_failure_payload_for_exception(
+                exc,
+                default_reason="not_project_root",
+                extra=strict_sidecar_no_write_failure_extra(continuity_confidence="broken"),
+            ),
             support=support,
         )
     try:
@@ -3269,13 +3475,19 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
             payload=cli_failure_payload_for_exception(
                 exc,
                 default_reason="damaged_sidecar",
-                extra={"continuity_confidence": "broken"},
+                extra=strict_sidecar_no_write_failure_extra(continuity_confidence="broken"),
             ),
             support=support,
         )
 
     if workspace is None:
         payload = build_no_project_payload(start_path)
+        payload.update(
+            strict_sidecar_no_write_failure_extra(
+                continuity_confidence="none",
+                include_recovery_actions=False,
+            )
+        )
     else:
         startup_residue_report = _exit_if_startup_scratch_residue_with_support(
             parser,
@@ -3293,7 +3505,11 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
                     json_mode=args.json,
                     exit_code=2,
                     message=message,
-                    payload=cli_failure_payload("malformed_managed_file", error=message),
+                    payload=cli_failure_payload(
+                        "malformed_managed_file",
+                        error=message,
+                        extra=_strict_gate_read_failure_extra(workspace),
+                    ),
                     support=support,
                 )
             summary_text = read_text(summary_path)
@@ -3305,7 +3521,11 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
                     json_mode=args.json,
                     exit_code=2,
                     message=message,
-                    payload=cli_failure_payload("malformed_managed_file", error=message),
+                    payload=cli_failure_payload(
+                        "malformed_managed_file",
+                        error=message,
+                        extra=_strict_gate_read_failure_extra(workspace),
+                    ),
                     support=support,
                 )
             state = load_workspace_state(workspace.storage_root / FILE_KEYS["state"])
@@ -3318,7 +3538,7 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
                 payload=cli_failure_payload_for_exception(
                     exc,
                     default_reason="damaged_sidecar",
-                    extra={"continuity_confidence": "broken"},
+                    extra=_strict_gate_read_failure_extra(workspace),
                 ),
                 support=support,
             )
@@ -3332,6 +3552,18 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
                 summary_base_workspace_revision=summary_state.base_workspace_revision,
                 state=state,
             )
+            strict_gate = strict_sidecar_integrity_gate(
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+            )
+            payload["strict_sidecar_integrity_gate"] = (
+                strict_sidecar_integrity_gate_public_summary(strict_gate)
+            )
+            if strict_gate.get("allowed_for_mutation") is not True:
+                payload["next_actions"] = _strict_gate_read_actions(
+                    list(payload.get("next_actions", [])),
+                    strict_gate_allows_write=False,
+                )
         except DailyLogCursorError as exc:
             _exit_with_support(
                 parser,
@@ -3345,7 +3577,7 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
                         **exc.details,
                         "project_root": str(workspace.project_root),
                     },
-                    extra={"continuity_confidence": "broken"},
+                    extra=_strict_gate_read_failure_extra(workspace),
                 ),
                 support=support,
             )
@@ -3880,7 +4112,11 @@ def _build_progressive_resume_payload(
             json_mode=args.json,
             exit_code=2,
             message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="not_project_root"),
+            payload=cli_failure_payload_for_exception(
+                exc,
+                default_reason="not_project_root",
+                extra=strict_sidecar_no_write_failure_extra(continuity_confidence="broken"),
+            ),
             support=support,
         )
     try:
@@ -3894,7 +4130,7 @@ def _build_progressive_resume_payload(
             payload=cli_failure_payload_for_exception(
                 exc,
                 default_reason="damaged_sidecar",
-                extra={"continuity_confidence": "broken"},
+                extra=strict_sidecar_no_write_failure_extra(continuity_confidence="broken"),
             ),
             support=support,
         )
@@ -3965,6 +4201,10 @@ def _build_progressive_resume_payload(
             "write_readiness": provenance["write_readiness"],
             "allowed_operation_level": trust_state["allowed_operation_level"],
             "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
+            **strict_sidecar_no_write_failure_extra(
+                continuity_confidence="none",
+                include_recovery_actions=False,
+            ),
             "progressive_read_plan": {
                 "mode": mode,
                 "files": [],
@@ -3987,7 +4227,11 @@ def _build_progressive_resume_payload(
                 json_mode=args.json,
                 exit_code=2,
                 message=message,
-                payload=cli_failure_payload("malformed_managed_file", error=message),
+                payload=cli_failure_payload(
+                    "malformed_managed_file",
+                    error=message,
+                    extra=_strict_gate_read_failure_extra(workspace),
+                ),
                 support=support,
             )
         summary_text = read_text(summary_path)
@@ -3999,7 +4243,11 @@ def _build_progressive_resume_payload(
                 json_mode=args.json,
                 exit_code=2,
                 message=message,
-                payload=cli_failure_payload("malformed_managed_file", error=message),
+                payload=cli_failure_payload(
+                    "malformed_managed_file",
+                    error=message,
+                    extra=_strict_gate_read_failure_extra(workspace),
+                ),
                 support=support,
             )
         state = load_workspace_state(workspace.storage_root / FILE_KEYS["state"])
@@ -4013,7 +4261,7 @@ def _build_progressive_resume_payload(
             payload=cli_failure_payload_for_exception(
                 exc,
                 default_reason="damaged_sidecar",
-                extra={"continuity_confidence": "broken"},
+                extra=_strict_gate_read_failure_extra(workspace),
             ),
             support=support,
         )
@@ -4041,7 +4289,7 @@ def _build_progressive_resume_payload(
                     **exc.details,
                     "project_root": str(workspace.project_root),
                 },
-                extra={"continuity_confidence": "broken"},
+                extra=_strict_gate_read_failure_extra(workspace),
             ),
             support=support,
         )
@@ -4055,17 +4303,31 @@ def _build_progressive_resume_payload(
         workspace_newer_than_summary=quick_payload["freshness"].get("workspace_newer_than_summary", False),
         provenance_facts=provenance_facts,
     )
+    strict_gate = strict_sidecar_integrity_gate(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+    )
+    strict_gate_summary = strict_sidecar_integrity_gate_public_summary(strict_gate)
+    strict_gate_receipts_verified = strict_gate_current_receipts_verified(strict_gate)
+    effective_allowed_operation_level = _effective_allowed_operation_level_for_strict_gate(
+        trust_state["allowed_operation_level"],
+        strict_gate,
+    )
     expected_revisions = expected_revisions_payload(
         workspace_revision=state["workspace_revision"],
         rolling_summary_revision=summary_state.revision,
     )
+    write_expected_revisions = (
+        expected_revisions if strict_gate.get("allowed_for_mutation") is True else None
+    )
     provenance = build_provenance_report(
         sidecar_trust_state=trust_state["sidecar_trust_state"],
         continuity_state=continuity_state,
-        allowed_operation_level=trust_state["allowed_operation_level"],
+        allowed_operation_level=effective_allowed_operation_level,
         summary_stale=quick_payload["freshness"]["summary_stale"],
-        expected_revisions=expected_revisions,
-        receipt_chain_verified=False,
+        expected_revisions=write_expected_revisions,
+        receipt_chain_verified=strict_gate_receipts_verified,
+        receipt_store_available=strict_gate_receipts_verified,
         legacy_sidecar=provenance_facts["legacy_sidecar"],
         review_required=provenance_facts["review_required"],
         review_imported_baseline=provenance_facts["review_imported_baseline"],
@@ -4101,7 +4363,8 @@ def _build_progressive_resume_payload(
             "provenance_state": provenance["state_label"],
             "provenance_metadata_status": provenance["metadata_status"],
             "write_readiness": provenance["write_readiness"],
-            "allowed_operation_level": trust_state["allowed_operation_level"],
+            "allowed_operation_level": effective_allowed_operation_level,
+            "strict_sidecar_integrity_gate": strict_gate_summary,
             "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
             "read_confidence": trust_state["read_confidence"],
             "read_trust_note": trust_state["read_trust_note"],
@@ -4113,11 +4376,15 @@ def _build_progressive_resume_payload(
         "provenance_metadata_status": provenance["metadata_status"],
         "provenance_contract": provenance["contract_identity"],
         "preflight_contract_identity": provenance_contract_identity(),
-        "expected_revisions": expected_revisions,
+        "expected_revisions": write_expected_revisions,
         "write_readiness": provenance["write_readiness"],
-        "allowed_operation_level": trust_state["allowed_operation_level"],
+        "allowed_operation_level": effective_allowed_operation_level,
+        "strict_sidecar_integrity_gate": strict_gate_summary,
         "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
-        "next_actions": _resume_next_actions(mode=mode, quick_actions=quick_payload["next_actions"]),
+        "next_actions": _strict_gate_read_actions(
+            _resume_next_actions(mode=mode, quick_actions=quick_payload["next_actions"]),
+            strict_gate_allows_write=strict_gate.get("allowed_for_mutation") is True,
+        ),
         "package_support": public_package_support_payload(support),
     }
     if startup_residue_report is not None:
@@ -4149,7 +4416,7 @@ def _build_progressive_resume_payload(
             payload=cli_failure_payload(
                 "damaged_sidecar",
                 error=f"Filesystem error: {exc}",
-                extra={"continuity_confidence": "broken"},
+                extra=_strict_gate_read_failure_extra(workspace),
             ),
             support=support,
         )

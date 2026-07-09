@@ -127,6 +127,12 @@ from core.continuity.workday import (
     detect_closure_signal,
 )
 from core.trust.state import evaluate_trust_state
+from core.provenance.evidence import (
+    strict_gate_current_receipts_verified,
+    strict_sidecar_no_write_failure_extra,
+    strict_sidecar_integrity_gate,
+    strict_sidecar_integrity_gate_public_summary,
+)
 from core.provenance.state import (
     build_provenance_report,
     expected_revisions_payload,
@@ -291,6 +297,28 @@ def recommended_actions_for_status(
     ):
         actions.append("consider_refresh_summary")
     return actions
+
+
+def strict_gate_status_actions(actions: list[str], *, strict_gate_allows_write: bool) -> list[str]:
+    if strict_gate_allows_write:
+        return actions
+    blocked_write_actions = {
+        "seed_initial_continuity",
+        "update_rolling_summary",
+        "consider_refresh_summary",
+    }
+    return [
+        "review_or_repair_sidecar_before_write",
+        *(action for action in actions if action not in blocked_write_actions),
+    ]
+
+
+def strict_gate_status_failure_extra(workspace) -> dict[str, object]:
+    return strict_sidecar_no_write_failure_extra(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        continuity_confidence="broken",
+    )
 
 
 def _project_relative_path(path: Path, project_root: Path) -> str:
@@ -522,7 +550,7 @@ def main() -> None:
             payload=cli_failure_payload_for_exception(
                 exc,
                 default_reason="damaged_sidecar",
-                extra={"continuity_confidence": "broken"},
+                extra=strict_sidecar_no_write_failure_extra(continuity_confidence="broken"),
             ),
         )
     if workspace is None:
@@ -535,7 +563,10 @@ def main() -> None:
                 "no_project_root",
                 error="No RecallLoom project root found.",
                 details={"project_root": public_project_root_label(Path(args.path).expanduser().resolve())},
-                extra={"continuity_confidence": "broken"},
+                extra=strict_sidecar_no_write_failure_extra(
+                    continuity_confidence="broken",
+                    include_recovery_actions=False,
+                ),
             ),
         )
     startup_residue_report = None
@@ -551,7 +582,7 @@ def main() -> None:
                 payload=cli_failure_payload(
                     "malformed_managed_file",
                     error=f"Missing required file: {summary_path}",
-                    extra={"continuity_confidence": "broken"},
+                    extra=strict_gate_status_failure_extra(workspace),
                 ),
             )
         summary_text = read_text(summary_path)
@@ -565,7 +596,7 @@ def main() -> None:
                 payload=cli_failure_payload(
                     "malformed_managed_file",
                     error=f"Missing required file-state metadata marker: {summary_path}",
-                    extra={"continuity_confidence": "broken"},
+                    extra=strict_gate_status_failure_extra(workspace),
                 ),
             )
 
@@ -580,7 +611,7 @@ def main() -> None:
                 payload=cli_failure_payload_for_exception(
                     exc,
                     default_reason="damaged_sidecar",
-                    extra={"continuity_confidence": "broken"},
+                    extra=strict_gate_status_failure_extra(workspace),
                 ),
             )
 
@@ -601,7 +632,7 @@ def main() -> None:
                     payload=cli_failure_payload(
                         "malformed_managed_file",
                         error=f"Missing required file-state metadata marker: {context_brief_path}",
-                        extra={"continuity_confidence": "broken"},
+                        extra=strict_gate_status_failure_extra(workspace),
                     ),
                 )
         update_protocol_state = None
@@ -619,7 +650,7 @@ def main() -> None:
                     payload=cli_failure_payload(
                         "malformed_managed_file",
                         error=f"Missing required file-state metadata marker: {update_protocol_path}",
-                        extra={"continuity_confidence": "broken"},
+                        extra=strict_gate_status_failure_extra(workspace),
                     ),
                 )
 
@@ -641,7 +672,7 @@ def main() -> None:
                         **exc.details,
                         "project_root": str(workspace.project_root),
                     },
-                    extra={"continuity_confidence": "broken"},
+                    extra=strict_gate_status_failure_extra(workspace),
                 ),
             )
         latest_daily_log = (
@@ -667,7 +698,7 @@ def main() -> None:
                         "Missing required daily-log-entry metadata marker in the latest ISO-dated daily log: "
                         f"{latest_daily_log}"
                     ),
-                    extra={"continuity_confidence": "broken"},
+                    extra=strict_gate_status_failure_extra(workspace),
                 ),
             )
 
@@ -771,13 +802,34 @@ def main() -> None:
                 else update_protocol_revision_seen
             ),
         )
+        strict_gate = strict_sidecar_integrity_gate(
+            project_root=workspace.project_root,
+            storage_root=workspace.storage_root,
+        )
+        strict_gate_summary = strict_sidecar_integrity_gate_public_summary(strict_gate)
+        strict_gate_allows_write = strict_gate.get("allowed_for_mutation") is True
+        strict_gate_receipts_verified = strict_gate_current_receipts_verified(strict_gate)
+        effective_allowed_operation_level = trust_state["allowed_operation_level"]
+        if (
+            not strict_gate_allows_write
+            and effective_allowed_operation_level == "write_current_state_after_preflight"
+        ):
+            effective_allowed_operation_level = "read_current_state"
+        write_expected_revisions = (
+            expected_revisions if strict_gate_allows_write else None
+        )
+        actions = strict_gate_status_actions(
+            actions,
+            strict_gate_allows_write=strict_gate_allows_write,
+        )
         provenance = build_provenance_report(
             sidecar_trust_state=trust_state["sidecar_trust_state"],
             continuity_state=continuity_state,
-            allowed_operation_level=trust_state["allowed_operation_level"],
+            allowed_operation_level=effective_allowed_operation_level,
             summary_stale=summary_stale,
-            expected_revisions=expected_revisions,
-            receipt_chain_verified=False,
+            expected_revisions=write_expected_revisions,
+            receipt_chain_verified=strict_gate_receipts_verified,
+            receipt_store_available=strict_gate_receipts_verified,
             legacy_sidecar=provenance_facts["legacy_sidecar"],
             review_required=provenance_facts["review_required"],
             review_imported_baseline=provenance_facts["review_imported_baseline"],
@@ -822,7 +874,7 @@ def main() -> None:
             payload=cli_failure_payload(
                 "damaged_sidecar",
                 error=message,
-                extra={"continuity_confidence": "broken"},
+                extra=strict_gate_status_failure_extra(workspace),
             ),
         )
 
@@ -858,9 +910,10 @@ def main() -> None:
         "provenance_metadata_status": provenance["metadata_status"],
         "provenance_contract": provenance["contract_identity"],
         "preflight_contract_identity": provenance_contract_identity(),
-        "expected_revisions": expected_revisions,
+        "expected_revisions": write_expected_revisions,
         "write_readiness": provenance["write_readiness"],
-        "allowed_operation_level": trust_state["allowed_operation_level"],
+        "allowed_operation_level": effective_allowed_operation_level,
+        "strict_sidecar_integrity_gate": strict_gate_summary,
         "continuity_drift_risk_level": trust_state["continuity_drift_risk_level"],
         "freshness_risk_level": freshness_risk["level"],
         "freshness_risk_note": freshness_risk["note"],
