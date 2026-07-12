@@ -34,6 +34,7 @@ from .planner import (
     normalize_record_class_hint,
     plan_record,
 )
+from .suggestions import build_recording_suggestion
 
 __all__ = (
     "BLOCKED_REASONS",
@@ -64,4 +65,5 @@ __all__ = (
     "normalize_layer_hint",
     "normalize_record_class_hint",
     "plan_record",
+    "build_recording_suggestion",
 )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,6 +17,12 @@ from core.provenance.evidence import (
 from core.provenance.state import (
     bounded_evidence_supports_helper_evidenced as bounded_helper_evidence_supported,
     cursor_repair_provenance_decision,
+    provenance_facts_from_state,
+)
+from core.provenance.store import RECEIPT_STORE_RELATIVE_PATH
+from core.output.confirmation_material import (
+    build_confirmation_material,
+    print_confirmation_material,
 )
 
 from _common import (
@@ -49,6 +56,7 @@ CURSOR_KEYS = (
     "latest_entry_seq",
     "entry_count",
 )
+PREVIEW_DIGEST_PREFIX = "sha256:"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-workspace-revision",
         type=int,
         help="Optional revision guard for apply mode.",
+    )
+    parser.add_argument(
+        "--preview-digest",
+        help="Optional preview digest from a fresh non-mutating preview.",
     )
     parser.add_argument(
         "--json",
@@ -108,33 +120,154 @@ def cursor_payload(cursor: dict[str, object]) -> dict[str, object]:
     return {key: cursor.get(key) for key in CURSOR_KEYS}
 
 
+def canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def digest_payload(value: object) -> str:
+    return PREVIEW_DIGEST_PREFIX + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def build_preview_identity(
+    *,
+    current_cursor: dict[str, object],
+    expected_cursor: dict[str, object],
+    workspace_revision: int | None,
+) -> dict[str, object]:
+    return {
+        "contract_name": "recallloom.daily_log_cursor_repair_preview",
+        "contract_version": "0.1",
+        "repair_kind": "daily_log_cursor_repair",
+        "expected_workspace_revision": workspace_revision,
+        "current_cursor": cursor_payload(current_cursor),
+        "expected_cursor": cursor_payload(expected_cursor),
+    }
+
+
+def repair_apply_confirmation_material(
+    *,
+    preview_digest: str,
+    expected_workspace_revision: int | None,
+) -> dict[str, str | None]:
+    revision_text = (
+        str(expected_workspace_revision)
+        if isinstance(expected_workspace_revision, int)
+        else "fresh preview revision"
+    )
+    return build_confirmation_material(
+        confirmation_type="repair_apply",
+        action_summary="Apply one bounded daily-log cursor repair from the current preview.",
+        why_needed="Repair changes state.json cursor metadata and must be reviewed before mutation.",
+        target_layer_or_surface="repair_state",
+        expected_side_effect="repair_apply",
+        files_or_keys_summary="state.daily_logs cursor fields only",
+        safety_gate_summary=(
+            "Package support, fresh preview digest, expected workspace revision, write lock, "
+            "strict sidecar integrity, and provenance/config evidence gates must pass; rerun "
+            "preview or validation after apply."
+        ),
+        risk_level="medium",
+        approval_scope=(
+            "Approve only the daily-log cursor repair matching preview "
+            f"{preview_digest} at workspace revision {revision_text}; no append, write, "
+            "sync, validation, release or advisory action is included."
+        ),
+        safe_retry_or_rollback=(
+            "Decline by stopping without repair; if state changes, rerun preview and use the new digest."
+        ),
+        debug_reference=preview_digest,
+    )
+
+
+def user_summary_for_preview(*, changed: bool, apply_mode: bool, applied: bool) -> dict[str, str]:
+    if apply_mode and applied:
+        return {
+            "category": "review_required",
+            "conclusion": "Repair applied; validation required.",
+            "reason": (
+                "The cursor repair updated only the previewed state cursor fields, "
+                "but it does not authorize a later write."
+            ),
+            "next_step": "Rerun repair preview or validation before continuing writes.",
+        }
+    if changed:
+        return {
+            "category": "needs_confirmation",
+            "conclusion": "Repair candidate found.",
+            "reason": "The daily-log cursor differs from parsed daily-log marker evidence.",
+            "next_step": "Review the confirmation material, then apply only with the fresh preview binding.",
+        }
+    return {
+        "category": "no_write_needed",
+        "conclusion": "No repair needed.",
+        "reason": "The daily-log cursor already matches parsed marker evidence.",
+        "next_step": "Stop; no cursor repair is needed.",
+    }
+
+
 def preview_payload(
     *,
     current_cursor: dict[str, object],
     expected_cursor: dict[str, object],
+    workspace_revision: int | None,
     apply_mode: bool,
     applied: bool = False,
     provenance_decision: dict[str, object] | None = None,
 ) -> dict[str, object]:
     changed = cursor_changed(current_cursor, expected_cursor)
     reason_code = "daily_log_cursor_mismatch" if changed else "daily_log_cursor_already_canonical"
+    preview_identity = build_preview_identity(
+        current_cursor=current_cursor,
+        expected_cursor=expected_cursor,
+        workspace_revision=workspace_revision,
+    )
+    preview_digest = digest_payload(preview_identity)
+    user_summary = user_summary_for_preview(
+        changed=changed,
+        apply_mode=apply_mode,
+        applied=applied,
+    )
     if apply_mode and applied:
-        next_action = "rerun_append_or_sync_preflight"
+        next_action = "rerun_repair_preview_or_validate"
     elif changed:
-        next_action = "rerun_with_apply_and_yes"
+        next_action = "review_confirmation_material_then_apply_with_preview_binding"
     else:
         next_action = "none"
     payload = {
         "ok": True,
+        "schema_version": "1.1",
         "mode": "apply" if apply_mode else "preview",
         "dry_run": not apply_mode,
         "applied": applied,
         "repair_eligible": changed,
+        "repair_kind": "daily_log_cursor_repair",
         "reason_code": reason_code,
+        "user_visible_category": user_summary["category"],
+        "user_summary": user_summary,
+        "expected_workspace_revision": workspace_revision,
+        "preview_digest": preview_digest,
+        "preview_identity": preview_identity,
         "current_cursor": cursor_payload(current_cursor),
         "expected_cursor": cursor_payload(expected_cursor),
         "next_action": next_action,
+        "post_repair_validation_step": "rerun repair-daily-log-cursor preview, then run validate if warnings remain",
     }
+    if changed and not applied:
+        payload["confirmation_material"] = repair_apply_confirmation_material(
+            preview_digest=preview_digest,
+            expected_workspace_revision=workspace_revision,
+        )
+        payload["apply_command_template"] = (
+            "recallloom.py repair-daily-log-cursor <project-path> --apply --yes "
+            f"--expected-workspace-revision {workspace_revision} "
+            f"--preview-digest {preview_digest} --json"
+        )
     if provenance_decision is not None:
         payload["provenance_decision"] = public_provenance_decision_summary(
             provenance_decision
@@ -214,6 +347,71 @@ def config_marker_guard_check(
         "missing_current_file_keys": [],
         "config_guard": config_guard,
     }
+
+
+def evaluate_cursor_repair_provenance(
+    *,
+    project_root: Path,
+    storage_root: Path,
+    state: dict,
+    state_text: str,
+    current_cursor: dict[str, object],
+    expected_cursor: dict[str, object],
+    timestamp: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    evidence_check = bounded_current_helper_evidence_check(
+        project_root=project_root,
+        storage_root=storage_root,
+        state=state,
+        state_text=state_text,
+        helper_evidenced_only=False,
+        require_config_guard=True,
+        daily_log_cursor=expected_cursor,
+    )
+    provenance_facts = provenance_facts_from_state(state, review_intent=True)
+    receipt_store_present = (storage_root / RECEIPT_STORE_RELATIVE_PATH).is_file()
+    evidence_reason_code = evidence_check.get("reason_code")
+    evidence_block_reason_code = evidence_check.get("evidence_block_reason_code")
+    if (
+        not isinstance(evidence_block_reason_code, str)
+        and evidence_reason_code in {"receipt_evidence_absent", "receipt_evidence_incomplete"}
+        and (receipt_store_present or provenance_facts["helper_evidenced"])
+    ):
+        if not receipt_store_present:
+            repair_reason_code = "helper_evidenced_receipt_store_missing"
+        elif evidence_reason_code == "receipt_evidence_absent":
+            repair_reason_code = "receipt_store_present_but_empty"
+        else:
+            repair_reason_code = "receipt_store_present_but_incomplete"
+        evidence_check = {
+            **evidence_check,
+            "receipt_store_available": receipt_store_present,
+            "evidence_block_reason_code": "receipt_evidence_mismatch",
+            "reason_code": repair_reason_code,
+        }
+        evidence_block_reason_code = "receipt_evidence_mismatch"
+    missing_active_daily_log_transition = (
+        isinstance(current_cursor.get("latest_file"), str)
+        and current_cursor.get("latest_file") != ""
+        and expected_cursor.get("latest_file") is None
+    )
+    bounded_evidence_supported = bounded_helper_evidence_supported(
+        state,
+        bounded_receipt_evidence_verified=evidence_check.get("verified") is True,
+        receipt_store_available=evidence_check.get("receipt_store_available") is True,
+    ) and not missing_active_daily_log_transition
+    decision = cursor_repair_provenance_decision(
+        state,
+        timestamp=timestamp,
+        bounded_evidence_supports_helper_evidenced=bounded_evidence_supported,
+        repair_kind="daily_log_cursor_repair",
+        evidence_block_reason_code=(
+            evidence_block_reason_code
+            if isinstance(evidence_block_reason_code, str)
+            else None
+        ),
+    )
+    return evidence_check, decision
 
 
 def cursor_error_failure_payload(
@@ -328,10 +526,22 @@ def print_payload(payload: dict[str, object], *, json_mode: bool) -> None:
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
+    user_summary = payload.get("user_summary")
+    if isinstance(user_summary, dict):
+        print("RecallLoom cursor repair")
+        print(f"{user_summary.get('category')}: {user_summary.get('conclusion')}")
+        if user_summary.get("reason"):
+            print(f"Reason: {user_summary.get('reason')}")
+        print(f"Next step: {user_summary.get('next_step')}")
+        confirmation_material = payload.get("confirmation_material")
+        if isinstance(confirmation_material, dict):
+            print_confirmation_material(confirmation_material)
+        return
     print(f"Mode: {payload.get('mode')}")
     print(f"Reason: {payload.get('reason_code')}")
     print(f"Repair eligible: {payload.get('repair_eligible')}")
     print(f"Applied: {payload.get('applied')}")
+    print(f"Preview digest: {payload.get('preview_digest')}")
     print(f"Current cursor: {json.dumps(payload.get('current_cursor'), ensure_ascii=False)}")
     print(f"Expected cursor: {json.dumps(payload.get('expected_cursor'), ensure_ascii=False)}")
     print(f"Next action: {payload.get('next_action')}")
@@ -360,6 +570,22 @@ def main() -> None:
             reason="invalid_prepared_input",
             message="--expected-workspace-revision must be a positive integer.",
         )
+    if args.preview_digest is not None and not (
+        isinstance(args.preview_digest, str)
+        and args.preview_digest.startswith(PREVIEW_DIGEST_PREFIX)
+        and len(args.preview_digest) == len(PREVIEW_DIGEST_PREFIX) + 64
+    ):
+        exit_with_redacted_failure(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            reason="invalid_prepared_input",
+            message="--preview-digest must be a sha256 digest from a fresh repair preview.",
+            details={
+                "reason_code": "invalid_preview_digest",
+                "side_effect": "none",
+            },
+        )
     if args.yes and not args.apply:
         exit_with_redacted_failure(
             parser,
@@ -375,6 +601,22 @@ def main() -> None:
             exit_code=2,
             reason="invalid_prepared_input",
             message="--apply requires --yes before repair can write state.json.",
+        )
+    if args.apply and args.expected_workspace_revision is None and args.preview_digest is None:
+        exit_with_redacted_failure(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            reason="invalid_prepared_input",
+            message=(
+                "--apply requires a fresh preview binding: provide "
+                "--expected-workspace-revision or --preview-digest."
+            ),
+            details={
+                "reason_code": "repair_apply_requires_preview_binding",
+                "side_effect": "none",
+                "next_actions": ["rerun_repair_preview", "retry_with_preview_binding"],
+            },
         )
 
     enforce_package_support_gate(
@@ -408,7 +650,7 @@ def main() -> None:
 
     if not args.apply:
         try:
-            _state_text, state, current, expected = load_repair_view(
+            state_text, state, current, expected = load_repair_view(
                 state_path=state_path,
                 storage_root=workspace.storage_root,
             )
@@ -438,10 +680,32 @@ def main() -> None:
                 message="RecallLoom managed state could not be read.",
             )
 
+        provenance_decision = None
+        if cursor_changed(current, expected):
+            evidence_check, provenance_decision = evaluate_cursor_repair_provenance(
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+                state=state,
+                state_text=state_text,
+                current_cursor=current,
+                expected_cursor=expected,
+                timestamp=now_iso_timestamp(),
+            )
+            if not provenance_decision.get("allowed"):
+                exit_with_provenance_refusal(
+                    parser,
+                    json_mode=args.json,
+                    decision=provenance_decision,
+                    evidence_check=evidence_check,
+                )
         payload = preview_payload(
             current_cursor=current,
             expected_cursor=expected,
+            workspace_revision=state.get("workspace_revision")
+            if isinstance(state.get("workspace_revision"), int)
+            else None,
             apply_mode=False,
+            provenance_decision=provenance_decision,
         )
         if args.json:
             print(
@@ -472,6 +736,35 @@ def main() -> None:
                     reason="stale_write_context",
                     message="Workspace revision changed before cursor repair; rerun preview.",
                 )
+            workspace_revision = (
+                state.get("workspace_revision")
+                if isinstance(state.get("workspace_revision"), int)
+                else None
+            )
+            current_preview_identity = build_preview_identity(
+                current_cursor=current,
+                expected_cursor=expected,
+                workspace_revision=workspace_revision,
+            )
+            current_preview_digest = digest_payload(current_preview_identity)
+            if args.preview_digest is not None and args.preview_digest != current_preview_digest:
+                exit_with_redacted_failure(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=3,
+                    reason="stale_write_context",
+                    message=(
+                        "Repair preview digest no longer matches current cursor evidence; "
+                        "rerun preview before applying repair."
+                    ),
+                    details={
+                        "reason_code": "repair_preview_digest_mismatch",
+                        "side_effect": "none",
+                        "provided_preview_digest": args.preview_digest,
+                        "current_preview_digest": current_preview_digest,
+                        "next_actions": ["rerun_repair_preview", "retry_with_fresh_preview_binding"],
+                    },
+                )
             if not cursor_changed(current, expected):
                 evidence_check = config_marker_guard_check(
                     storage_root=workspace.storage_root,
@@ -496,42 +789,20 @@ def main() -> None:
                 payload = preview_payload(
                     current_cursor=current,
                     expected_cursor=expected,
+                    workspace_revision=workspace_revision,
                     apply_mode=True,
                     applied=False,
                 )
             else:
                 repair_timestamp = now_iso_timestamp()
-                evidence_check = bounded_current_helper_evidence_check(
+                evidence_check, provenance_decision = evaluate_cursor_repair_provenance(
                     project_root=workspace.project_root,
                     storage_root=workspace.storage_root,
                     state=state,
                     state_text=state_text,
-                    require_config_guard=True,
-                    daily_log_cursor=expected,
-                )
-                missing_active_daily_log_transition = (
-                    isinstance(current.get("latest_file"), str)
-                    and current.get("latest_file") != ""
-                    and expected.get("latest_file") is None
-                )
-                bounded_evidence_supported = bounded_helper_evidence_supported(
-                    state,
-                    bounded_receipt_evidence_verified=evidence_check.get("verified") is True,
-                    receipt_store_available=(
-                        evidence_check.get("receipt_store_available") is True
-                    ),
-                ) and not missing_active_daily_log_transition
-                evidence_block_reason_code = evidence_check.get("evidence_block_reason_code")
-                provenance_decision = cursor_repair_provenance_decision(
-                    state,
                     timestamp=repair_timestamp,
-                    bounded_evidence_supports_helper_evidenced=bounded_evidence_supported,
-                    repair_kind="daily_log_cursor_repair",
-                    evidence_block_reason_code=(
-                        evidence_block_reason_code
-                        if isinstance(evidence_block_reason_code, str)
-                        else None
-                    ),
+                    current_cursor=current,
+                    expected_cursor=expected,
                 )
                 if not provenance_decision.get("allowed"):
                     exit_with_provenance_refusal(
@@ -557,6 +828,7 @@ def main() -> None:
                 payload = preview_payload(
                     current_cursor=current,
                     expected_cursor=expected,
+                    workspace_revision=workspace_revision,
                     apply_mode=True,
                     applied=True,
                     provenance_decision=provenance_decision,

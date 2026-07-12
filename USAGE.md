@@ -17,6 +17,7 @@ the installed skill, and native wrappers:
 - `rl-init`, `rl-resume`, `rl-status`, and `rl-validate` are stable operator
   action names
 - `init`, `resume`, `status`, `validate`, `quick-summary`, `record --plan`,
+  `record --suggest`,
   `append`, `write`, `sync-current-state-after-append`,
   `repair-daily-log-cursor`, and `bridge` are dispatcher subcommands
 - native wrappers are convenience entrypoints only
@@ -82,6 +83,7 @@ The dispatcher command surface includes:
 - `validate`
 - `quick-summary`
 - `record --plan`
+- `record --suggest`
 - `append`
 - `write`
 - `sync-current-state-after-append`
@@ -96,6 +98,7 @@ python skills/recallloom/scripts/recallloom.py resume /absolute/path/to/project 
 python skills/recallloom/scripts/recallloom.py status /absolute/path/to/project
 python skills/recallloom/scripts/recallloom.py quick-summary /absolute/path/to/project --json
 python skills/recallloom/scripts/recallloom.py record /absolute/path/to/project --plan --intent-text "Record this progress." --payload-json '{"work_completed":"<public-safe summary>","confirmed_facts":"<confirmed fact>","key_decisions":"<decision or none>","risks_blockers":"<risk or none>","recommended_next_step":"<next step>"}' --layer-hint daily-log --json
+python skills/recallloom/scripts/recallloom.py record /absolute/path/to/project --suggest --intent-text "Completed a durable public-safe milestone." --json
 python skills/recallloom/scripts/recallloom.py append /absolute/path/to/project --entry-json '{"work_completed":"Recorded the milestone.","confirmed_facts":"The prepared entry was reviewed before append.","key_decisions":"Keep the entry scoped to current work.","risks_blockers":"None.","recommended_next_step":"Continue from the refreshed summary."}' --json
 python skills/recallloom/scripts/recallloom.py write /absolute/path/to/project --type current-state --source-file /absolute/path/to/prepared-current-state.md --dry-run --json
 python skills/recallloom/scripts/recallloom.py sync-current-state-after-append /absolute/path/to/project --reuse-current-summary --semantic-unchanged-assertion-json '{"semantic_unchanged":true,"assertion_source_kind":"record_plan_output_id","assertion_source_id":"record-plan-output:sha256:<64-hex>","record_plan_output":{}}' --json
@@ -107,9 +110,16 @@ python skills/recallloom/scripts/recallloom.py bridge /absolute/path/to/project 
 `repair-daily-log-cursor` previews by default. Use apply mode only after
 reviewing the preview and confirming the current `workspace_revision`; apply
 repairs `state.json.daily_logs` from the parsed latest active daily log and
-does not create helper receipts or rewrite daily-log content.
+does not create helper receipts or rewrite daily-log content. A successful
+apply remains `review_required`; rerun repair preview or validation before any
+later write.
 
 ## Recording Workflow
+
+Use `record --suggest` after a durable milestone when the agent should decide
+whether to offer a recording prompt. It is side-effect-free, returns only a
+sanitized candidate and suggested `record --plan` path, and never authorizes a
+write.
 
 Use `record --plan` when the user asks to record progress and the agent needs a
 short, auditable route before choosing `append`, `write`, or a stop/ask result.

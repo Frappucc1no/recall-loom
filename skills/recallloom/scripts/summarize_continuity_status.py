@@ -126,6 +126,7 @@ from core.continuity.workday import (
     describe_workday_guidance,
     detect_closure_signal,
 )
+from core.output.user_status import print_user_summary, read_surface_user_summary
 from core.trust.state import evaluate_trust_state
 from core.provenance.evidence import (
     strict_gate_current_receipts_verified,
@@ -954,12 +955,22 @@ def main() -> None:
         },
         "workday": workday,
     }
+    user_summary = read_surface_user_summary(
+        surface="Status",
+        summary_stale=summary_stale,
+        strict_sidecar_integrity_gate=strict_gate_summary,
+        continuity_drift_risk_level=trust_state["continuity_drift_risk_level"],
+        continuity_state=continuity_state,
+    )
+    payload["user_visible_category"] = user_summary["category"]
+    payload["user_summary"] = user_summary
 
     if args.json:
         if startup_residue_report is not None:
             payload["startup_residue_report"] = startup_residue_report
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
+        print_user_summary("RecallLoom status", user_summary)
         print(f"RecallLoom root: {public_project_root}")
         print(f"Continuity confidence: {confidence}")
         if freshness_risk["note"]:

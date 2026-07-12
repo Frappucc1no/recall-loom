@@ -71,11 +71,21 @@ _SENSITIVE_FIELD_NAMES = {
 }
 _TRAILING_PATH_PUNCTUATION = ".,:;!?)]}"
 _QUOTED_PATH_PATTERN = re.compile(
-    r"(?P<quote>[\"'])(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/])[^\"']+)(?P=quote)"
+    r"(?P<quote>[\"'])(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/]|\\\\\\\\)[^\"']+)(?P=quote)"
 )
 _UNQUOTED_PATH_PATTERN = re.compile(
-    r"(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/])\S+)"
+    r"(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/]|\\\\\\\\)\S+)"
 )
+_LOCAL_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._:/\\-])(?:"
+    r"~[\\/][^\s\"'<>]+"
+    r"|/[A-Za-z0-9._~+-][^\s\"'<>]*"
+    r"|[A-Za-z]:[\\/][^\s\"'<>]+"
+    r"|\\\\[^\\/\s\"'<>]+[\\/][^\s\"'<>]+"
+    r"|//[^\\/\s\"'<>]+[\\/][^\s\"'<>]+"
+    r")"
+)
+_WINDOWS_DRIVE_PREFIX_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
 _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|token|secret|password|credential)\s*[:=]\s*['\"]?[^\s,'\"]+"
@@ -150,6 +160,23 @@ def display_project_path(
     return public_project_path(path, project_root=project_root)
 
 
+def contains_local_absolute_path(text: str | None) -> bool:
+    """Return whether text contains a POSIX, Windows-drive, or UNC absolute path."""
+
+    return isinstance(text, str) and bool(_LOCAL_ABSOLUTE_PATH_PATTERN.search(text))
+
+
+def _portable_foreign_path_label(raw_path: str) -> str | None:
+    if not (
+        _WINDOWS_DRIVE_PREFIX_PATTERN.match(raw_path)
+        or raw_path.startswith("\\\\")
+        or raw_path.startswith("//")
+    ):
+        return None
+    parts = [part for part in raw_path.replace("\\", "/").split("/") if part]
+    return parts[-1] if parts else "redacted-path"
+
+
 def _publicize_path_fragment(
     raw_path: str,
     *,
@@ -163,11 +190,13 @@ def _publicize_path_fragment(
         candidate = candidate[:-1]
     if not candidate:
         return raw_path
-    publicized = display_project_path(
-        candidate,
-        project_root=project_root or candidate,
-        private=private,
-    )
+    publicized = _portable_foreign_path_label(candidate)
+    if publicized is None:
+        publicized = display_project_path(
+            candidate,
+            project_root=project_root or candidate,
+            private=private,
+        )
     if publicized is None:
         return raw_path
     return f"{publicized}{suffix}"

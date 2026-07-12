@@ -20,6 +20,7 @@ from core.output.privacy import (
     publicize_json_value,
     redact_public_text,
 )
+from core.output.user_status import print_user_summary, validate_user_summary
 from core.provenance.store import (
     RECEIPT_STORE_RELATIVE_PATH,
 )
@@ -1255,6 +1256,12 @@ def main() -> None:
             for finding in findings
         ],
     }
+    user_summary = validate_user_summary(
+        error_count=len(errors),
+        warning_count=len(warnings),
+    )
+    payload["user_visible_category"] = user_summary["category"]
+    payload["user_summary"] = user_summary
     if args.require_provenance:
         payload["provenance_validation"] = provenance_validation
 
@@ -1264,6 +1271,7 @@ def main() -> None:
         public_payload = publicize_json_value(payload, project_root=workspace.project_root)
         print(json.dumps(public_payload, ensure_ascii=False, indent=2))
     else:
+        print_user_summary("RecallLoom validate", user_summary)
         print(f"RecallLoom root: {display_project_root_label(workspace.project_root)}")
         print(
             "Storage root: "

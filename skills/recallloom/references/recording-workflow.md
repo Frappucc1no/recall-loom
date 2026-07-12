@@ -4,6 +4,16 @@
 
 It classifies a recording intent, returns an ordered helper path, and points to the current safe next step or a stop/ask reason. It does not write sidecar files, daily logs, receipts, locks, derived evidence, or revisions.
 
+`record --suggest` is the side-effect-free proactive prompt lane.
+
+It reviews public-safe candidate text and returns one of three outcomes:
+
+- `candidate`: show a sanitized candidate summary and suggested `record --plan` path.
+- `silent`: do not prompt because the text is exploratory, unstable, or explicitly says not to record.
+- `blocked`: do not suggest a write path because the candidate looks sensitive or private.
+
+It does not run in the background, watch files, auto-listen, write sidecar files, or approve a later record action.
+
 ## Command Shape
 
 Append-only progress:
@@ -28,9 +38,18 @@ recallloom.py record <project> --plan \
   --compact --json
 ```
 
+Proactive suggestion:
+
+```bash
+recallloom.py record <project> --suggest \
+  --intent-text "completed a public-safe milestone" \
+  --privacy-safety-json '{"classification":"safe"}' \
+  --json
+```
+
 ## Input Contract
 
-`record --plan` accepts these input fields through CLI options:
+`record --plan` and `record --suggest` accept these input fields through CLI options:
 
 - `intent_text`: original user or agent intent.
 - `prepared_record_payload`: public-safe structured payload or placeholder reference.
@@ -128,6 +147,8 @@ Failure retry template:
 
 Use metadata-only refresh only after preflight allows `post_append_summary_sync` and returns an assertion binding seed. The assertion JSON is bound data, not a free-text confirmation:
 
+Before `record --plan` may expose the metadata-refresh helper path, the plan input must explicitly include `--semantic-unchanged`. If that decision is omitted, the plan remains confirmation-only with no current safe command. If meaning changed, use `--semantic-changed` and route to a separately reviewed current-state update instead.
+
 ```json
 {
   "semantic_unchanged": true,
@@ -159,6 +180,14 @@ Use metadata-only refresh only after preflight allows `post_append_summary_sync`
 `source_id` is not accepted. `record_plan_output_id` assertions must carry the complete `record_plan_output` so the helper can recompute its id, input digest, and preflight binding before any metadata-only refresh. `explicit_operator_confirmation` is also allowed only when it carries the same bound fields and uses an `assertion_source_id` shaped like `explicit-operator-confirmation:sha256:<64hex>`. Do not use a bare `semantic_unchanged: true` boolean or free-text confirmation.
 
 ## Output Meaning
+
+For `record --suggest`:
+
+- `suggestion_status`: `candidate`, `silent`, or `blocked`.
+- `should_prompt`: `true` only when the user should see a sanitized candidate recording prompt.
+- `candidate_summary`: sanitized text only; sensitive candidates use a redacted digest reference instead.
+- `suggested_path`: a suggested `record --plan` path only, never a write command.
+- `side_effect`: always `none`.
 
 Important fields:
 

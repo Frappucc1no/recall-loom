@@ -12,7 +12,7 @@
 
 <p>RecallLoom 是给 AI 协作使用的文件化项目记忆层：把背景、进展、关键决策和下一步保存到项目旁边/项目内的 Markdown / JSON 文件里，不需要数据库、RAG 或后台服务。换会话、换模型、换工具，下一次 AI 协作更容易接上当前状态。</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.6.2-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.4.7-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- 包版本：`0.4.6.2`
+- 包版本：`0.4.7`
 - 协议版本：`1.0`
 - 当前支持的协议版本：
   - `1.0`
@@ -173,8 +173,10 @@ rl-init
 |---|---|
 | 恢复项目上下文 | 新的 AI 工具或下一次会话先接上当前事实，减少从零重建项目历史 |
 | 记录关键进展 | 把需要长期保留的进展、决策和下一步写回项目旁边 |
+| 建议记录时机 | 在形成稳定里程碑时给出脱敏候选和下一步建议，不静默写入 |
 | 校验连续性状态 | 在继续或写入前识别缺失、过期、冲突和需要人工确认的风险 |
 | 受控更新当前状态 | 写入前后保留修订、新鲜度和校验边界，降低误写旧事实的概率 |
+| 预览式修复 | daily-log cursor 异常先诊断、预览和确认，修复后再验证，不手写 `state.json` |
 | 多工具接力 | Codex、Claude Code、Gemini 等工具在相应入口可用时，可以从同一套项目记忆继续 |
 
 这些能力连在一起，解决的是一个共同问题：下一次接手项目的 AI 工具，先知道当前状态，再开始行动。
@@ -309,6 +311,7 @@ RecallLoom 的工程原则很简单：项目事实留在项目里，AI 工具只
 
 | 版本 | 重点更新 | 对用户的价值 |
 |---|---|---|
+| `v0.4.7` | 记录与修复体验升级：普通 `record --plan` 收敛为结论、原因和唯一下一步；新增无副作用 `record --suggest`；状态摘要与确认材料口径统一；daily-log cursor repair 增加 preview binding、修复后复核和跨平台本地路径隐私保护 | 推荐所有用户升级；“记录一下”和异常修复更短、更清楚，agent 可以建议记录时机但不会静默写入，敏感本地路径不会在普通、完整或 compact 输出中原样回显 |
 | `v0.4.6.2` | 0.4.6 线内紧急 P0 修复：append、write、sync、recovery follow-up 统一经过 strict sidecar integrity gate；strict validation 失败时不再发放写入绑定或展示危险重试命令 | 强烈建议 v0.4.6.1 及更早用户更新；异常 sidecar 状态下更难误写项目记忆，失败后更明确转向 review / repair |
 | `v0.4.6.1` | 0.4.6 线内紧急修复：升级后的历史 receipt store 可以继续安全 append；`record --plan` 更准确识别“不用记录/只是确认”等 no-write 意图；blocked / invalid 输入不再展示错误写命令；support advisory 当天刷新与子 helper 继承更稳 | 已更新到 v0.4.6 的用户也建议升级；真实项目不会因历史收据契约差异卡死，记录计划和失败恢复更少误导，升级提醒更及时 |
 | `v0.4.6` | 推荐所有用户更新的 recording workflow fast lane：新增 `record --plan`、记录分类和安全下一步；append 后支持受控 metadata-only refresh；compact 输出和记录模板同步更新 | “帮我记一下”从多轮工具考古变成先拿清晰计划和当前安全命令；append/sync 高频尾部不再默认要求手工重写完整 current-state JSON |

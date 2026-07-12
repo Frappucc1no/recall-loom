@@ -15,6 +15,7 @@ from .contracts import (
     validate_layer_name,
     validate_record_class,
 )
+from .privacy import contains_unsafe_record_text, record_input_text
 
 
 LAYER_HINT_ALIASES = {
@@ -86,34 +87,6 @@ READY_AFTER_PREFLIGHT_LABELS = frozenset(
     }
 )
 
-UNSAFE_RECORD_TEXT_TOKENS = (
-    "<!-- recallloom:",
-    "<!-- file-state:",
-    "<!-- daily-log-entry:",
-    "<!-- daily-log-scaffold",
-    "<!-- last-writer:",
-    "/users/",
-    "file://",
-    "~/",
-    ":\\",
-    "api secret",
-    "api key",
-    "secret",
-    "token",
-    "password",
-    "密码",
-    "密钥",
-    "私钥",
-    "访问令牌",
-    "<attached",
-    "attached text",
-    "manual patch",
-    "state.json",
-    "config.json",
-    "receipt store",
-)
-
-
 def normalize_layer_hint(value: str | None) -> str | None:
     if value is None:
         return None
@@ -136,31 +109,21 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
 
 
-def _iter_record_text_fragments(value: Any) -> list[str]:
-    fragments: list[str] = []
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            fragments.append(str(key))
-            fragments.extend(_iter_record_text_fragments(item))
-    elif isinstance(value, list):
-        for item in value:
-            fragments.extend(_iter_record_text_fragments(item))
-    elif value is not None:
-        fragments.append(str(value))
-    return fragments
-
-
-def _raw_intent_and_payload_text(input_contract: Mapping[str, Any]) -> tuple[str, bool]:
-    intent = str(input_contract.get("intent_text") or "")
-    payload = input_contract.get("prepared_record_payload")
-    payload_fragments = _iter_record_text_fragments(payload)
-    return " ".join([intent, *payload_fragments]).casefold(), bool(payload_fragments)
-
-
 def _redacted_intent_text(intent_text: str) -> str:
     if not intent_text:
         return ""
     return f"redacted-intent:{digest_payload({'intent_text': intent_text})}"
+
+
+def _redacted_record_payload(payload: object) -> dict[str, str]:
+    if not payload:
+        return {}
+    return {
+        "payload_ref": (
+            "redacted-payload:"
+            + digest_payload({"prepared_record_payload": payload})
+        )
+    }
 
 
 def _privacy_classification(input_contract: Mapping[str, Any]) -> str:
@@ -232,8 +195,9 @@ def classify_record_plan_input(
 ) -> tuple[str, str]:
     """Return (record_class, confidence) without claiming full semantic understanding."""
 
-    combined, payload_present = _raw_intent_and_payload_text(input_contract)
-    if _contains_any(combined, UNSAFE_RECORD_TEXT_TOKENS):
+    combined, payload_present = record_input_text(input_contract)
+    lowered_combined = combined.casefold()
+    if contains_unsafe_record_text(combined):
         return "unsafe_blocked", "high"
     normalized = normalize_record_plan_input(input_contract)
     if _privacy_classification(normalized) in {"unsafe", "blocked", "block"}:
@@ -261,14 +225,14 @@ def classify_record_plan_input(
     if layer_hint == "metadata":
         return "metadata_refresh_only", "medium"
 
-    if _contains_any(combined, ("已经记过", "duplicate", "already recorded", "重复")):
+    if _contains_any(lowered_combined, ("已经记过", "duplicate", "already recorded", "重复")):
         return "duplicate_noop", "medium"
-    if _contains_any(combined, ("刚才那条", "改一下", "覆盖上一条", "amend", "overwrite")):
+    if _contains_any(lowered_combined, ("刚才那条", "改一下", "覆盖上一条", "amend", "overwrite")):
         return "amend_last", "medium"
-    if _contains_any(combined, ("记录规则", "protocol rule", "update_protocol", "规则改成")):
+    if _contains_any(lowered_combined, ("记录规则", "protocol rule", "update_protocol", "规则改成")):
         return "protocol_rule_update", "medium"
     if _contains_any(
-        combined,
+        lowered_combined,
         (
             "以后默认",
             "长期保留",
@@ -283,10 +247,13 @@ def classify_record_plan_input(
         ),
     ):
         return "stable_context_update", "medium"
-    if _contains_any(combined, ("既要", "同时", "multi-layer", "multi layer", "current state and log")):
+    if _contains_any(
+        lowered_combined,
+        ("既要", "同时", "multi-layer", "multi layer", "current state and log"),
+    ):
         return "simple_multi_layer_plan", "medium"
     if _contains_any(
-        combined,
+        lowered_combined,
         (
             "当前状态",
             "当前摘要",
@@ -299,7 +266,7 @@ def classify_record_plan_input(
     ):
         return "current_state_update", "medium"
     if _contains_any(
-        combined,
+        lowered_combined,
         (
             "刚 append 完",
             "刚记录完",
@@ -466,8 +433,20 @@ def plan_record(
         record_class_hint=record_class_hint,
     )
     normalized_input = normalize_record_plan_input(input_contract)
+    semantic_assertion = normalized_input.get("semantic_unchanged_assertion")
+    semantic_changed_metadata_refresh = (
+        record_class == "metadata_refresh_only"
+        and semantic_assertion is False
+    )
+    semantic_unconfirmed_metadata_refresh = (
+        record_class == "metadata_refresh_only"
+        and semantic_assertion is None
+    )
     if record_class == "unsafe_blocked":
         normalized_input["intent_text"] = _redacted_intent_text(normalized_input["intent_text"])
+        normalized_input["prepared_record_payload"] = _redacted_record_payload(
+            normalized_input.get("prepared_record_payload")
+        )
     if record_class not in RECORD_CLASS_SET:
         raise RecordContractError(f"Unsupported record_class: {record_class}")
 
@@ -479,6 +458,14 @@ def plan_record(
         workflow_status = "no_write"
     elif record_class == "no_write_success":
         workflow_status = "complete"
+    elif semantic_changed_metadata_refresh:
+        workflow_status = "needs_user_confirmation"
+        blocked_reason = "semantic_changed"
+        path = ()
+    elif semantic_unconfirmed_metadata_refresh:
+        workflow_status = "needs_user_confirmation"
+        blocked_reason = "user_decision_required"
+        path = ()
     elif record_class in {
         "stable_context_update",
         "protocol_rule_update",
@@ -516,12 +503,16 @@ def plan_record(
     recommended_action = (
         "stop_and_redact_input"
         if record_class == "unsafe_blocked"
-        else "ask_one_user_confirmation"
-        if workflow_status == "needs_user_confirmation"
         else "review_or_repair_sidecar_before_write"
         if workflow_status == "blocked_fixable" and preflight_strict_blocks_write
         else "resolve_preflight_write_readiness"
         if workflow_status == "blocked_fixable"
+        else "prepare_reviewed_current_state_update"
+        if semantic_changed_metadata_refresh
+        else "confirm_semantic_unchanged_or_route_to_current_state"
+        if semantic_unconfirmed_metadata_refresh
+        else "ask_one_user_confirmation"
+        if workflow_status == "needs_user_confirmation"
         else "no_write_needed"
         if workflow_status in {"no_write", "complete"}
         else "run_current_safe_command"
@@ -530,10 +521,20 @@ def plan_record(
         "record --plan is side-effect-free",
         "commands are placeholders and do not include user payload",
     )
-    planned_layers = () if preflight_strict_blocks_write else None
+    planned_layers = (
+        ()
+        if preflight_strict_blocks_write
+        else ("current_state",)
+        if semantic_changed_metadata_refresh
+        else ("metadata",)
+        if semantic_unconfirmed_metadata_refresh
+        else None
+    )
     write_effect = (
         "none"
         if preflight_strict_blocks_write
+        else "planned_only"
+        if semantic_changed_metadata_refresh or semantic_unconfirmed_metadata_refresh
         else "planned_only"
         if preflight_blocks_write
         else None
@@ -549,7 +550,13 @@ def plan_record(
         single_next_command=current_safe_command,
         user_decision_required=False if strict_gate_blocks_mutating_plan else None,
         required_gates=_required_gates_for_class(record_class),
-        terminal_success_condition=_terminal_condition(record_class),
+        terminal_success_condition=(
+            "a reviewed current-state write is separately confirmed and completed"
+            if semantic_changed_metadata_refresh
+            else "the semantic decision is made and record --plan is rerun with the matching assertion"
+            if semantic_unconfirmed_metadata_refresh
+            else _terminal_condition(record_class)
+        ),
         blocked_reason=blocked_reason,
         expected_revision_binding=_expected_revision_binding(preflight_payload),
         input_contract={

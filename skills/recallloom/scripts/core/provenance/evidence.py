@@ -556,7 +556,7 @@ def bounded_current_helper_evidence_check(
     if not latest_receipts:
         return _incomplete_result(
             reason_code="receipt_evidence_absent",
-            receipt_store_available=True,
+            receipt_store_available=store_path.is_file(),
             receipt_store=receipt_store,
             config_guard=config_guard,
         )

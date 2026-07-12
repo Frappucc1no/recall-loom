@@ -166,6 +166,26 @@ Default exit modes before a write should stay explicit:
 - `confirm` when the action is historical, cross-boundary, or otherwise needs explicit confirmation
 - `blocked` when the sidecar or safety contract is not trustworthy enough to write
 
+## Proactive Recording Prompt
+
+Use proactive recording prompts only after a durable milestone, accepted decision,
+completed validation, release, or stable workflow rule becomes clear.
+
+The prompt is a candidate, not a write:
+
+- show a sanitized candidate summary
+- suggest a `record --plan` path
+- do not append, write, sync, repair, stage, commit, release, or update advisory state
+- do not run as a daemon, watcher, hook, scheduled reminder, or background listener
+- stay silent during unstable exploration, drafts, ordinary debugging, or explicit
+  "do not record" requests
+- block instead of suggesting a path when the candidate includes sensitive content,
+  private evidence, raw attached text, secrets, personal data, or local absolute paths
+
+`record --suggest` is the side-effect-free helper lane for this prompt. A later
+record still has to pass `record --plan`, preflight, privacy, revision/cursor,
+support, and receipt/provenance gates.
+
 ## Layered Write Judgment
 
 The agent is responsible for judging the meaning of prepared continuity content.
@@ -327,11 +347,11 @@ Use `repair-daily-log-cursor` only when validation or helper output shows that
 Operator flow:
 
 1. run `recallloom.py repair-daily-log-cursor <project-path> --json`
-2. review `current_cursor`, `expected_cursor`, `repair_eligible`, and
-   `next_action`
-3. if repair is intentional, rerun with `--apply --yes` and the fresh
-   `--expected-workspace-revision`
-4. rerun status, validation, or the blocked write path that originally surfaced
+2. review `current_cursor`, `expected_cursor`, `repair_eligible`,
+   `preview_digest`, confirmation material, and `next_action`
+3. if repair is intentional, rerun with `--apply --yes` and a fresh preview
+   binding: `--expected-workspace-revision` or `--preview-digest`
+4. rerun preview, status, validation, or the blocked write path that originally surfaced
    the cursor mismatch
 
 Repair rules:
@@ -339,6 +359,7 @@ Repair rules:
 - preview is read-only; apply is mutating and must pass the support gate
 - apply updates cursor state from parser evidence instead of editing daily-log
   content
+- apply must refuse stale preview digests or missing preview bindings
 - the repair does not create helper receipts or claim historical helper origin
 - if a failure payload includes `safe_to_retry: false` or a non-`none`
   `trust_effect`, follow `single_next_command` or validation guidance before

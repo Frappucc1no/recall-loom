@@ -22,6 +22,7 @@ from core.continuity.workday import (
     build_write_tier_judgment,
     detect_closure_signal,
 )
+from core.output.user_status import preflight_user_summary, print_user_summary
 from core.trust.state import evaluate_trust_state
 from core.provenance.evidence import (
     strict_gate_current_receipts_verified,
@@ -1117,9 +1118,14 @@ def main() -> None:
             rolling_summary_handoff=rolling_summary_handoff,
         )
 
+    user_summary = preflight_user_summary(payload)
+    payload["user_visible_category"] = user_summary["category"]
+    payload["user_summary"] = user_summary
+
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
+        print_user_summary("RecallLoom preflight", user_summary)
         print(f"RecallLoom root: {public_project_root}")
         print(f"Storage root: {public_storage_root}")
         print(f"Storage mode: {workspace.storage_mode}")

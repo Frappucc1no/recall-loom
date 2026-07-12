@@ -122,7 +122,13 @@ _exit_if_runtime_unsupported()
 from core.continuity.quick_summary import build_no_project_payload, build_quick_summary_payload
 from core.continuity.workday import RECOMMENDATION_TYPES, describe_workday_guidance
 from core.failure.contracts import failure_payload, preferred_failure_language
+from core.output.confirmation_material import (
+    print_confirmation_material,
+    record_plan_confirmation_material,
+    review_imported_baseline_confirmation_material,
+)
 from core.output.privacy import redact_public_text
+from core.output.user_status import print_user_summary, read_surface_user_summary
 from core.provenance.bindings import (
     PreflightBindingLeaseError,
     write_preflight_binding_lease,
@@ -151,6 +157,7 @@ from core.recording import (
     normalize_layer_hint,
     normalize_record_class_hint,
     plan_record,
+    build_recording_suggestion,
     validate_record_plan_output,
 )
 from core.support.policy import action_level_for_dispatcher
@@ -409,6 +416,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan",
         action="store_true",
         help="Return a plan-only workflow. This is the current v0.4.6-line record mode.",
+    )
+    record_parser.add_argument(
+        "--suggest",
+        action="store_true",
+        help=(
+            "Return a side-effect-free proactive recording suggestion with a sanitized "
+            "candidate summary and suggested record --plan path."
+        ),
     )
     record_parser.add_argument(
         "--intent-text",
@@ -698,6 +713,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional revision guard forwarded to repair_daily_log_cursor.py apply mode.",
     )
+    repair_parser.add_argument(
+        "--preview-digest",
+        help="Optional fresh preview digest forwarded to repair_daily_log_cursor.py apply mode.",
+    )
     repair_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
     bridge_parser = subparsers.add_parser(
@@ -754,12 +773,20 @@ def _exit_with_support(
     payload: dict | None = None,
     support: dict | None = None,
 ) -> None:
+    public_payload = _with_package_support(payload, support)
+    if not json_mode and isinstance(public_payload, dict):
+        confirmation_material = public_payload.get("confirmation_material")
+        if isinstance(confirmation_material, dict):
+            public_message = redact_public_text(message, project_root=None) or message
+            print(public_message, file=sys.stderr)
+            print_confirmation_material(confirmation_material, file=sys.stderr)
+            raise SystemExit(exit_code)
     exit_with_cli_error(
         parser,
         json_mode=json_mode,
         exit_code=exit_code,
         message=message,
-        payload=_with_package_support(payload, support),
+        payload=public_payload,
     )
 
 
@@ -1828,6 +1855,30 @@ def _write_retry_payload(
     }
 
 
+def _confirmation_target_for_file_key(file_key: str) -> str:
+    return {
+        "rolling_summary": "current_state",
+        "context_brief": "stable_context",
+        "update_protocol": "protocol_rule",
+    }.get(file_key, "current_state")
+
+
+def _write_confirmation_material(*, file_key: str) -> dict:
+    target_layer = _confirmation_target_for_file_key(file_key)
+    return review_imported_baseline_confirmation_material(
+        command="write",
+        operation="managed_file_commit",
+        target_layer_or_surface=target_layer,
+        expected_side_effect="managed_file_write",
+        files_or_keys_summary=f"{file_key} {target_layer} key",
+        approval_scope=(
+            f"Approve only this revision-checked {target_layer} write for {file_key}; "
+            "no append, sync, repair, validation or release action is included."
+        ),
+        debug_reference=f"write:{file_key}:review_imported_baseline",
+    )
+
+
 def _write_preflight_failure_payload(
     args: argparse.Namespace,
     *,
@@ -1846,20 +1897,23 @@ def _write_preflight_failure_payload(
         error=message,
         details=details,
     )
+    extra = {
+        "repair_command": base_payload["recovery_command"],
+        "retry_payload": _write_retry_payload(
+            args,
+            file_key=file_key,
+            input_mode=input_mode,
+            extra_args=retry_extra_args,
+            requires_repair_command_first=retry_requires_repair,
+        ),
+    }
+    if reason == "review_imported_baseline_confirmation_required":
+        extra["confirmation_material"] = _write_confirmation_material(file_key=file_key)
     return cli_failure_payload(
         reason,
         error=message,
         details=details,
-        extra={
-            "repair_command": base_payload["recovery_command"],
-            "retry_payload": _write_retry_payload(
-                args,
-                file_key=file_key,
-                input_mode=input_mode,
-                extra_args=retry_extra_args,
-                requires_repair_command_first=retry_requires_repair,
-            ),
-        },
+        extra=extra,
     )
 
 
@@ -2015,6 +2069,18 @@ def _enforce_append_preflight_gate(
             )
             input_mode = _append_dispatcher_input_mode(args)
             input_format = args.input_format or "auto"
+            confirmation_material = review_imported_baseline_confirmation_material(
+                command="append",
+                operation="daily_log_append",
+                target_layer_or_surface="daily_log",
+                expected_side_effect="single_append",
+                files_or_keys_summary="latest daily_log cursor",
+                approval_scope=(
+                    "Approve only this revision-checked daily-log append; no current-state "
+                    "sync, repair, validation or release action is included."
+                ),
+                debug_reference="append:daily_log:review_imported_baseline",
+            )
             payload = cli_failure_payload(
                 "review_imported_baseline_confirmation_required",
                 error=message,
@@ -2034,6 +2100,7 @@ def _enforce_append_preflight_gate(
                         extra_args=["--confirm-review-imported-baseline"],
                         requires_repair_command_first=False,
                     ),
+                    "confirmation_material": confirmation_material,
                 },
             )
             _exit_with_support(
@@ -2450,6 +2517,86 @@ def _commit_context_file_args(
 
 POST_APPEND_SYNC_COMMAND = "sync-current-state-after-append"
 POST_APPEND_SYNC_CONTRACT_TYPE = "post_append_summary_sync"
+POST_APPEND_SYNC_NOOP_REASONS = frozenset(
+    {
+        "summary_not_stale",
+        "summary_revision_not_stale",
+    }
+)
+
+
+def _post_append_sync_user_summary(
+    *,
+    category: str,
+    conclusion: str,
+    reason: str,
+    next_step: str,
+) -> dict:
+    return {
+        "category": category,
+        "conclusion": conclusion,
+        "reason": reason,
+        "next_step": next_step,
+    }
+
+
+def _post_append_sync_success_summary(*, input_mode: str) -> dict:
+    if input_mode == "reuse-current-summary":
+        reason = (
+            "The authorized append was reconciled as metadata-only; "
+            "the current-state summary body was not rewritten."
+        )
+    else:
+        reason = "The reviewed current-state summary was synced after the append."
+    return _post_append_sync_user_summary(
+        category="no_write_needed",
+        conclusion="Recording closeout complete.",
+        reason=reason,
+        next_step="Stop; no further RecallLoom write is needed.",
+    )
+
+
+def _post_append_sync_noop_summary(*, reason_code: str) -> dict:
+    reason = "The rolling summary is already current enough for this closeout."
+    if reason_code == "summary_not_stale":
+        reason = "There is no stale post-append summary state to reconcile."
+    elif reason_code == "summary_revision_not_stale":
+        reason = "The summary revision is not behind the workspace revision."
+    return _post_append_sync_user_summary(
+        category="no_write_needed",
+        conclusion="Recording closeout already complete.",
+        reason=reason,
+        next_step="Stop; no RecallLoom write is needed.",
+    )
+
+
+def _post_append_sync_review_summary(*, reason_code: str) -> dict:
+    reason_by_code = {
+        "stale_cause_not_append_only": "The stale state includes changes beyond one append.",
+        "stale_not_single_append_delta": "The workspace changed by more than the single authorized append.",
+        "daily_log_cursor_mismatch": "The daily-log cursor does not match the latest log.",
+        "missing_latest_daily_log": "The latest daily log could not be identified.",
+        "missing_latest_daily_log_entry": "The latest daily-log entry could not be identified.",
+        "invalid_daily_log_cursor": "The daily-log cursor is not safe enough for automatic closeout.",
+        "continuity_not_seeded": "Continuity state is not seeded enough for automatic closeout.",
+    }
+    return _post_append_sync_user_summary(
+        category="review_required",
+        conclusion="Review required before closeout.",
+        reason=reason_by_code.get(
+            reason_code,
+            "The post-append closeout contract is not safe enough for automatic sync.",
+        ),
+        next_step="Rerun preflight and review the post-append closeout state before writing.",
+    )
+
+
+def _print_post_append_sync_summary(summary: dict) -> None:
+    print("RecallLoom post-recording closeout")
+    print(f"{summary['category']}: {summary['conclusion']}")
+    if summary.get("reason"):
+        print(f"Reason: {summary['reason']}")
+    print(f"Next step: {summary['next_step']}")
 
 
 def _post_append_sync_retry_payload(
@@ -2523,6 +2670,7 @@ def _post_append_sync_failure_payload(
     provenance_guard = contract.get("provenance_guard") if isinstance(contract, dict) else None
     append_cursor = contract.get("append_cursor") if isinstance(contract, dict) else None
     ordinary_write_gate = contract.get("ordinary_write_gate") if isinstance(contract, dict) else None
+    user_summary = _post_append_sync_review_summary(reason_code=reason_code)
     return {
         "ok": False,
         "schema_version": "1.1",
@@ -2545,6 +2693,8 @@ def _post_append_sync_failure_payload(
         "input_format": _post_append_sync_input_format(args),
         "reason_code": reason_code,
         "error": message,
+        "user_visible_category": user_summary["category"],
+        "user_summary": user_summary,
         "user_message": "Post-append summary sync is not allowed for the current sidecar state.",
         "operator_note": (
             "Rerun preflight and only retry this command when the post_append_summary_sync "
@@ -2565,6 +2715,49 @@ def _post_append_sync_failure_payload(
     }
 
 
+def _post_append_sync_noop_payload(
+    args: argparse.Namespace,
+    *,
+    input_mode: str,
+    reason_code: str,
+    contract: dict | None,
+    support: dict,
+) -> dict:
+    append_cursor = contract.get("append_cursor") if isinstance(contract, dict) else None
+    ordinary_write_gate = contract.get("ordinary_write_gate") if isinstance(contract, dict) else None
+    user_summary = _post_append_sync_noop_summary(reason_code=reason_code)
+    return {
+        "ok": True,
+        "schema_version": "1.1",
+        "command": POST_APPEND_SYNC_COMMAND,
+        "contract_type": (
+            contract.get("contract_type")
+            if isinstance(contract, dict) and isinstance(contract.get("contract_type"), str)
+            else POST_APPEND_SYNC_CONTRACT_TYPE
+        ),
+        "write_type": "current-state",
+        "file_key": "rolling_summary",
+        "input_mode": input_mode,
+        "input_format": _post_append_sync_input_format(args),
+        "side_effect": "none",
+        "write_effect": "none",
+        "reason_code": reason_code,
+        "user_visible_category": user_summary["category"],
+        "user_summary": user_summary,
+        "next_actions": ["stop_no_write_needed"],
+        "single_next_command": None,
+        "safe_to_retry": True,
+        "append_cursor": append_cursor if isinstance(append_cursor, dict) else None,
+        "ordinary_write_gate_preserved": (
+            contract.get("ordinary_write_gate_preserved")
+            if isinstance(contract, dict)
+            else None
+        ),
+        "ordinary_write_gate": ordinary_write_gate if isinstance(ordinary_write_gate, dict) else None,
+        "package_support": public_package_support_payload(support),
+    }
+
+
 def _post_append_sync_confirmation_payload(
     args: argparse.Namespace,
     *,
@@ -2577,6 +2770,18 @@ def _post_append_sync_confirmation_payload(
         insert_at = len(argv_template) - 1 if argv_template and argv_template[-1] == "--json" else len(argv_template)
         argv_template.insert(insert_at, "--confirm-review-imported-baseline")
     retry_payload["requires_repair_command_first"] = False
+    confirmation_material = review_imported_baseline_confirmation_material(
+        command=POST_APPEND_SYNC_COMMAND,
+        operation="post_append_summary_sync",
+        target_layer_or_surface="metadata",
+        expected_side_effect="metadata_only_sync",
+        files_or_keys_summary="rolling_summary metadata and latest daily_log cursor",
+        approval_scope=(
+            "Approve only metadata-only post-append current-state sync for the already "
+            "authorized append; no semantic current-state rewrite is included."
+        ),
+        debug_reference=f"{POST_APPEND_SYNC_COMMAND}:metadata_sync:review_imported_baseline",
+    )
     return cli_failure_payload(
         "review_imported_baseline_confirmation_required",
         error=(
@@ -2591,7 +2796,7 @@ def _post_append_sync_confirmation_payload(
             "side_effect": "none",
             "required_flag": "--confirm-review-imported-baseline",
         },
-        extra={"retry_payload": retry_payload},
+        extra={"retry_payload": retry_payload, "confirmation_material": confirmation_material},
     )
 
 
@@ -3230,6 +3435,19 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
     contract = _post_append_sync_contract_from_preflight(preflight_payload)
     reason_code = _post_append_sync_contract_reason(contract)
     if reason_code is not None:
+        if reason_code in POST_APPEND_SYNC_NOOP_REASONS:
+            payload = _post_append_sync_noop_payload(
+                args,
+                input_mode=input_mode,
+                reason_code=reason_code,
+                contract=contract,
+                support=support,
+            )
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                _print_post_append_sync_summary(payload["user_summary"])
+            return
         message = (
             "Preflight did not authorize post-append current-state summary sync "
             f"for this sidecar state: {reason_code}."
@@ -3326,12 +3544,17 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
         "ordinary_write_gate": contract.get("ordinary_write_gate"),
         "package_support": public_package_support_payload(support),
     }
+    user_summary = _post_append_sync_success_summary(input_mode=input_mode)
+    result["user_visible_category"] = user_summary["category"]
+    result["user_summary"] = user_summary
+    result["next_actions"] = ["stop_no_further_recallloom_write_needed"]
+    result["single_next_command"] = None
     if wrapper_metadata is not None:
         result["wrapper_metadata"] = wrapper_metadata
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"Synced rolling_summary after append to {result.get('target_path', '.recallloom/rolling_summary.md')}")
+        _print_post_append_sync_summary(user_summary)
 
 
 def _repair_daily_log_cursor_args(args: argparse.Namespace) -> list[str]:
@@ -3344,6 +3567,8 @@ def _repair_daily_log_cursor_args(args: argparse.Namespace) -> list[str]:
         helper_args.extend(
             ["--expected-workspace-revision", str(args.expected_workspace_revision)]
         )
+    if getattr(args, "preview_digest", None) is not None:
+        helper_args.extend(["--preview-digest", args.preview_digest])
     return helper_args
 
 
@@ -3419,6 +3644,16 @@ def _validate_repair_dispatcher_args(
             args,
             message="--apply requires --yes before repair can write state.json.",
             reason_code="apply_requires_yes",
+        )
+    if args.apply and args.expected_workspace_revision is None and args.preview_digest is None:
+        _exit_repair_argument_error(
+            parser,
+            args,
+            message=(
+                "--apply requires a fresh repair preview binding: provide "
+                "--expected-workspace-revision or --preview-digest."
+            ),
+            reason_code="repair_apply_requires_preview_binding",
         )
 
 
@@ -3585,10 +3820,29 @@ def _handle_quick_summary(parser, args: argparse.Namespace, *, support: dict) ->
             payload["startup_residue_report"] = startup_residue_report
 
     if args.json:
+        user_summary = read_surface_user_summary(
+            surface="Quick summary",
+            summary_stale=bool(payload.get("freshness", {}).get("summary_stale")),
+            strict_sidecar_integrity_gate=payload.get("strict_sidecar_integrity_gate"),
+            continuity_state=payload.get("continuity_state"),
+            no_project=payload.get("continuity_state") == "no_project",
+        )
+        payload["user_visible_category"] = user_summary["category"]
+        payload["user_summary"] = user_summary
         payload["package_support"] = public_package_support_payload(support)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
+    user_summary = read_surface_user_summary(
+        surface="Quick summary",
+        summary_stale=bool(payload.get("freshness", {}).get("summary_stale")),
+        strict_sidecar_integrity_gate=payload.get("strict_sidecar_integrity_gate"),
+        continuity_state=payload.get("continuity_state"),
+        no_project=payload.get("continuity_state") == "no_project",
+    )
+    payload["user_visible_category"] = user_summary["category"]
+    payload["user_summary"] = user_summary
+    print_user_summary("RecallLoom quick summary", user_summary)
     print(f"RecallLoom quick summary target: {payload['project_root']}")
     storage_root = payload.get("storage_root")
     if storage_root:
@@ -3618,6 +3872,51 @@ def _record_invalid_input(
     message: str,
     reason_code: str,
 ) -> None:
+    suggest_mode = bool(getattr(args, "suggest", False)) and not bool(
+        getattr(args, "plan", False)
+    )
+    if suggest_mode:
+        user_summary = {
+            "category": "blocked",
+            "conclusion": "Recording suggestion input is invalid.",
+            "reason": "The suggestion request must be corrected before RecallLoom can classify it.",
+            "next_step": "Revise the record --suggest input and rerun the suggestion.",
+        }
+        payload = {
+            "ok": False,
+            "schema_version": "1.1",
+            "command": "record",
+            "mode": "suggest",
+            "blocked": True,
+            "blocked_reason": "invalid_record_suggestion_input",
+            "reason_code": reason_code,
+            "recoverability": "user_input_required",
+            "surface_level": "user_safe",
+            "trust_effect": "none",
+            "suggestion_status": "blocked",
+            "should_prompt": False,
+            "side_effect": "none",
+            "error": message,
+            "user_visible_category": user_summary["category"],
+            "user_summary": user_summary,
+            "user_message": "The record suggestion input is not valid.",
+            "operator_note": "Fix the record --suggest input shape, then rerun record --suggest.",
+            "next_actions": [
+                "revise_record_suggestion_input",
+                "rerun_record_suggestion",
+            ],
+            "current_safe_command": None,
+            "single_next_command": None,
+            "safe_to_retry": True,
+        }
+        _exit_with_support(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            payload=payload,
+            support=support,
+        )
     payload = {
         "ok": False,
         "schema_version": "1.1",
@@ -3681,11 +3980,12 @@ def _record_json_object(
 
 def _record_payload_from_args(parser, args: argparse.Namespace, *, support: dict) -> dict:
     if args.payload_json is not None and args.stdin:
+        record_mode = "--suggest" if getattr(args, "suggest", False) else "--plan"
         _record_invalid_input(
             parser,
             args,
             support=support,
-            message="record --plan accepts either --payload-json or --stdin, not both.",
+            message=f"record {record_mode} accepts either --payload-json or --stdin, not both.",
             reason_code="multiple_payload_sources",
         )
     if args.payload_json is not None:
@@ -3794,21 +4094,151 @@ def _record_input_contract(
     return input_contract, record_class_hint
 
 
+def _record_plan_strict_gate_blocks(payload: dict) -> bool:
+    expected_revision_binding = payload.get("expected_revision_binding")
+    if isinstance(expected_revision_binding, dict):
+        strict_gate = expected_revision_binding.get("strict_sidecar_integrity_gate")
+        if isinstance(strict_gate, dict) and strict_gate.get("allowed_for_mutation") is False:
+            return True
+    return payload.get("blocked_reason") == "strict_sidecar_integrity_failed"
+
+
+def _record_plan_user_view(payload: dict) -> dict:
+    workflow_status = payload.get("workflow_status")
+    record_class = payload.get("record_class")
+    blocked_reason = payload.get("blocked_reason")
+
+    if (
+        workflow_status == "blocked_unsafe"
+        or blocked_reason == "package_support_blocked"
+        or _record_plan_strict_gate_blocks(payload)
+    ):
+        reason = "The requested path is blocked by a safety gate."
+        if record_class == "unsafe_blocked":
+            reason = "The input includes unsafe or private-looking content and cannot be recorded as-is."
+        elif blocked_reason == "strict_sidecar_integrity_failed":
+            reason = "Managed sidecar integrity is not safe for mutation."
+        elif blocked_reason == "package_support_blocked":
+            reason = "Package support status blocks mutation."
+        return {
+            "category": "blocked",
+            "conclusion": "Blocked.",
+            "reason": reason,
+            "next_step": "Stop and remove, redact, or repair the blocking cause through the supported path.",
+        }
+
+    if workflow_status == "blocked_fixable":
+        reason = "Current state needs review before any write."
+        if blocked_reason == "preflight_write_not_ready":
+            reason = "Write readiness is not safe enough yet."
+        return {
+            "category": "review_required",
+            "conclusion": "Review required before recording.",
+            "reason": reason,
+            "next_step": "Review current state or rerun preflight before writing.",
+        }
+
+    if workflow_status == "needs_user_confirmation":
+        reason = "One target, scope, or material decision is needed before RecallLoom can write."
+        next_step = "Ask one confirmation question before any write."
+        if record_class == "ambiguous_needs_user":
+            reason = "The recording intent is not specific enough to choose one safe target."
+        elif record_class == "metadata_refresh_only":
+            input_contract = payload.get("input_contract")
+            semantic_assertion = (
+                input_contract.get("semantic_unchanged_assertion")
+                if isinstance(input_contract, dict)
+                else None
+            )
+            if semantic_assertion is False:
+                reason = "Current-state meaning changed, so metadata-only reconciliation is not safe."
+                next_step = "Prepare and confirm a reviewed current-state update."
+            else:
+                reason = "Metadata-only reconciliation needs an explicit semantic-unchanged decision."
+                next_step = "Confirm whether meaning stayed unchanged, then rerun the plan with that assertion."
+        return {
+            "category": "needs_confirmation",
+            "conclusion": "Confirmation required.",
+            "reason": reason,
+            "next_step": next_step,
+        }
+
+    if workflow_status == "ready_to_run":
+        ready_reasons = {
+            "append_only": "A daily-log note is prepared; safety gates stay active.",
+            "current_state_update": "A current-state update is prepared; safety gates stay active.",
+            "metadata_refresh_only": "A metadata-only refresh is prepared; safety gates stay active.",
+        }
+        return {
+            "category": "ready_to_record",
+            "conclusion": "Ready to record.",
+            "reason": ready_reasons.get(
+                record_class,
+                "The requested RecallLoom action is prepared; safety gates stay active.",
+            ),
+            "next_step": "Run the prepared record action.",
+        }
+
+    if workflow_status in {"no_write", "complete"}:
+        no_write_reasons = {
+            "duplicate_noop": "The same durable fact appears to be already covered.",
+            "defer_no_write": "The request does not add a durable RecallLoom fact yet.",
+            "no_write_success": "The request is complete without changing RecallLoom memory.",
+        }
+        return {
+            "category": "no_write_needed",
+            "conclusion": "No write needed.",
+            "reason": no_write_reasons.get(
+                record_class,
+                "The request is complete without changing RecallLoom memory.",
+            ),
+            "next_step": "Stop; no RecallLoom write is needed.",
+        }
+
+    return {
+        "category": "diagnostic_only",
+        "conclusion": "Diagnostic result only.",
+        "reason": "This result is not a write authorization.",
+        "next_step": "Continue reading or run a diagnostic; do not mutate from this result alone.",
+    }
+
+
 def _print_record_plan_summary(payload: dict) -> None:
+    user_view = _record_plan_user_view(payload)
     print("RecallLoom record plan")
-    print(f"Status: {payload['workflow_status']}")
-    print(f"Record class: {payload['record_class']}")
-    print(f"Write effect: {payload['write_effect']}")
-    current_safe_command = payload.get("current_safe_command")
-    if current_safe_command:
-        print(f"Current safe command: {current_safe_command}")
-    elif payload.get("blocked_reason"):
-        print(f"Stop reason: {payload['blocked_reason']}")
-    if payload.get("terminal_success_condition"):
-        print(f"Terminal success: {payload['terminal_success_condition']}")
+    print(f"{user_view['category']}: {user_view['conclusion']}")
+    if user_view.get("reason"):
+        print(f"Reason: {user_view['reason']}")
+    print(f"Next step: {user_view['next_step']}")
+    confirmation_material = record_plan_confirmation_material(payload, user_view)
+    if confirmation_material is not None:
+        print_confirmation_material(confirmation_material)
+
+
+def _print_record_suggestion(payload: dict) -> None:
+    user_summary = payload.get("user_summary") if isinstance(payload, dict) else None
+    if not isinstance(user_summary, dict):
+        user_summary = {
+            "category": payload.get("user_visible_category") or "diagnostic_only",
+            "conclusion": "Recording suggestion result.",
+            "reason": "This result is side-effect-free.",
+            "next_step": "Continue or run record --plan only if a durable fact should be recorded.",
+        }
+    print("RecallLoom record suggestion")
+    print(f"{user_summary['category']}: {user_summary['conclusion']}")
+    if user_summary.get("reason"):
+        print(f"Reason: {user_summary['reason']}")
+    candidate_summary = payload.get("candidate_summary")
+    if candidate_summary:
+        print(f"Candidate summary: {candidate_summary}")
+    suggested_path = payload.get("suggested_path")
+    if suggested_path:
+        print(f"Suggested path: {suggested_path}")
+    print(f"Next step: {user_summary['next_step']}")
 
 
 def _compact_record_plan_payload(payload: dict) -> dict:
+    user_view = _record_plan_user_view(payload)
     current_safe_command = payload.get("current_safe_command")
     blocked_reason = payload.get("blocked_reason")
     if current_safe_command:
@@ -3846,7 +4276,7 @@ def _compact_record_plan_payload(payload: dict) -> dict:
         and payload.get("workflow_status") == "ready_to_run"
         and payload.get("side_effect") == "none"
     )
-    return {
+    compact_payload = {
         "schema_version": "1.1",
         "ok": payload.get("workflow_status") not in {"blocked_fixable", "blocked_unsafe"},
         "command": "record",
@@ -3855,10 +4285,9 @@ def _compact_record_plan_payload(payload: dict) -> dict:
         "side_effect": payload.get("side_effect"),
         "ready_to_mutate": False,
         "ready_to_run_current_command": ready_to_run_current_command,
-        "topline": (
-            f"record --plan classified this as {payload.get('record_class')} "
-            f"with status {payload.get('workflow_status')}."
-        ),
+        "user_visible_category": user_view["category"],
+        "topline": f"{user_view['category']}: {user_view['conclusion']}",
+        "user_summary": user_view,
         "next_action": {
             "type": action_type,
             "value": action_value,
@@ -3938,15 +4367,39 @@ def _compact_record_plan_payload(payload: dict) -> dict:
             "validation_hint": payload.get("validation_hint"),
         },
     }
+    confirmation_material = record_plan_confirmation_material(payload, user_view)
+    if confirmation_material is not None:
+        compact_payload["confirmation_material"] = confirmation_material
+    return compact_payload
 
 
 def _handle_record_plan(parser, args: argparse.Namespace, *, support: dict) -> None:
+    if args.plan and getattr(args, "suggest", False):
+        _record_invalid_input(
+            parser,
+            args,
+            support=support,
+            message="Use either record --plan or record --suggest, not both.",
+            reason_code="record_mode_conflict",
+        )
+    if getattr(args, "suggest", False):
+        input_contract, _record_class_hint = _record_input_contract(parser, args, support=support)
+        payload = build_recording_suggestion(input_contract)
+        payload["package_support"] = public_package_support_payload(support)
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            _print_record_suggestion(payload)
+        return
     if not args.plan:
         _record_invalid_input(
             parser,
             args,
             support=support,
-            message="record currently supports only --plan. record --apply is not part of the current v0.4.6-line package.",
+            message=(
+                "record currently supports --plan and --suggest. record --apply is not "
+                "part of the current v0.4.6-line package."
+            ),
             reason_code="record_plan_required",
         )
     input_contract, record_class_hint = _record_input_contract(parser, args, support=support)

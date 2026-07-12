@@ -635,6 +635,25 @@ def _invalid_prepared_input_suggestion(language: str, details: dict | None) -> s
     input_mode = _prepared_input_mode(details)
     command = details.get("command") if isinstance(details, dict) else None
     operation = details.get("operation") if isinstance(details, dict) else None
+    if command == "repair-daily-log-cursor" or operation == "repair_daily_log_cursor":
+        reason_code = details.get("reason_code") if isinstance(details, dict) else None
+        if reason_code == "repair_apply_requires_preview_binding":
+            return _localized_text(
+                language,
+                en=(
+                    "Run repair-daily-log-cursor preview first, review the preview digest "
+                    "and confirmation material, then retry apply with the fresh preview binding."
+                ),
+                zh_cn=(
+                    "请先运行 repair-daily-log-cursor preview，复核 preview digest 和确认材料，"
+                    "再携带 fresh preview binding 重试 apply。"
+                ),
+            )
+        return _localized_text(
+            language,
+            en="Fix the repair cursor arguments, then rerun repair-daily-log-cursor preview.",
+            zh_cn="请先修正 repair cursor 参数，再重新运行 repair-daily-log-cursor preview。",
+        )
     if command == "validate":
         return _localized_text(
             language,
@@ -998,6 +1017,20 @@ def _failure_stage(reason: str, error: str | None) -> str:
     return "helper_execution"
 
 
+def _is_repair_daily_log_cursor_context(details: dict | None) -> bool:
+    command = details.get("command") if isinstance(details, dict) else None
+    operation = details.get("operation") if isinstance(details, dict) else None
+    reason_code = details.get("reason_code") if isinstance(details, dict) else None
+    return (
+        command == "repair-daily-log-cursor"
+        or operation == "repair_daily_log_cursor"
+        or reason_code in {
+            "repair_apply_requires_preview_binding",
+            "repair_preview_digest_mismatch",
+        }
+    )
+
+
 def _failure_user_message(reason: str, *, language: str, error: str | None) -> str:
     if reason == "python_runtime_unavailable" and _python_runtime_stage(error) == "runtime_bootstrap":
         return _localized_text(
@@ -1008,13 +1041,51 @@ def _failure_user_message(reason: str, *, language: str, error: str | None) -> s
     return failure_reason_contract(reason)["user_message"][language]
 
 
-def _failure_operator_note(reason: str, *, language: str, error: str | None) -> str | None:
+def _failure_operator_note(
+    reason: str,
+    *,
+    language: str,
+    error: str | None,
+    details: dict | None,
+) -> str | None:
     contract = failure_reason_contract(reason)
     if reason == "python_runtime_unavailable" and _python_runtime_stage(error) == "runtime_bootstrap":
         return _localized_text(
             language,
             en="Repair the RecallLoom bootstrap inputs such as package metadata, managed assets, or contract registry files before retrying.",
             zh_cn="请先修复 RecallLoom 的 bootstrap 输入，例如 package metadata、managed assets 或 contract registry 文件，再重试。",
+        )
+    reason_code = details.get("reason_code") if isinstance(details, dict) else None
+    is_repair_cursor = _is_repair_daily_log_cursor_context(details)
+    if reason == "invalid_prepared_input" and is_repair_cursor:
+        if reason_code == "repair_apply_requires_preview_binding":
+            return _localized_text(
+                language,
+                en=(
+                    "Review a fresh repair preview and its confirmation material, then retry "
+                    "apply only with --expected-workspace-revision or --preview-digest from that preview."
+                ),
+                zh_cn=(
+                    "请复核 fresh repair preview 及其确认材料；只使用该 preview 里的 "
+                    "--expected-workspace-revision 或 --preview-digest 重试 apply。"
+                ),
+            )
+        return _localized_text(
+            language,
+            en="Fix the repair cursor arguments before retrying; this is not a prepared-entry content error.",
+            zh_cn="请先修正 repair cursor 参数再重试；这不是 prepared-entry 内容错误。",
+        )
+    if reason == "stale_write_context" and is_repair_cursor:
+        return _localized_text(
+            language,
+            en=(
+                "Do not reuse the stale repair preview binding. Rerun repair preview and retry "
+                "apply only with the new preview digest or expected workspace revision."
+            ),
+            zh_cn=(
+                "不要复用已经过期的 repair preview binding。请重新运行 repair preview，"
+                "并只用新的 preview digest 或 expected workspace revision 重试 apply。"
+            ),
         )
     operator_note = contract.get("operator_note")
     if operator_note:
@@ -1030,6 +1101,25 @@ def _failure_suggestion(
     details: dict | None,
 ) -> str:
     if reason == "stale_write_context":
+        command = details.get("command") if isinstance(details, dict) else None
+        operation = details.get("operation") if isinstance(details, dict) else None
+        reason_code = details.get("reason_code") if isinstance(details, dict) else None
+        if (
+            command == "repair-daily-log-cursor"
+            or operation == "repair_daily_log_cursor"
+            or reason_code == "repair_preview_digest_mismatch"
+        ):
+            return _localized_text(
+                language,
+                en=(
+                    "Rerun repair-daily-log-cursor preview and use the new preview digest "
+                    "or expected workspace revision before applying repair."
+                ),
+                zh_cn=(
+                    "请重新运行 repair-daily-log-cursor preview，并使用新的 preview digest "
+                    "或 expected workspace revision 后再执行 repair apply。"
+                ),
+            )
         current_revision = details.get("current_workspace_revision") if details else None
         if isinstance(current_revision, int):
             return _localized_text(
@@ -1269,6 +1359,15 @@ def _failure_recovery_command(
                 return command
         return "Create new milestone content with append_daily_log_entry.py using --entry-file or --stdin instead of --create-daily-log."
     if reason == "stale_write_context":
+        command = details.get("command") if details else None
+        operation = details.get("operation") if details else None
+        reason_code = details.get("reason_code") if details else None
+        if (
+            command == "repair-daily-log-cursor"
+            or operation == "repair_daily_log_cursor"
+            or reason_code == "repair_preview_digest_mismatch"
+        ):
+            return f"recallloom.py repair-daily-log-cursor {project_arg} --json"
         if isinstance(project_root, str):
             return _script_command("preflight_context_check.py", project_arg, "--json")
         return "Rerun preflight_context_check.py from the project root, then retry with the fresh workspace revision."
@@ -1424,6 +1523,8 @@ _SAFE_ROUTING_REASON_CODES = {
     "missing_write_type",
     "provenance_scope_required",
     "provenance_scope_without_requirement",
+    "repair_apply_requires_preview_binding",
+    "repair_preview_digest_mismatch",
     "reserved_marker_injection",
     "source_selection_invalid",
     "source_file_not_supported",
@@ -1602,6 +1703,8 @@ def _failure_single_next_command(
     if reason == "invalid_prepared_input":
         return _single_next_for_invalid_prepared_input(details)
     if reason == "stale_write_context":
+        if command == "repair-daily-log-cursor" or operation == "repair_daily_log_cursor":
+            return f"recallloom.py repair-daily-log-cursor {project_arg} --json"
         return f"recallloom.py status {project_arg} --json"
     if reason == "trust_review_required":
         return f"recallloom.py validate {project_arg} --json"
@@ -1645,6 +1748,23 @@ def _apply_additive_failure_fields(
     )
     if reason == "invalid_date" and _is_archive_before_date_invalid(details):
         payload["next_actions"] = ["replace_invalid_before_date", "retry_archive"]
+    if reason == "invalid_prepared_input" and _is_repair_daily_log_cursor_context(details):
+        reason_code = details.get("reason_code") if isinstance(details, dict) else None
+        if reason_code == "repair_apply_requires_preview_binding":
+            payload["next_actions"] = [
+                "rerun_repair_preview",
+                "retry_with_fresh_preview_binding",
+            ]
+        else:
+            payload["next_actions"] = [
+                "fix_repair_cursor_arguments",
+                "rerun_repair_preview",
+            ]
+    if reason == "stale_write_context" and _is_repair_daily_log_cursor_context(details):
+        payload["next_actions"] = [
+            "rerun_repair_preview",
+            "retry_with_fresh_preview_binding",
+        ]
 
 
 def preferred_failure_language(env: dict[str, str] | None = None) -> str:
@@ -1719,6 +1839,7 @@ def failure_payload(
         normalized_reason,
         language=language,
         error=error,
+        details=suggestion_details,
     )
     if operator_note:
         payload["operator_note"] = operator_note
