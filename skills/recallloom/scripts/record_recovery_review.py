@@ -1264,6 +1264,7 @@ def main() -> None:
                     create=False,
                     )
                 proposal_text = read_text(proposal_path)
+                stored_review_text = body_text.rstrip("\n") + "\n"
                 state_path = workspace.storage_root / FILE_KEYS["state"]
                 next_state_text = None
                 if promotion_ready:
@@ -1273,11 +1274,11 @@ def main() -> None:
                         timestamp=recorded_at,
                         review_action=review_action,
                         proposal_digest=text_digest(proposal_text),
-                        review_digest=text_digest(body_text),
+                        review_digest=text_digest(stored_review_text),
                     )
                     new_workspace_revision = state["workspace_revision"]
                     next_state_text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
-                write_text(review_path, body_text.rstrip("\n") + "\n")
+                write_text(review_path, stored_review_text)
                 if next_state_text is not None:
                     try:
                         write_text(state_path, next_state_text)

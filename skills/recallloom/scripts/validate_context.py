@@ -1093,10 +1093,13 @@ def validate_provenance_receipts(
             "verified": True,
             "reason_code": reviewed_baseline.reason_code,
             "receipt_backed": False,
-            "inconsistent_review_binding_digest": reviewed_baseline.binding_digest,
             "proposal_digest": reviewed_baseline.proposal_digest,
             "review_digest": reviewed_baseline.review_digest,
         }
+        if reviewed_baseline.binding_digest is not None:
+            result["review_imported_baseline_validation"][
+                "inconsistent_review_binding_digest"
+            ] = reviewed_baseline.binding_digest
         return result
 
     actual_daily_log_cursor = None

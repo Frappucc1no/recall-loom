@@ -14,9 +14,11 @@ import stat
 from typing import Any, Mapping
 
 from core.coldstart.structured import (
+    PROPOSAL_SECTION_ALIASES,
     REVIEW_SECTION_ALIASES,
     classify_review_action,
     extract_structured_sections,
+    promotion_ready_for_action,
 )
 from core.protocol.contracts import DAILY_LOG_PATH_PATTERN, FILE_KEYS
 from core.provenance.state import (
@@ -43,6 +45,7 @@ INCONSISTENT_RECOVERY_PROPOSED_ACTION = (
 )
 INCONSISTENT_RECOVERY_REVIEW_TYPE = "inconsistent_recovery_review"
 INCONSISTENT_RECOVERY_MATERIAL_MAX_BYTES = 1024 * 1024
+ORDINARY_RECOVERY_MATERIAL_MAX_BYTES = 4 * 1024 * 1024
 
 INCONSISTENT_REVIEW_EVIDENCE_FIELDS = (
     "schema_version",
@@ -269,15 +272,25 @@ class ReviewImportedBaselineMaterialResult:
     def __post_init__(self) -> None:
         if self.status not in REVIEW_IMPORTED_BASELINE_MATERIAL_STATUSES:
             raise ValueError("Invalid reviewed-baseline material result status.")
-        digests = (
-            self.binding_digest,
-            self.proposal_digest,
-            self.review_digest,
-        )
         if self.status == "verified":
-            if not all(is_sha256_digest(digest) for digest in digests):
-                raise ValueError("Verified reviewed-baseline material requires all digests.")
-        elif any(digest is not None for digest in digests):
+            if not all(
+                is_sha256_digest(digest)
+                for digest in (self.proposal_digest, self.review_digest)
+            ) or (
+                self.binding_digest is not None
+                and not is_sha256_digest(self.binding_digest)
+            ):
+                raise ValueError(
+                    "Verified reviewed-baseline material requires valid material digests."
+                )
+        elif any(
+            digest is not None
+            for digest in (
+                self.binding_digest,
+                self.proposal_digest,
+                self.review_digest,
+            )
+        ):
             raise ValueError("Non-verified reviewed-baseline results must not carry digests.")
 
 
@@ -1375,6 +1388,8 @@ def _capped_directory_names(directory_fd: int) -> tuple[str, ...] | None:
 def _stable_material_snapshot_at(
     directory_fd: int,
     name: str,
+    *,
+    max_bytes: int = INCONSISTENT_RECOVERY_MATERIAL_MAX_BYTES,
 ) -> tuple[str, str, int] | None:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     file_fd: int | None = None
@@ -1383,11 +1398,11 @@ def _stable_material_snapshot_at(
         before_stat = os.fstat(file_fd)
         if (
             not stat.S_ISREG(before_stat.st_mode)
-            or before_stat.st_size > INCONSISTENT_RECOVERY_MATERIAL_MAX_BYTES
+            or before_stat.st_size > max_bytes
         ):
             return None
         chunks: list[bytes] = []
-        remaining = INCONSISTENT_RECOVERY_MATERIAL_MAX_BYTES + 1
+        remaining = max_bytes + 1
         while remaining > 0:
             chunk = os.read(file_fd, min(65536, remaining))
             if not chunk:
@@ -1402,7 +1417,7 @@ def _stable_material_snapshot_at(
         if file_fd is not None:
             os.close(file_fd)
     if (
-        len(raw_bytes) > INCONSISTENT_RECOVERY_MATERIAL_MAX_BYTES
+        len(raw_bytes) > max_bytes
         or _stat_identity(before_stat) != _stat_identity(after_stat)
         or len(raw_bytes) != after_stat.st_size
     ):
@@ -1417,11 +1432,17 @@ def _stable_material_snapshot_at(
 def _material_snapshots_unchanged(
     directory_fd: int | None,
     snapshots: Mapping[str, str],
+    *,
+    max_bytes: int = INCONSISTENT_RECOVERY_MATERIAL_MAX_BYTES,
 ) -> bool:
     if directory_fd is None:
         return not snapshots
     for name, expected_digest in snapshots.items():
-        current = _stable_material_snapshot_at(directory_fd, name)
+        current = _stable_material_snapshot_at(
+            directory_fd,
+            name,
+            max_bytes=max_bytes,
+        )
         if current is None or current[1] != expected_digest:
             return False
     return True
@@ -1700,6 +1721,201 @@ def evaluate_current_inconsistent_review_orphan(
             os.close(review_fd)
 
 
+def _evaluate_ordinary_review_imported_baseline_materials(
+    *,
+    storage_root: Path,
+    state_text: str,
+    metadata: Mapping[str, Any],
+) -> ReviewImportedBaselineMaterialResult:
+    """Verify the bounded material pair for an ordinary pre-D5 review import."""
+
+    proposal_digest = metadata.get("proposal_digest")
+    review_digest = metadata.get("review_digest")
+    review_action = metadata.get("review_action")
+    if (
+        metadata.get("schema_version") != PROVENANCE_METADATA_SCHEMA_VERSION
+        or metadata.get("baseline_kind") != "review_import"
+        or metadata.get("receipt_backed") is not False
+        or not promotion_ready_for_action(str(review_action or ""))
+        or any(
+            key in metadata
+            for key in (
+                "source_state_label",
+                "source_reason_code",
+                "inconsistent_review_binding",
+                "inconsistent_review_binding_digest",
+            )
+        )
+        or not (
+            isinstance(proposal_digest, str)
+            and is_sha256_digest("sha256:" + proposal_digest)
+        )
+        or not (
+            isinstance(review_digest, str)
+            and is_sha256_digest("sha256:" + review_digest)
+        )
+    ):
+        return ReviewImportedBaselineMaterialResult(
+            "invalid", "review_imported_baseline_metadata_invalid"
+        )
+
+    expected_proposal_digest = "sha256:" + proposal_digest
+    expected_review_digest = "sha256:" + review_digest
+    proposal_parts = ("companion", "recovery", "proposals")
+    review_parts = ("companion", "recovery", "review_log")
+    proposal_status, proposal_fd = _open_directory_chain_nofollow(
+        storage_root, proposal_parts
+    )
+    review_status, review_fd = _open_directory_chain_nofollow(storage_root, review_parts)
+    try:
+        if (
+            proposal_status != "present"
+            or review_status != "present"
+            or proposal_fd is None
+            or review_fd is None
+        ):
+            return ReviewImportedBaselineMaterialResult(
+                "invalid", "review_imported_baseline_material_directory_unavailable"
+            )
+        proposal_directory = _bounded_canonical_directory_entries(
+            proposal_fd, pattern=_CANONICAL_RECOVERY_PROPOSAL_FILE_RE
+        )
+        review_directory = _bounded_canonical_directory_entries(
+            review_fd, pattern=_CANONICAL_RECOVERY_REVIEW_FILE_RE
+        )
+        if proposal_directory is None or review_directory is None:
+            return ReviewImportedBaselineMaterialResult(
+                "invalid", "review_imported_baseline_material_directory_unsafe"
+            )
+        proposal_all_names, proposal_names = proposal_directory
+        review_all_names, review_names = review_directory
+        proposal_snapshots: dict[str, str] = {}
+        review_snapshots: dict[str, str] = {}
+        matching_proposals: list[str] = []
+        matching_reviews: list[str] = []
+        total_bytes = 0
+
+        for name in proposal_names:
+            snapshot = _stable_material_snapshot_at(
+                proposal_fd,
+                name,
+                max_bytes=ORDINARY_RECOVERY_MATERIAL_MAX_BYTES,
+            )
+            if snapshot is None:
+                return ReviewImportedBaselineMaterialResult(
+                    "invalid", "review_imported_baseline_proposal_unreadable"
+                )
+            text, digest, byte_count = snapshot
+            total_bytes += byte_count
+            if total_bytes > _MAX_RECOVERY_MATERIAL_SCAN_BYTES:
+                return ReviewImportedBaselineMaterialResult(
+                    "invalid", "review_imported_baseline_material_scan_unbounded"
+                )
+            proposal_snapshots[name] = digest
+            if digest != expected_proposal_digest:
+                continue
+            sections = extract_structured_sections(text, PROPOSAL_SECTION_ALIASES)
+            if (
+                set(sections) != set(PROPOSAL_SECTION_ALIASES)
+                or not text.endswith("\n")
+                or text.endswith("\n\n")
+            ):
+                return ReviewImportedBaselineMaterialResult(
+                    "invalid", "review_imported_baseline_proposal_material_invalid"
+                )
+            matching_proposals.append(name)
+
+        for name in review_names:
+            snapshot = _stable_material_snapshot_at(
+                review_fd,
+                name,
+                max_bytes=ORDINARY_RECOVERY_MATERIAL_MAX_BYTES,
+            )
+            if snapshot is None:
+                return ReviewImportedBaselineMaterialResult(
+                    "invalid", "review_imported_baseline_review_unreadable"
+                )
+            text, digest, byte_count = snapshot
+            total_bytes += byte_count
+            if total_bytes > _MAX_RECOVERY_MATERIAL_SCAN_BYTES:
+                return ReviewImportedBaselineMaterialResult(
+                    "invalid", "review_imported_baseline_material_scan_unbounded"
+                )
+            review_snapshots[name] = digest
+            if digest != expected_review_digest and not (
+                text.endswith("\n")
+                and "sha256:"
+                + hashlib.sha256(text[:-1].encode("utf-8")).hexdigest()
+                == expected_review_digest
+            ):
+                continue
+            sections = extract_structured_sections(text, REVIEW_SECTION_ALIASES)
+            observed_action = classify_review_action(sections)
+            if (
+                set(sections) != set(REVIEW_SECTION_ALIASES)
+                or observed_action != review_action
+                or not promotion_ready_for_action(observed_action)
+                or not text.endswith("\n")
+                or text.endswith("\n\n")
+            ):
+                return ReviewImportedBaselineMaterialResult(
+                    "invalid", "review_imported_baseline_review_material_invalid"
+                )
+            matching_reviews.append(name)
+
+        if len(matching_proposals) != 1 or len(matching_reviews) != 1:
+            return ReviewImportedBaselineMaterialResult(
+                "invalid", "review_imported_baseline_material_missing_or_ambiguous"
+            )
+        if matching_reviews[0] != f"{Path(matching_proposals[0]).stem}.review.md":
+            return ReviewImportedBaselineMaterialResult(
+                "invalid", "review_imported_baseline_material_pair_mismatch"
+            )
+        if (
+            not _material_snapshots_unchanged(
+                proposal_fd,
+                proposal_snapshots,
+                max_bytes=ORDINARY_RECOVERY_MATERIAL_MAX_BYTES,
+            )
+            or not _material_snapshots_unchanged(
+                review_fd,
+                review_snapshots,
+                max_bytes=ORDINARY_RECOVERY_MATERIAL_MAX_BYTES,
+            )
+            or not _directory_snapshot_unchanged(
+                storage_root=storage_root,
+                parts=proposal_parts,
+                original_fd=proposal_fd,
+                original_names=proposal_all_names,
+            )
+            or not _directory_snapshot_unchanged(
+                storage_root=storage_root,
+                parts=review_parts,
+                original_fd=review_fd,
+                original_names=review_all_names,
+            )
+        ):
+            return ReviewImportedBaselineMaterialResult(
+                "invalid", "review_imported_baseline_material_changed_during_scan"
+            )
+        final_state_snapshot = _stable_utf8_text_snapshot(storage_root / FILE_KEYS["state"])
+        if final_state_snapshot is None or final_state_snapshot[0] != state_text:
+            return ReviewImportedBaselineMaterialResult(
+                "invalid", "review_imported_baseline_state_changed"
+            )
+        return ReviewImportedBaselineMaterialResult(
+            "verified",
+            "review_imported_baseline_material_verified",
+            proposal_digest=expected_proposal_digest,
+            review_digest=expected_review_digest,
+        )
+    finally:
+        if proposal_fd is not None:
+            os.close(proposal_fd)
+        if review_fd is not None:
+            os.close(review_fd)
+
+
 def evaluate_review_imported_baseline_materials(
     *,
     project_root: Path,
@@ -1732,8 +1948,10 @@ def evaluate_review_imported_baseline_materials(
             "not_applicable", "review_imported_baseline_not_current"
         )
     if metadata.get("source_state_label") != "inconsistent_or_tampered_evidence":
-        return ReviewImportedBaselineMaterialResult(
-            "not_applicable", "review_imported_baseline_not_d5"
+        return _evaluate_ordinary_review_imported_baseline_materials(
+            storage_root=storage_root,
+            state_text=state_text,
+            metadata=metadata,
         )
 
     binding_digest = metadata.get("inconsistent_review_binding_digest")

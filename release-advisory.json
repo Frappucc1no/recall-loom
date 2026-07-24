@@ -1,12 +1,12 @@
 {
-  "latest_version": "0.4.8.1",
+  "latest_version": "0.4.8.2",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
   "advisory_level": "upgrade_recommended",
   "release_channel": "stable",
   "public_release_status": "released",
-  "reason_code": "v0481_receipt_compatibility_hotfix_recommended",
-  "user_message": "RecallLoom v0.4.8.1 is the recommended stable release. It fixes a narrow upgrade compatibility issue where v0.4.8 could reject legitimate finalized receipts created by the v0.4.6.2-v0.4.7 recording implementation. Sidecar protocol 1.0 is unchanged, existing workspaces do not require migration or receipt rewriting, and unknown receipt identities remain rejected.",
+  "reason_code": "v0482_reviewed_baseline_compatibility_hotfix_recommended",
+  "user_message": "RecallLoom v0.4.8.2 is the recommended stable release. It fixes a narrow compatibility issue where full provenance validation could reject an ordinary pre-D5 reviewed baseline even when its exact proposal and review material remained intact. Sidecar protocol 1.0 is unchanged, the first mutating write still requires explicit confirmation, and changed or missing review material remains blocked.",
   "support_advisory_url_status": "canonical_public_location",
   "remote_parity_rule": "The default support_advisory_url points at the canonical public origin/main location. Re-run remote support/readiness checks after publishing package updates.",
   "update_hints": {
