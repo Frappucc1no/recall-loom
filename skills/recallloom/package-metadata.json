@@ -1,10 +1,10 @@
 {
   "package_name": "recallloom",
   "display_name": "RecallLoom",
-  "package_version": "0.4.8",
+  "package_version": "0.4.8.1",
   "release_channel": "stable",
   "public_release_status": "released",
-  "install_guidance": "Install the latest public RecallLoom v0.4.8 stable package from the published release. Existing protocol 1.0 workspaces do not require sidecar migration.",
+  "install_guidance": "Install the latest public RecallLoom v0.4.8.1 stable package from the published release. Existing protocol 1.0 workspaces do not require sidecar migration or receipt rewriting.",
   "protocol_version": "1.0",
   "supported_protocol_versions": [
     "1.0"
