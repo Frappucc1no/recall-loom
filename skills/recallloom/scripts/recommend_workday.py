@@ -102,6 +102,7 @@ from core.continuity.freshness import (
     is_effectively_empty_summary_next_step as shared_is_effectively_empty_summary_next_step,
 )
 from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
     RECOMMENDATION_TYPES,
     build_workday_decision,
     describe_workday_guidance,
@@ -153,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rollover-hour",
         type=int,
-        default=3,
+        default=DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
         help="Logical day rollover hour in 24-hour form. Defaults to 3.",
     )
     parser.add_argument(
@@ -385,7 +386,10 @@ def main() -> None:
         preferred_date=preferred_date,
         session_intent=args.session_intent,
         project_time_policy_cues=project_time_policy_cues,
-        host_explicit=args.timezone is not None or args.rollover_hour != 3,
+        host_explicit=(
+            args.timezone is not None
+            or args.rollover_hour != DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR
+        ),
     )
 
     recommendation = decision["recommendation_type"]

@@ -106,6 +106,25 @@ workspace data.
 
 ## Before Opening a Pull Request / 提 PR 前
 
+### Verification Rhythm / 验证节奏
+
+For a behavior change, start from a reproducible scenario where feasible,
+make the smallest root-cause fix, and run the smallest relevant check before
+calling the change complete. A code review, syntax check, or clean diff is not
+enough evidence for state-machine, write-path, recovery, privacy, or security
+behavior.
+
+行为改动应尽可能先有可复现场景，再做最小根因修复，并在宣称完成前运行最小相关检查。
+对于状态机、写入路径、恢复、隐私或安全行为，代码审阅、语法检查或干净 diff 都不能代替动态证据。
+
+Maintainers may run additional affected-subsystem, compatibility, and release
+checks in a private workspace. Those tests, fixtures, raw outputs, and process
+records do not belong in this public repository. Passing development checks
+also does not by itself authorize a release; release preparation and public
+publication remain separate maintainer decisions.
+
+维护者可能在私有工作区继续运行受影响子系统、兼容性和发布检查。这些测试、fixture、原始输出和过程记录不属于本公开仓库。开发验证通过也不自动授权发布；发布准备和正式公开仍是分开的维护者决策。
+
 Please check:
 
 请确认：

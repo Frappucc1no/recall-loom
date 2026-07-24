@@ -144,14 +144,14 @@ def action_level_for_dispatcher(command: str, *, apply: bool = False) -> str:
 
 
 def action_allowed(state: str, action_level: str) -> bool:
-    if state not in PACKAGE_SUPPORT_STATES:
-        state = "unknown_offline"
     if action_level not in ACTION_LEVELS:
         action_level = "readonly"
+    if state not in PACKAGE_SUPPORT_STATES:
+        return action_level == "diagnostic"
     if state in {"supported", "upgrade_recommended"}:
         return True
     if state == "unknown_offline":
-        return action_level in {"diagnostic", "readonly"}
+        return True
     if state == "readonly_only":
         return action_level in {"diagnostic", "readonly"}
     if state == "diagnostic_only":
@@ -188,6 +188,48 @@ def install_topology_reason(package_root: Path, *, source: str | None = None) ->
     return "unknown_install_topology"
 
 
+def invalid_support_advisory_user_message() -> str:
+    return (
+        "RecallLoom received an invalid package support advisory, so only diagnostic actions are "
+        "available until the advisory is corrected or refreshed."
+    )
+
+
+def invalid_support_advisory_update_hints() -> dict[str, str]:
+    return {
+        "support_diagnostic": "Run a read-only support diagnostic before retrying.",
+        "refresh_support_advisory": "Correct or refresh the configured package support advisory, then retry.",
+    }
+
+
+def invalid_support_cache_user_message() -> str:
+    return (
+        "The local package support cache is invalid, so offline use is limited to diagnostics. "
+        "Refresh support while online so RecallLoom can replace the cache, or remove the invalid "
+        "package-scoped local support cache and retry."
+    )
+
+
+def invalid_support_cache_update_hints() -> dict[str, str]:
+    return {
+        "support_diagnostic": "Run a read-only support diagnostic before retrying.",
+        "refresh_support_cache": (
+            "Reconnect and rerun the support check so RecallLoom can atomically replace the invalid local cache."
+        ),
+        "remove_invalid_support_cache": (
+            "Remove the invalid package-scoped local support cache, then rerun the support check."
+        ),
+    }
+
+
+def support_cache_repair_failed_user_message() -> str:
+    return (
+        "The online support advisory was applied, but the invalid local support cache could not be replaced. "
+        "Retry the support check while online or remove the invalid package-scoped local support cache before "
+        "relying on offline support state."
+    )
+
+
 def user_message_for_state(state: str) -> str:
     if state == "readonly_only":
         return "This RecallLoom package needs an upgrade before mutating actions can continue."
@@ -196,5 +238,5 @@ def user_message_for_state(state: str) -> str:
     if state == "upgrade_recommended":
         return "A newer RecallLoom package is available, but this action is still allowed."
     if state == "unknown_offline":
-        return "RecallLoom could not refresh package support status today, so mutating actions stay blocked until support can be verified."
+        return "RecallLoom could not refresh package support status today; local actions remain available."
     return "This RecallLoom package is currently supported."

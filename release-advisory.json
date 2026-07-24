@@ -1,12 +1,12 @@
 {
-  "latest_version": "0.4.7",
+  "latest_version": "0.4.8",
   "minimum_mutating_version": "0.3.3",
   "minimum_readonly_version": "0.3.3",
   "advisory_level": "upgrade_recommended",
   "release_channel": "stable",
   "public_release_status": "released",
-  "reason_code": "v047_workflow_upgrade_recommended",
-  "user_message": "RecallLoom v0.4.7 is the recommended stable release. It adds a shorter recording workflow, side-effect-free recording suggestions, consistent status and next-step summaries, confirmation material, and preview-bound daily-log cursor repair while preserving protocol 1.0 compatibility. Existing protocol 1.0 workspaces do not require migration.",
+  "reason_code": "v048_hardening_upgrade_recommended",
+  "user_message": "RecallLoom v0.4.8 is the recommended stable release. It hardens sequential writes and failure routing, keeps local work usable when version checks are offline, improves path and symlink safety, and aligns initialization with the logical workday while preserving protocol 1.0 compatibility. Existing protocol 1.0 workspaces do not require migration.",
   "support_advisory_url_status": "canonical_public_location",
   "remote_parity_rule": "The default support_advisory_url points at the canonical public origin/main location. Re-run remote support/readiness checks after publishing package updates.",
   "update_hints": {

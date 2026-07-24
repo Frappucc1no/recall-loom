@@ -16,6 +16,12 @@ from core.coldstart.structured import (
     detect_source_tiers,
     extract_structured_sections,
 )
+from core.provenance.inconsistent_review import (
+    InconsistentReviewContractError,
+    staged_d5_proposal_filename,
+    validate_inconsistent_recovery_material_size,
+    validate_inconsistent_recovery_proposal_text,
+)
 from core.safety.prepared_input import (
     PreparedInputSafetyError,
     read_prepared_input_source_text,
@@ -45,7 +51,7 @@ from _common import (
     text_digest,
     validate_recovery_proposal_text,
     workspace_write_lock,
-    write_text,
+    write_text_create_only,
 )
 
 
@@ -92,6 +98,31 @@ def resolve_filename_stamp(raw_value: str | None) -> str:
             )
         return raw_value
     return datetime.now().astimezone().strftime("%Y-%m-%d-%H%M%S")
+
+
+def exit_existing_proposal(
+    parser,
+    *,
+    json_mode: bool,
+    target_path: Path,
+    project_root: Path,
+) -> None:
+    public_target = (
+        public_project_path(target_path, project_root=project_root)
+        or target_path.name
+    )
+    message = f"Refusing to overwrite an existing recovery proposal: {public_target}"
+    exit_with_cli_error(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message=message,
+        payload=cli_failure_payload(
+            "malformed_managed_file",
+            error=message,
+            details={"proposal_path": str(target_path)},
+        ),
+    )
 
 
 def exit_prepared_input_safety_error(
@@ -301,6 +332,22 @@ def main() -> None:
         project_root=workspace.project_root,
         storage_root=workspace.storage_root,
     )
+    try:
+        inconsistent_proposal_material = validate_inconsistent_recovery_proposal_text(
+            body_text
+        )
+    except InconsistentReviewContractError as exc:
+        exit_with_failure_contract(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message="Invalid inconsistent-evidence recovery proposal material.",
+            reason="invalid_prepared_input",
+            details={
+                "reason_code": exc.reason_code,
+                "side_effect": "none",
+            },
+        )
     proposal_errors = validate_recovery_proposal_text(body_text)
     if proposal_errors:
         message = "Invalid recovery proposal content:\n- " + "\n- ".join(proposal_errors)
@@ -330,8 +377,36 @@ def main() -> None:
             payload=cli_failure_payload("invalid_prepared_input", error=str(exc)),
         )
 
+    staged_text = body_text.rstrip("\n") + "\n"
+    if isinstance(inconsistent_proposal_material, dict):
+        try:
+            validate_inconsistent_recovery_material_size(
+                staged_text,
+                material_role="proposal",
+            )
+        except InconsistentReviewContractError as exc:
+            exit_with_failure_contract(
+                parser,
+                json_mode=args.json,
+                exit_code=2,
+                message="Invalid inconsistent-evidence recovery proposal material.",
+                reason="invalid_prepared_input",
+                details={
+                    "reason_code": exc.reason_code,
+                    "side_effect": "none",
+                },
+            )
+    target_filename = (
+        staged_d5_proposal_filename(
+            filename_stamp=filename_stamp,
+            proposal_id=proposal_id,
+            staged_text=staged_text,
+        )
+        if isinstance(inconsistent_proposal_material, dict)
+        else f"{filename_stamp}-{proposal_id}.md"
+    )
     proposals_dir = workspace.storage_root / "companion" / "recovery" / "proposals"
-    target_path = proposals_dir / f"{filename_stamp}-{proposal_id}.md"
+    target_path = proposals_dir / target_filename
 
     try:
         with workspace_write_lock(workspace.project_root, "stage_recovery_proposal.py"):
@@ -350,33 +425,34 @@ def main() -> None:
                 ("companion", "recovery", "archive"),
                 project_root=workspace.project_root,
             )
-            target_path = proposals_dir / f"{filename_stamp}-{proposal_id}.md"
+            target_path = proposals_dir / target_filename
             try:
                 target_path.lstat()
                 target_exists = True
             except FileNotFoundError:
                 target_exists = False
             if target_exists:
-                public_target = public_project_path(target_path, project_root=workspace.project_root) or target_path.name
-                message = f"Refusing to overwrite an existing recovery proposal: {public_target}"
-                exit_with_cli_error(
+                exit_existing_proposal(
                     parser,
                     json_mode=args.json,
-                    exit_code=2,
-                    message=message,
-                    payload=cli_failure_payload(
-                        "malformed_managed_file",
-                        error=message,
-                        details={"proposal_path": str(target_path)},
-                    ),
+                    target_path=target_path,
+                    project_root=workspace.project_root,
                 )
             ensure_managed_directory_chain(
                 workspace.storage_root,
                 ("companion", "recovery", "proposals"),
                 project_root=workspace.project_root,
                 create=False,
+            )
+            try:
+                write_text_create_only(target_path, staged_text)
+            except LockBusyError:
+                exit_existing_proposal(
+                    parser,
+                    json_mode=args.json,
+                    target_path=target_path,
+                    project_root=workspace.project_root,
                 )
-            write_text(target_path, body_text.rstrip("\n") + "\n")
     except LockBusyError as exc:
         public_message = publicize_text_paths(
             str(exc),

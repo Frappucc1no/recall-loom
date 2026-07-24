@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 from _common import (
+    DailyLogCursor,
     DailyLogCursorError,
+    daily_log_cursor_is_empty_scaffold,
     daily_log_cursor_is_legacy_empty,
     daily_log_cursor_state_fields,
     daily_log_cursors_equivalent,
     latest_active_daily_log_cursor,
+    sorted_active_daily_log_files,
 )
 from core.errors import ConfigContractError
 from core.protocol.contracts import (
@@ -23,6 +27,10 @@ from core.protocol.contracts import (
     SUPPORTED_WORKSPACE_LANGUAGES,
 )
 from core.protocol.markers import parse_file_marker, parse_file_state_marker
+from core.provenance.inconsistent_review import (
+    REVIEW_IMPORTED_BASELINE_MATERIAL_FAILURE_REASONS,
+    evaluate_review_imported_baseline_materials,
+)
 from core.provenance.store import (
     RECEIPT_STORE_RELATIVE_PATH,
     ReceiptStoreError,
@@ -39,6 +47,20 @@ RECEIPT_VERIFIED_FILE_KEYS = (
     "update_protocol",
 )
 
+_ACTUAL_DAILY_LOG_CURSOR_EVIDENCE_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class ActualDailyLogCursorEvidence:
+    """Internal proof that a cursor came from a specific on-disk snapshot."""
+
+    storage_root: str
+    workspace_revision: int
+    state_digest: str
+    cursor: DailyLogCursor
+    latest_file_identity: tuple[int, int, int, int, int] | None
+    _construction_token: object = field(repr=False, compare=False)
+
 
 def _sha256_text_digest(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -46,6 +68,240 @@ def _sha256_text_digest(text: str) -> str:
 
 def _read_text(path: Path) -> str:
     return path.read_bytes().decode("utf-8")
+
+
+def _normalized_path(path: Path) -> str:
+    return str(path.expanduser().absolute())
+
+
+def _strict_json_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        if left.keys() != right.keys():
+            return False
+        return all(_strict_json_equal(left[key], right[key]) for key in left)
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _strict_json_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return left == right
+
+
+def _exact_state_snapshot_digest(*, state_text: str, state: dict) -> str | None:
+    try:
+        parsed_state = json.loads(state_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed_state, dict) or not _strict_json_equal(parsed_state, state):
+        return None
+    return _sha256_text_digest(state_text)
+
+
+def _daily_log_cursor_has_strict_json_types(cursor: dict[str, object]) -> bool:
+    latest_file = cursor.get("latest_file")
+    latest_entry_id = cursor.get("latest_entry_id")
+    latest_entry_seq = cursor.get("latest_entry_seq")
+    entry_count = cursor.get("entry_count")
+    return (
+        (latest_file is None or type(latest_file) is str)
+        and (latest_entry_id is None or type(latest_entry_id) is str)
+        and (
+            latest_entry_seq is None
+            or (_is_json_int(latest_entry_seq) and latest_entry_seq >= 0)
+        )
+        and _is_json_int(entry_count)
+        and entry_count >= 0
+    )
+
+
+def _daily_log_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    stat_result = path.stat()
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _stable_actual_daily_log_cursor_snapshot(
+    storage_root: Path,
+) -> tuple[
+    DailyLogCursor,
+    tuple[int, int, int, int, int] | None,
+    bool,
+]:
+    logs_dir = storage_root / DAILY_LOGS_DIRNAME
+    try:
+        before_files = sorted_active_daily_log_files(logs_dir)
+        before_path = before_files[-1] if before_files else None
+        before_identity = (
+            _daily_log_file_identity(before_path) if before_path is not None else None
+        )
+        actual_cursor = latest_active_daily_log_cursor(storage_root)
+        after_files = sorted_active_daily_log_files(logs_dir)
+        after_path = after_files[-1] if after_files else None
+        after_identity = (
+            _daily_log_file_identity(after_path) if after_path is not None else None
+        )
+    except OSError as exc:
+        raise DailyLogCursorError(
+            reason_code="unreadable_latest_daily_log",
+            message="Could not read a stable latest daily-log snapshot.",
+            path=logs_dir,
+        ) from exc
+
+    parsed_path = actual_cursor.latest_path
+    stable = (
+        (before_path is None and parsed_path is None and after_path is None)
+        or (
+            before_path is not None
+            and parsed_path is not None
+            and after_path is not None
+            and _normalized_path(before_path) == _normalized_path(parsed_path)
+            and _normalized_path(parsed_path) == _normalized_path(after_path)
+            and before_identity == after_identity
+        )
+    )
+    return actual_cursor, after_identity, stable
+
+
+def _bind_actual_daily_log_cursor_evidence(
+    *,
+    storage_root: Path,
+    state: dict,
+    state_text: str,
+    actual_cursor: DailyLogCursor,
+    latest_file_identity: tuple[int, int, int, int, int] | None,
+) -> ActualDailyLogCursorEvidence | None:
+    workspace_revision = state.get("workspace_revision")
+    if not _is_json_int(workspace_revision) or workspace_revision < 1:
+        return None
+    state_digest = _exact_state_snapshot_digest(state_text=state_text, state=state)
+    if state_digest is None:
+        return None
+    actual_cursor_fields = actual_cursor.as_state_fields()
+    state_cursor_fields = daily_log_cursor_state_fields(state)
+    if not (
+        _daily_log_cursor_has_strict_json_types(state_cursor_fields)
+        and _daily_log_cursor_has_strict_json_types(actual_cursor_fields)
+    ):
+        return None
+    if not daily_log_cursors_equivalent(
+        state_cursor_fields,
+        actual_cursor_fields,
+        actual_cursor=actual_cursor_fields,
+    ):
+        return None
+
+    if actual_cursor.latest_file is None:
+        if actual_cursor.latest_path is not None or latest_file_identity is not None:
+            return None
+    else:
+        expected_path = storage_root / actual_cursor.latest_file
+        if actual_cursor.latest_path is None or (
+            _normalized_path(actual_cursor.latest_path) != _normalized_path(expected_path)
+        ):
+            return None
+        if latest_file_identity is None:
+            return None
+
+    return ActualDailyLogCursorEvidence(
+        storage_root=_normalized_path(storage_root),
+        workspace_revision=workspace_revision,
+        state_digest=state_digest,
+        cursor=actual_cursor,
+        latest_file_identity=latest_file_identity,
+        _construction_token=_ACTUAL_DAILY_LOG_CURSOR_EVIDENCE_TOKEN,
+    )
+
+
+def capture_actual_daily_log_cursor_evidence(
+    *,
+    storage_root: Path,
+    state: dict,
+    state_text: str,
+) -> tuple[DailyLogCursor, ActualDailyLogCursorEvidence | None]:
+    """Capture a stable disk cursor and bind it to the exact state snapshot."""
+
+    actual_cursor, latest_file_identity, stable = _stable_actual_daily_log_cursor_snapshot(
+        storage_root
+    )
+    if not stable:
+        raise DailyLogCursorError(
+            reason_code="daily_log_cursor_mismatch",
+            message="The latest daily-log snapshot changed while it was being read.",
+            path=storage_root / DAILY_LOGS_DIRNAME,
+        )
+    return actual_cursor, _bind_actual_daily_log_cursor_evidence(
+        storage_root=storage_root,
+        state=state,
+        state_text=state_text,
+        actual_cursor=actual_cursor,
+        latest_file_identity=latest_file_identity,
+    )
+
+
+def _verified_actual_daily_log_cursor(
+    *,
+    storage_root: Path,
+    state: dict,
+    state_text: str | None,
+    evidence: ActualDailyLogCursorEvidence | None,
+) -> tuple[dict[str, object] | None, bool]:
+    state_digest = (
+        _exact_state_snapshot_digest(state_text=state_text, state=state)
+        if isinstance(state_text, str)
+        else None
+    )
+    if not isinstance(evidence, ActualDailyLogCursorEvidence):
+        return None, False
+    if (
+        evidence._construction_token is not _ACTUAL_DAILY_LOG_CURSOR_EVIDENCE_TOKEN
+        or evidence.storage_root != _normalized_path(storage_root)
+        or evidence.workspace_revision != state.get("workspace_revision")
+        or state_digest is None
+        or evidence.state_digest != state_digest
+    ):
+        return None, True
+
+    cursor = evidence.cursor.as_state_fields()
+    state_cursor = daily_log_cursor_state_fields(state)
+    if not (
+        _daily_log_cursor_has_strict_json_types(state_cursor)
+        and _daily_log_cursor_has_strict_json_types(cursor)
+    ):
+        return None, True
+    if not daily_log_cursors_equivalent(
+        state_cursor,
+        cursor,
+        actual_cursor=cursor,
+    ):
+        return None, True
+    try:
+        current_cursor, current_identity, stable = _stable_actual_daily_log_cursor_snapshot(
+            storage_root
+        )
+    except DailyLogCursorError:
+        return None, True
+    evidence_path = evidence.cursor.latest_path
+    current_path = current_cursor.latest_path
+    if (
+        not stable
+        or evidence.latest_file_identity != current_identity
+        or current_cursor.as_state_fields() != cursor
+        or ((evidence_path is None) != (current_path is None))
+        or (
+            evidence_path is not None
+            and current_path is not None
+            and _normalized_path(evidence_path) != _normalized_path(current_path)
+        )
+    ):
+        return None, True
+    return cursor, False
 
 
 def _is_json_int(value: Any) -> bool:
@@ -86,11 +342,48 @@ def _daily_log_cursor_for_evidence(
     return state_cursor if isinstance(state_cursor, dict) else None
 
 
+def _daily_log_required_without_actual_evidence(
+    *,
+    storage_root: Path,
+    state: dict,
+    daily_log_cursor: dict[str, object] | None,
+) -> bool:
+    state_daily_logs = state.get("daily_logs")
+    if type(state_daily_logs) is not dict or type(daily_log_cursor) is not dict:
+        return True
+    state_cursor = daily_log_cursor_state_fields(state_daily_logs)
+    caller_cursor = daily_log_cursor_state_fields(daily_log_cursor)
+    if not (
+        _daily_log_cursor_has_strict_json_types(state_cursor)
+        and _daily_log_cursor_has_strict_json_types(caller_cursor)
+    ):
+        return True
+    if not (
+        daily_log_cursor_is_legacy_empty(state_cursor)
+        and daily_log_cursor_is_legacy_empty(caller_cursor)
+        and _strict_json_equal(state_cursor, caller_cursor)
+    ):
+        return True
+
+    logs_dir = storage_root / DAILY_LOGS_DIRNAME
+    try:
+        if not logs_dir.is_dir():
+            return True
+        active_files = sorted_active_daily_log_files(logs_dir)
+        if not logs_dir.is_dir():
+            return True
+    except OSError:
+        return True
+    return bool(active_files)
+
+
 def current_receipt_required_file_keys(
     *,
     storage_root: Path,
     state: dict,
+    state_text: str | None = None,
     daily_log_cursor: dict[str, object] | None = None,
+    actual_daily_log_cursor_evidence: ActualDailyLogCursorEvidence | None = None,
 ) -> list[str]:
     required = []
     for file_key in ("rolling_summary", "context_brief", "update_protocol"):
@@ -98,11 +391,23 @@ def current_receipt_required_file_keys(
             state, file_key
         ):
             required.append(file_key)
-    daily_state = _daily_log_cursor_for_evidence(
+    actual_daily_log_cursor, actual_evidence_changed = _verified_actual_daily_log_cursor(
+        storage_root=storage_root,
+        state=state,
+        state_text=state_text,
+        evidence=actual_daily_log_cursor_evidence,
+    )
+    if actual_daily_log_cursor is not None:
+        if (
+            not daily_log_cursor_is_empty_scaffold(actual_daily_log_cursor)
+            and actual_daily_log_cursor.get("latest_file") is not None
+        ):
+            required.append("daily_log")
+    elif actual_evidence_changed or _daily_log_required_without_actual_evidence(
+        storage_root=storage_root,
         state=state,
         daily_log_cursor=daily_log_cursor,
-    )
-    if isinstance(daily_state, dict) and isinstance(daily_state.get("latest_file"), str):
+    ):
         required.append("daily_log")
     return sorted(required)
 
@@ -160,6 +465,28 @@ def _is_positive_json_int(value: Any) -> bool:
     return _is_json_int(value) and value >= 1
 
 
+def _daily_log_cursor_mismatch_result(
+    *,
+    state_cursor: dict[str, object],
+    actual: DailyLogCursor,
+) -> dict[str, object]:
+    actual_cursor = actual.as_state_fields()
+    reason_code = "daily_log_cursor_mismatch"
+    if actual.latest_file is None and not daily_log_cursor_is_legacy_empty(state_cursor):
+        reason_code = "unexpected_latest_daily_log_state"
+    elif state_cursor.get("latest_file") is None:
+        reason_code = "missing_latest_daily_log_state"
+    elif state_cursor.get("latest_file") != actual_cursor.get("latest_file"):
+        reason_code = "latest_daily_log_state_mismatch"
+    return {
+        "verified": False,
+        "reason_code": reason_code,
+        "state_cursor": state_cursor,
+        "actual_cursor": actual_cursor,
+        "path": str(actual.latest_path) if actual.latest_path is not None else None,
+    }
+
+
 def current_daily_log_cursor_consistency_check(
     *,
     storage_root: Path,
@@ -184,6 +511,14 @@ def current_daily_log_cursor_consistency_check(
             "actual_cursor": exc.details,
             "path": str(exc.path) if exc.path is not None else None,
         }
+    except OSError:
+        return {
+            "verified": False,
+            "reason_code": "unreadable_latest_daily_log",
+            "state_cursor": state_cursor,
+            "actual_cursor": None,
+            "path": str(storage_root / DAILY_LOGS_DIRNAME),
+        }
     actual_cursor = actual.as_state_fields()
 
     if daily_log_cursors_equivalent(
@@ -199,20 +534,85 @@ def current_daily_log_cursor_consistency_check(
             "path": str(actual.latest_path) if actual.latest_path is not None else None,
         }
 
-    reason_code = "daily_log_cursor_mismatch"
-    if actual.latest_file is None and not daily_log_cursor_is_legacy_empty(state_cursor):
-        reason_code = "unexpected_latest_daily_log_state"
-    elif state_cursor.get("latest_file") is None:
-        reason_code = "missing_latest_daily_log_state"
-    elif state_cursor.get("latest_file") != actual_cursor.get("latest_file"):
-        reason_code = "latest_daily_log_state_mismatch"
+    return _daily_log_cursor_mismatch_result(
+        state_cursor=state_cursor,
+        actual=actual,
+    )
+
+
+def _current_daily_log_cursor_consistency_snapshot(
+    *,
+    storage_root: Path,
+    state: dict,
+    state_text: str,
+) -> tuple[dict[str, object], ActualDailyLogCursorEvidence | None]:
+    daily_state = state.get("daily_logs")
+    if not isinstance(daily_state, dict):
+        return {
+            "verified": False,
+            "reason_code": "invalid_daily_logs_state",
+            "state_cursor": None,
+        }, None
+
+    state_cursor = daily_log_cursor_state_fields(daily_state)
+    try:
+        actual, latest_file_identity, stable = _stable_actual_daily_log_cursor_snapshot(
+            storage_root
+        )
+    except DailyLogCursorError as exc:
+        return {
+            "verified": False,
+            "reason_code": exc.reason_code,
+            "state_cursor": state_cursor,
+            "actual_cursor": exc.details,
+            "path": str(exc.path) if exc.path is not None else None,
+        }, None
+
+    actual_cursor = actual.as_state_fields()
+    if not stable:
+        return {
+            "verified": False,
+            "reason_code": "daily_log_cursor_mismatch",
+            "state_cursor": state_cursor,
+            "actual_cursor": {
+                "reason_code": "daily_log_cursor_mismatch",
+                "side_effect": "none",
+                "path": str(storage_root / DAILY_LOGS_DIRNAME),
+            },
+            "path": str(storage_root / DAILY_LOGS_DIRNAME),
+        }, None
+    if not daily_log_cursors_equivalent(
+        state_cursor,
+        actual_cursor,
+        actual_cursor=actual_cursor,
+    ):
+        return _daily_log_cursor_mismatch_result(
+            state_cursor=state_cursor,
+            actual=actual,
+        ), None
+
+    actual_evidence = _bind_actual_daily_log_cursor_evidence(
+        storage_root=storage_root,
+        state=state,
+        state_text=state_text,
+        actual_cursor=actual,
+        latest_file_identity=latest_file_identity,
+    )
+    if actual_evidence is None:
+        return {
+            "verified": False,
+            "reason_code": "daily_log_cursor_mismatch",
+            "state_cursor": state_cursor,
+            "actual_cursor": actual_cursor,
+            "path": str(actual.latest_path) if actual.latest_path is not None else None,
+        }, None
     return {
-        "verified": False,
-        "reason_code": reason_code,
+        "verified": True,
+        "reason_code": "daily_log_cursor_verified",
         "state_cursor": state_cursor,
         "actual_cursor": actual_cursor,
         "path": str(actual.latest_path) if actual.latest_path is not None else None,
-    }
+    }, actual_evidence
 
 
 def _state_file_entry_issue(entry: Any, *, file_key: str) -> str | None:
@@ -480,6 +880,7 @@ def bounded_current_helper_evidence_check(
     require_receipt_store: bool = False,
     require_config_guard: bool = False,
     daily_log_cursor: dict[str, object] | None = None,
+    actual_daily_log_cursor_evidence: ActualDailyLogCursorEvidence | None = None,
 ) -> dict[str, object]:
     """Verify whether current receipt-store evidence can preserve helper_evidenced.
 
@@ -493,7 +894,9 @@ def bounded_current_helper_evidence_check(
     required_file_keys = current_receipt_required_file_keys(
         storage_root=storage_root,
         state=state,
+        state_text=state_text,
         daily_log_cursor=daily_log_cursor,
+        actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
     )
     config_guard = None
     if require_config_guard:
@@ -999,9 +1402,12 @@ def strict_sidecar_integrity_gate(
             evidence=evidence,
         )
 
-    daily_log_cursor = current_daily_log_cursor_consistency_check(
-        storage_root=storage_root,
-        state=state,
+    daily_log_cursor, actual_daily_log_cursor_evidence = (
+        _current_daily_log_cursor_consistency_snapshot(
+            storage_root=storage_root,
+            state=state,
+            state_text=state_text,
+        )
     )
     evidence["daily_log_cursor"] = daily_log_cursor
     actual_daily_log_cursor = (
@@ -1012,7 +1418,9 @@ def strict_sidecar_integrity_gate(
     required_file_keys = current_receipt_required_file_keys(
         storage_root=storage_root,
         state=state,
+        state_text=state_text,
         daily_log_cursor=actual_daily_log_cursor,
+        actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
     )
     evidence["required_current_file_keys"] = required_file_keys
 
@@ -1081,6 +1489,35 @@ def strict_sidecar_integrity_gate(
             details=evidence["provenance_facts"],
         )
 
+    if provenance_facts.get("review_imported_baseline") is True:
+        reviewed_baseline = evaluate_review_imported_baseline_materials(
+            project_root=project_root,
+            storage_root=storage_root,
+            state=state,
+            state_text=state_text,
+        )
+        if reviewed_baseline.status != "not_applicable":
+            route_reason_code = reviewed_baseline.reason_code
+            material_reason_code = None
+            if route_reason_code in REVIEW_IMPORTED_BASELINE_MATERIAL_FAILURE_REASONS:
+                material_reason_code = route_reason_code
+                route_reason_code = "review_imported_baseline_material_invalid"
+            evidence["review_imported_baseline"] = {
+                "verified": reviewed_baseline.status == "verified",
+                "reason_code": route_reason_code,
+                "receipt_backed": False,
+            }
+            if material_reason_code is not None:
+                evidence["review_imported_baseline"][
+                    "material_reason_code"
+                ] = material_reason_code
+        if reviewed_baseline.status == "invalid":
+            return _strict_gate_block(
+                reason_code=evidence["review_imported_baseline"]["reason_code"],
+                evidence=evidence,
+                details=evidence["review_imported_baseline"],
+            )
+
     if provenance_facts.get("helper_evidenced") is not True:
         return {
             "allowed_for_mutation": True,
@@ -1103,6 +1540,7 @@ def strict_sidecar_integrity_gate(
         require_receipt_store=True,
         require_config_guard=False,
         daily_log_cursor=actual_daily_log_cursor,
+        actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
     )
     evidence["helper_evidence"] = helper_evidence
     if helper_evidence.get("verified") is not True:

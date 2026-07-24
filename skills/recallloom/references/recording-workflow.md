@@ -62,13 +62,13 @@ Do not put raw private payloads, shell transcripts, absolute local paths, reserv
 
 ## Prepared Input Templates
 
-These templates show valid prepared shapes. Replace placeholder text with public-safe project content only, then run the helper gates returned by `record --plan` and preflight.
+These templates show valid prepared shapes. Replace placeholder text with public-safe project content only, then use the dispatcher so it can run a fresh preflight and issue the revision binding before any mutation.
 
 Append daily-log JSON:
 
 ```bash
 recallloom.py append <project> \
-  --entry-json '{"work_completed":["public-safe milestone"],"confirmed_facts":["public-safe fact"],"key_decisions":[],"risks_blockers":[],"recommended_next_step":["next safe step"]}' \
+  --entry-json '{"work_completed":["public-safe milestone"],"confirmed_facts":["public-safe fact"],"key_decisions":["none"],"risks_blockers":["none"],"recommended_next_step":["next safe step"]}' \
   --input-format json \
   --json
 ```
@@ -97,8 +97,9 @@ Current-state JSON:
 ```bash
 recallloom.py write <project> \
   --type current-state \
-  --stdin \
+  --source-file <prepared-current-state.json> \
   --input-format json \
+  --dry-run \
   --json
 ```
 
@@ -111,6 +112,38 @@ recallloom.py write <project> \
   "recent_pivots": []
 }
 ```
+
+The JSON block is the complete UTF-8 content of
+`<prepared-current-state.json>`. Remove `--dry-run` only after the dispatcher
+has returned a fresh preflight result that authorizes the write.
+
+## Dispatcher Internal Helper Boundary
+
+For normal operations, use only the applicable dispatcher surface. Managed-file
+writes and daily-log entries use `write` and `append`;
+`sync-current-state-after-append` is used only when its post-append contract
+requires that lane. `commit_context_file.py` and `append_daily_log_entry.py` are
+internal dispatcher and integration surfaces, not standalone operator paths.
+The dispatcher runs a fresh preflight, constructs the binding, and writes the
+matching lease immediately before calling a helper. A read-only
+`preflight_context_check.py <project> --json` result does not issue either
+material. There is no independent operator binding/lease pickup interface: a
+hand-invoked helper without the still-current dispatcher-issued material is
+expected to fail. Never reconstruct, copy from preflight output, reuse, or
+amend that material.
+
+After a D5 promotion produces `review_imported_baseline`, use dispatcher
+`write` or `append` with its existing `--confirm-review-imported-baseline` flag
+for the first write. The dispatcher then issues the
+confirmation-bound binding and matching lease. The internal helpers do not accept
+that flag; the internal helpers only verify and consume the dispatcher-issued binding and lease
+inside the dispatcher/integration path.
+The existing `sync-current-state-after-append` lane also accepts the confirmation
+when its own post-append contract requires it; it still delegates through the
+same internal binding/lease boundary.
+If the binding is omitted, stale, malformed, missing its lease or confirmation,
+or has a mismatched hash, stop and return the helper failure contract rather
+than attempting a write.
 
 Record-plan input:
 

@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 from core.bridge.blocks import bridge_block_integrity
 from core.continuity.freshness import (
     continuity_state_for_workspace as shared_continuity_state_for_workspace,
     summary_matches_empty_shell_template as shared_summary_matches_empty_shell_template,
+)
+from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
+    logical_workday_for,
 )
 from core.failure.contracts import failure_payload
 from core.output.privacy import publicize_json_value
@@ -51,7 +56,6 @@ from _common import (
     restore_text_snapshot,
     storage_root_for_mode,
     storage_root_boundary_issue,
-    today_iso,
     MANAGED_ASSET_REQUIRED_DIRECTORIES,
     MANAGED_ASSET_REQUIRED_FILES,
     unknown_storage_assets,
@@ -80,6 +84,15 @@ def continuity_state_for_workspace(
     )
 
 
+def default_initialization_date(now: datetime | None = None) -> str:
+    """Return the default init date under the shared logical-workday policy."""
+    effective_now = now or datetime.now().astimezone()
+    return logical_workday_for(
+        effective_now,
+        DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
+    ).isoformat()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Initialize a RecallLoom file structure in a project directory."
@@ -97,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--date",
-        default=today_iso(),
+        default=default_initialization_date(),
         help="Date to use for generated metadata and optional daily log file.",
     )
     parser.add_argument(

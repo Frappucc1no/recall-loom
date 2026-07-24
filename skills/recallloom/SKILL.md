@@ -41,7 +41,7 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.7`
+- package version: `0.4.8`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -68,7 +68,10 @@ RecallLoom package support is separate from project sidecar protocol compatibili
 - Helpers MUST perform the package-support check and MUST NOT write support state into project `.recallloom/`.
 - If support is `readonly_only`, mutating helpers MUST block while diagnostic and read-only helpers MAY continue.
 - If support is `diagnostic_only`, only diagnostic helpers SHOULD continue.
-- If support is `unknown_offline`, diagnostic and read-only actions MAY continue, but mutating actions MUST block until support can be verified.
+- If support is `unknown_offline` because no local support cache exists, local diagnostic, read-only, and mutating actions MAY continue; network access is not a prerequisite for local RecallLoom use.
+- A structurally invalid or uninterpretable local support cache permits diagnostic actions only while offline. A structurally valid stale cache is re-evaluated against the current package version and keeps its `supported`, `upgrade_recommended`, `readonly_only`, or `diagnostic_only` restriction.
+- Invalid-cache diagnostics MUST identify the cache condition with a public-safe reason and direct recovery toward read-only diagnosis, online refresh and atomic cache replacement, or removal of the invalid package-scoped local cache. They MUST NOT present a package upgrade as the cache repair or describe the cache as tampered.
+- `invalid_support_advisory` remains distinct from an invalid local cache: correct or refresh the advisory rather than treating it as cache damage.
 - Blocked actions MUST return the shared failure contract with `blocked_reason: package_support_blocked` and a `package_support` object. See `references/package-support-policy.md`.
 
 ## Public Surface And Required Checks
@@ -86,17 +89,19 @@ RecallLoom package support is separate from project sidecar protocol compatibili
 - Managed sidecar or provenance-impacting actions surface one of `allow`, `warn`, `ask`, or `block` in helper readiness output when provenance state is relevant.
 - `warn` is for low-risk structural-only or readable legacy states and should stay brief; repeated same-session low-risk warnings should be cooldown-friendly.
 - `ask` is for legacy review / repair import or reviewed imported baseline actions and requires explicit operator confirmation before higher-risk writes.
-- `block` is non-waivable for forged markers, detected receipt/store inconsistency, direct `state.json` / `config.json` edits, privacy violations, and any state classified as `inconsistent_or_tampered_evidence`.
+- `block` is non-waivable for forged markers, detected receipt/store inconsistency, direct `state.json` / `config.json` edits, privacy violations, and any general, legacy, or unbound state classified as `inconsistent_or_tampered_evidence`.
+- D5 is the sole narrow recovery transition: only helper-path target-only post-hash evidence that is contract-valid for the current D5 schema and has an exact failure-time state match may proceed through a fresh binding, human proposal/review, and expected-binding promotion. It is not a waiver and does not prove cryptographic authorship. Promotion still requires fresh validate, status, and preflight before a write. The exact D5 human-material sections, JSON keys, and promotion commands are in `references/operation-playbooks.md`.
 - Do not present remote services, host memory, plugins, MCP, hooks, or wrappers as authority for local helper evidence.
-- Receipt-backed mutation is limited to dispatcher-issued managed-file writes, daily-log appends to the current latest cursor, and post-append summary sync. Archive apply and bridge apply remain preview-only until those surfaces gain their own receipt support.
+- Receipt-backed mutation is limited to dispatcher-issued managed-file writes, daily-log appends to the current latest cursor, and post-append summary sync. Archive and bridge remain preview-only; their apply modes remain unsupported until those surfaces gain their own receipt support.
 
 ## Write Protocol Red Lines
 
-- Managed sidecar writes MUST use helper scripts. Do not bypass them with blind file replacement, blind patching, or hand-built sidecar files.
-- Daily-log writes MUST use `append_daily_log_entry.py` or dispatcher `append`. Do not handwrite `daily-log-entry` markers.
-- Daily-log cursor repair MUST use `repair_daily_log_cursor.py` or dispatcher `repair-daily-log-cursor`. Do not hand-edit `state.json.daily_logs`.
-- Overwrite-style managed files MUST use revision-aware helper commits. Do not handwrite `file-state` markers.
+- Managed sidecar mutations in normal operation MUST use the applicable dispatcher surface: use `write` for managed-file writes, `append` for daily-log entries, and `sync-current-state-after-append` only when its post-append contract requires that lane. Do not bypass the dispatcher with blind file replacement, blind patching, or hand-built sidecar files.
+- Daily-log writes in normal operation MUST use dispatcher `append`; its internal helper writes the entry. Do not handwrite `daily-log-entry` markers.
+- Daily-log cursor repair in normal operation MUST use dispatcher `repair-daily-log-cursor`; its internal helper performs the repair. Do not hand-edit `state.json.daily_logs`.
+- Overwrite-style managed files in normal operation MUST use dispatcher `write`; its internal helper performs the revision-aware commit. Do not handwrite `file-state` markers.
 - `STORAGE_ROOT/state.json` and `STORAGE_ROOT/config.json` MUST NOT be hand-edited during normal operation.
+- Normal operations use only the applicable dispatcher surface. Managed-file writes and daily-log entries use `write` and `append`; `sync-current-state-after-append` is used only when its post-append contract requires that lane. `commit_context_file.py` and `append_daily_log_entry.py` are internal dispatcher/integration surfaces: the dispatcher performs its own fresh preflight, constructs the binding, and persists the matching lease immediately before calling a helper. A read-only preflight does not issue either material, there is no independent operator pickup interface, and a hand-invoked helper without dispatcher-issued material is expected to fail. For the first write from a reviewed imported baseline, use dispatcher `write` or `append` with `--confirm-review-imported-baseline`; the post-append sync lane also accepts that confirmation when its contract requires it. The internal helpers do not accept the flag and only consume dispatcher-issued confirmation-bound binding and lease material.
 - Protocol `1.0` daily-log counters are file-local: `entry-seq` is `1..N` within one daily log and canonical `entry-id` is `entry-{entry_seq}`. Do not treat either as globally unique.
 - Keep `state.json.daily_logs.entry_count` as `entry_count`; it means the entry marker count in the latest active daily log, not a global cumulative count.
 - If a helper write fails, diagnose, fix, retry, then surface the helper failure contract if it still cannot complete.

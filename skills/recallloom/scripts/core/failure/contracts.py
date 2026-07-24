@@ -478,9 +478,582 @@ FAILURE_REASON_REGISTRY = {
 FAILURE_PAYLOAD_SCHEMA_VERSION = "1.1"
 _KNOWN_STORAGE_ROOT_NAMES = {".recallloom", "recallloom"}
 
+_INVALID_LOCAL_SUPPORT_CACHE_REASON_CODES = frozenset(
+    (
+        "support_cache_unreadable",
+        "support_cache_non_utf8",
+        "support_cache_malformed_json",
+        "support_cache_not_object",
+        "support_cache_wrong_package_path",
+        "support_cache_invalid_checked_date",
+        "support_cache_invalid_advisory",
+    )
+)
+
+_CANONICAL_DETAIL_REASON_ROUTES = {
+    "receipt_store_not_written_verified": {
+        "blocked": True,
+        "recoverability": "retryable",
+        "trust_effect": "review_required",
+        "next_actions": [
+            "run_read_only_status",
+            "rerun_fresh_preflight",
+        ],
+        "next_action": "run_read_only_status_then_fresh_preflight_before_retry",
+        "side_effect": "target_and_state_written_receipt_store_verified_unchanged",
+        "safe_to_retry": False,
+        "single_next_command": "recallloom.py status <project-path> --json",
+        "user_message": {
+            "en": (
+                "The target and state were written while the receipt store was verified "
+                "unchanged. Diagnose read-only, then obtain a fresh preflight before retrying."
+            ),
+            "zh-CN": (
+                "目标文件和状态已经写入，同时 receipt store 已确认保持不变。"
+                "请先只读诊断，再获取 fresh preflight 后重试。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Do not retry the helper directly. Run read-only status, then retry only from "
+                "a newly issued preflight binding."
+            ),
+            "zh-CN": (
+                "不要直接重试 helper。请先运行只读 status，再仅使用新签发的 preflight "
+                "binding 重试。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Run read-only status first, then rerun preflight and use only the fresh binding; "
+                "never directly retry the previous helper invocation."
+            ),
+            "zh-CN": (
+                "请先运行只读 status，再重新执行 preflight 并仅使用 fresh binding；"
+                "不要直接重试上一次 helper 调用。"
+            ),
+        },
+        "recovery_command": (
+            "Run recallloom.py status <project-path> --json, then rerun fresh preflight "
+            "before retrying the mutation."
+        ),
+    },
+    "concurrent_external_modification_detected": {
+        "blocked": True,
+        "recoverability": "operator_repair_required",
+        "trust_effect": "damaged",
+        "next_actions": [
+            "run_read_only_status",
+            "run_read_only_validate",
+        ],
+        "next_action": "run_read_only_status_or_validate",
+        "safe_to_retry": False,
+        "single_next_command": "recallloom.py status <project-path> --json",
+        "user_message": {
+            "en": (
+                "External modification was detected during the bounded write. Preserve the "
+                "observed state and diagnose it read-only."
+            ),
+            "zh-CN": (
+                "在有界写入期间检测到外部修改。请保留当前观测状态，并仅做只读诊断。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Run only status or validate next. Do not roll back and do not retry the write "
+                "from the prior context."
+            ),
+            "zh-CN": (
+                "下一步只能运行 status 或 validate。不要回滚，也不要沿用之前的写入上下文重试。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Use read-only status or validation to establish the current state; do not "
+                "roll back or retry the mutation."
+            ),
+            "zh-CN": (
+                "请使用只读 status 或 validation 确认当前状态；不要回滚或重试该变更。"
+            ),
+        },
+        "recovery_command": (
+            "Run recallloom.py status <project-path> --json or recallloom.py validate "
+            "<project-path> --json; do not roll back or retry the mutation."
+        ),
+    },
+    "state_write_failed_target_preserved": {
+        "blocked": True,
+        "recoverability": "operator_repair_required",
+        "trust_effect": "damaged",
+        "next_actions": [
+            "run_read_only_status",
+            "run_read_only_validate",
+        ],
+        "next_action": "run_read_only_status_or_validate",
+        "side_effect": "write_attempted",
+        "safe_to_retry": False,
+        "single_next_command": "recallloom.py status <project-path> --json",
+        "user_message": {
+            "en": (
+                "The target was written but the state write failed. Preserve all bytes and "
+                "diagnose the resulting mismatch read-only."
+            ),
+            "zh-CN": (
+                "目标文件已写入，但 state 写入失败。请保留全部字节，并仅通过只读诊断该不一致状态。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Run only status or validate next. Do not roll back and do not retry the "
+                "write from the prior context."
+            ),
+            "zh-CN": (
+                "下一步只能运行 status 或 validate。不要回滚，也不要沿用之前的写入上下文重试。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Use read-only status or validation to establish the current state; do not "
+                "roll back or retry the mutation."
+            ),
+            "zh-CN": (
+                "请使用只读 status 或 validation 确认当前状态；不要回滚或重试该变更。"
+            ),
+        },
+        "recovery_command": (
+            "Run recallloom.py status <project-path> --json or recallloom.py validate "
+            "<project-path> --json; do not roll back or retry the mutation."
+        ),
+    },
+    "post_hash_inconsistent_review_eligible": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "trust_effect": "review_required",
+        "next_actions": [
+            "prepare_exact_bound_recovery_proposal",
+            "prepare_exact_bound_recovery_review",
+        ],
+        "next_action": "prepare_exact_binding_manual_recovery_materials",
+        "safe_to_retry": False,
+        "single_next_command": (
+            "stage_recovery_proposal.py <project-path> "
+            "--source-file <exact-d5-proposal.md> --json"
+        ),
+        "user_message": {
+            "en": (
+                "This inconsistent-evidence state is eligible for manual review using the exact "
+                "current binding."
+            ),
+            "zh-CN": (
+                "当前不一致证据状态可以进入人工复核，但必须使用精确的当前 binding。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Prepare the proposal and review material against the exact binding digest; "
+                "keep diagnosis read-only until those materials are ready."
+            ),
+            "zh-CN": (
+                "请针对精确 binding digest 准备 proposal 和 review 材料；"
+                "材料就绪前保持只读诊断。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Prepare exact-binding manual recovery proposal and review material before any "
+                "promotion attempt."
+            ),
+            "zh-CN": (
+                "在尝试 promotion 前，请先准备与 exact binding 对应的人工 recovery proposal "
+                "和 review 材料。"
+            ),
+        },
+        "recovery_command": (
+            "Prepare exact-binding D5 proposal and review material, then run "
+            "stage_recovery_proposal.py <project-path> --source-file "
+            "<exact-d5-proposal.md> --json."
+        ),
+    },
+    "post_hash_inconsistent_review_binding_changed": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "trust_effect": "review_required",
+        "next_actions": [
+            "rerun_read_only_changed_provenance_validation",
+            "repeat_manual_inconsistent_review",
+        ],
+        "next_action": "rerun_read_only_validation_then_repeat_manual_review",
+        "safe_to_retry": False,
+        "single_next_command": (
+            "recallloom.py validate <project-path> --require-provenance "
+            "--changed-only --json"
+        ),
+        "user_message": {
+            "en": (
+                "The inconsistent-review binding or its material changed. Earlier proposal or "
+                "review material must not be reused."
+            ),
+            "zh-CN": (
+                "inconsistent-review binding 或其材料已经变化，不能复用之前的 proposal 或 review。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Rerun read-only changed-only provenance validation and repeat the manual review "
+                "against the new exact binding."
+            ),
+            "zh-CN": (
+                "请重新运行只读 changed-only provenance validation，并针对新的 exact binding "
+                "重新人工复核。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Rerun read-only validation, inspect the new binding, and restart the manual "
+                "review; do not reuse earlier material."
+            ),
+            "zh-CN": (
+                "请重新运行只读 validation，检查新的 binding，并重新开始人工复核；"
+                "不要复用旧材料。"
+            ),
+        },
+        "recovery_command": (
+            "Run recallloom.py validate <project-path> --require-provenance "
+            "--changed-only --json, then repeat manual review against the new binding."
+        ),
+    },
+    "review_imported_baseline_material_invalid": {
+        "blocked": True,
+        "recoverability": "operator_repair_required",
+        "trust_effect": "damaged",
+        "next_actions": [
+            "run_read_only_status",
+            "run_read_only_validate",
+        ],
+        "next_action": "run_read_only_status_and_validate_before_operator_repair",
+        "side_effect": "external_target_modification_preserved",
+        "safe_to_retry": False,
+        "single_next_command": "recallloom.py status <project-path> --json",
+        "user_message": {
+            "en": (
+                "The reviewed-baseline state was committed, but its exact proposal or review "
+                "material is no longer valid. All observed bytes were preserved."
+            ),
+            "zh-CN": (
+                "reviewed-baseline 状态已经提交，但其精确 proposal 或 review 材料已无效。"
+                "所有观测到的字节均已保留。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Run status and validation read-only, then repair the reviewed-baseline "
+                "material through the operator recovery process. Do not retry promotion or "
+                "reuse the prior D5 binding."
+            ),
+            "zh-CN": (
+                "先只读运行 status 与 validation，再通过 operator 修复流程修复 "
+                "reviewed-baseline 材料。不要重试 promotion，也不要复用之前的 D5 binding。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Preserve the current state, diagnose it read-only, and repair the committed "
+                "reviewed-baseline material before any later mutation."
+            ),
+            "zh-CN": (
+                "保留当前状态，只读诊断，并在任何后续写入前修复已提交的 "
+                "reviewed-baseline 材料。"
+            ),
+        },
+        "recovery_command": (
+            "Run recallloom.py status <project-path> --json and recallloom.py validate "
+            "<project-path> --require-provenance --changed-only --json, then repair the "
+            "reviewed-baseline material through the operator recovery process."
+        ),
+    },
+    "post_hash_inconsistent_review_promotion_not_committed": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "trust_effect": "review_required",
+        "next_actions": [
+            "inspect_exact_orphan_review_read_only",
+            "explicitly_reuse_exact_orphan_review",
+        ],
+        "next_action": "inspect_exact_orphan_then_explicitly_reuse_it",
+        "safe_to_retry": False,
+        "single_next_command": (
+            "recallloom.py validate <project-path> --require-provenance "
+            "--changed-only --json"
+        ),
+        "user_message": {
+            "en": (
+                "Exact review evidence exists, but the reviewed-baseline state promotion was not "
+                "committed."
+            ),
+            "zh-CN": (
+                "精确 review evidence 已存在，但 reviewed-baseline 状态 promotion 尚未提交。"
+            ),
+        },
+        "operator_note": {
+            "en": (
+                "Inspect the exact orphan review read-only. Reuse it only through an explicit "
+                "promotion attempt with the same binding and review bytes."
+            ),
+            "zh-CN": (
+                "请先只读检查精确 orphan review。只有在 binding 与 review bytes 完全一致时，"
+                "才能通过显式 promotion 尝试复用它。"
+            ),
+        },
+        "suggestion": {
+            "en": (
+                "Validate the exact orphan read-only, then explicitly reuse only that same binding "
+                "and review bytes; do not perform a generic retry."
+            ),
+            "zh-CN": (
+                "请先只读验证精确 orphan，再仅显式复用同一 binding 和 review bytes；"
+                "不要进行普通重试。"
+            ),
+        },
+        "recovery_command": (
+            "Run recallloom.py validate <project-path> --require-provenance "
+            "--changed-only --json, inspect the exact orphan, then explicitly reuse only the "
+            "same binding and review bytes."
+        ),
+    },
+}
+
+_GENERIC_RECEIPT_FAILURE_ROUTE = {
+    "blocked": True,
+    "recoverability": "operator_repair_required",
+    "trust_effect": "review_required",
+    "next_actions": [
+        "run_read_only_status",
+        "run_read_only_validate",
+    ],
+    "next_action": "run_read_only_status_and_validate_before_operator_repair",
+    "safe_to_retry": False,
+    "single_next_command": "recallloom.py status <project-path> --json",
+    "user_message": {
+        "en": (
+            "Receipt finalization is not trustworthy enough to retry. Diagnose the current state "
+            "read-only before operator repair."
+        ),
+        "zh-CN": (
+            "receipt finalization 当前不够可信，不能重试。请先只读诊断当前状态，再由 operator 修复。"
+        ),
+    },
+    "operator_note": {
+        "en": (
+            "Treat this receipt failure as blocked. Run status and validation read-only; do not "
+            "retry the mutation until the evidence is repaired."
+        ),
+        "zh-CN": (
+            "请把这类 receipt failure 视为阻断状态。仅运行只读 status 和 validation；"
+            "证据修复前不要重试变更。"
+        ),
+    },
+    "suggestion": {
+        "en": (
+            "Run read-only status and validation, then repair receipt evidence before considering "
+            "another mutation."
+        ),
+        "zh-CN": (
+            "请先运行只读 status 和 validation，再修复 receipt evidence，之后才能考虑新的变更。"
+        ),
+    },
+    "recovery_command": (
+        "Run recallloom.py status <project-path> --json and recallloom.py validate "
+        "<project-path> --json before operator repair; do not retry the mutation."
+    ),
+}
+
+_HELPER_RECEIPT_FINALIZATION_DETAIL_ROUTE = {
+    "next_action": "review_or_repair_receipt_store_before_claiming_helper_evidenced",
+}
+
+_INVALID_LOCAL_SUPPORT_CACHE_ROUTE = {
+    "blocked": True,
+    "recoverability": "operator_repair_required",
+    "trust_effect": "review_required",
+    "next_actions": [
+        "run_read_only_support_diagnostic",
+        "refresh_or_repair_package_support_cache",
+        "remove_package_scoped_support_cache_and_retry",
+    ],
+    "next_action": "diagnose_then_refresh_repair_or_remove_package_support_cache",
+    "safe_to_retry": False,
+    "single_next_command": "recallloom.py status <project-path> --json",
+    "user_message": {
+        "en": (
+            "The package-scoped support cache is invalid and needs operator repair before this "
+            "action can continue."
+        ),
+        "zh-CN": (
+            "当前 package-scoped support cache 无效，需要 operator 修复后才能继续。"
+        ),
+    },
+    "operator_note": {
+        "en": (
+            "Diagnose read-only, then refresh or atomically repair the package-scoped cache; if "
+            "that cannot succeed, remove only that cache and retry the support check."
+        ),
+        "zh-CN": (
+            "请先只读诊断，再在线刷新或原子修复 package-scoped cache；若无法完成，"
+            "仅移除该 cache 后重试 support check。"
+        ),
+    },
+    "suggestion": {
+        "en": (
+            "Run a read-only support diagnosis, refresh or atomically repair the local support "
+            "cache, or remove only the package-scoped cache before retrying."
+        ),
+        "zh-CN": (
+            "请运行只读 support diagnosis，在线刷新或原子修复本地 support cache；"
+            "也可以仅移除 package-scoped cache 后重试。"
+        ),
+    },
+    "recovery_command": (
+        "Run read-only package support diagnosis, then refresh or atomically repair the "
+        "package-scoped support cache; if needed, remove only that cache and retry the "
+        "support check."
+    ),
+}
+
+_INVALID_SUPPORT_ADVISORY_ROUTE = {
+    "blocked": True,
+    "recoverability": "operator_repair_required",
+    "trust_effect": "review_required",
+    "next_actions": [
+        "correct_or_refresh_package_support_advisory",
+        "rerun_package_support_check",
+    ],
+    "next_action": "correct_or_refresh_advisory_then_rerun_support_check",
+    "safe_to_retry": False,
+    "single_next_command": "recallloom.py status <project-path> --json",
+    "user_message": {
+        "en": (
+            "The configured package support advisory is invalid. Correct or refresh it before "
+            "rerunning the support check."
+        ),
+        "zh-CN": (
+            "当前配置的 package support advisory 无效。请先修正或刷新 advisory，"
+            "再重新运行 support check。"
+        ),
+    },
+    "operator_note": {
+        "en": (
+            "Correct or refresh the configured advisory, then rerun the package support check."
+        ),
+        "zh-CN": (
+            "请修正或刷新当前配置的 advisory，然后重新运行 package support check。"
+        ),
+    },
+    "suggestion": {
+        "en": (
+            "Correct or refresh the configured package support advisory, then rerun the support check."
+        ),
+        "zh-CN": (
+            "请修正或刷新当前配置的 package support advisory，然后重新运行 support check。"
+        ),
+    },
+    "recovery_command": (
+        "Correct or refresh the configured package support advisory, then rerun the support check."
+    ),
+}
+
 
 def _localized_text(language: str, *, en: str, zh_cn: str) -> str:
     return zh_cn if language == "zh-CN" else en
+
+
+def _localized_reason_route(template: dict, *, language: str) -> dict:
+    route: dict = {}
+    for key, value in template.items():
+        if key in {"user_message", "operator_note", "suggestion"}:
+            route[key] = value[language]
+        elif isinstance(value, list):
+            route[key] = list(value)
+        else:
+            route[key] = value
+    return route
+
+
+def canonical_detail_reason_contract(
+    reason_code: str | None,
+    *,
+    language: str = "en",
+) -> dict | None:
+    """Return the canonical public route for a nested failure reason code."""
+
+    if language not in {"en", "zh-CN"}:
+        language = "en"
+    template = _CANONICAL_DETAIL_REASON_ROUTES.get(reason_code)
+    if template is None and isinstance(reason_code, str) and (
+        reason_code.startswith("receipt_store_")
+        or reason_code.startswith("receipt_failure_")
+    ):
+        template = _GENERIC_RECEIPT_FAILURE_ROUTE
+    if template is None:
+        return None
+    return _localized_reason_route(template, language=language)
+
+
+def _canonical_failure_route(
+    reason: str,
+    *,
+    language: str,
+    details: dict | None,
+) -> dict | None:
+    reason_code = details.get("reason_code") if isinstance(details, dict) else None
+    if reason == "package_support_blocked" and reason_code == "invalid_support_advisory":
+        return _localized_reason_route(
+            _INVALID_SUPPORT_ADVISORY_ROUTE,
+            language=language,
+        )
+    if (
+        reason == "package_support_blocked"
+        and reason_code in _INVALID_LOCAL_SUPPORT_CACHE_REASON_CODES
+    ):
+        return _localized_reason_route(
+            _INVALID_LOCAL_SUPPORT_CACHE_ROUTE,
+            language=language,
+        )
+    route = canonical_detail_reason_contract(reason_code, language=language)
+    if reason_code == "concurrent_external_modification_detected" and route is not None:
+        route = dict(route)
+        side_effect = details.get("side_effect") if isinstance(details, dict) else None
+        if isinstance(side_effect, str) and side_effect:
+            route["side_effect"] = side_effect
+    if (
+        route is None
+        and isinstance(details, dict)
+        and details.get("receipt_store_file") == "derived/helper-receipts.json"
+        and details.get("receipt_finalization_status")
+        in {"failed", "blocked_before_write"}
+    ):
+        route = dict(_HELPER_RECEIPT_FINALIZATION_DETAIL_ROUTE)
+    return route
+
+
+def _canonicalize_failure_details(
+    reason: str,
+    *,
+    language: str,
+    details: dict | None,
+) -> dict | None:
+    if not isinstance(details, dict):
+        return None
+    canonical_details = dict(details)
+    route = _canonical_failure_route(
+        reason,
+        language=language,
+        details=canonical_details,
+    )
+    if route is not None and isinstance(route.get("next_action"), str):
+        canonical_details["next_action"] = route["next_action"]
+    if route is not None and isinstance(route.get("side_effect"), str):
+        canonical_details["side_effect"] = route["side_effect"]
+    return canonical_details
 
 
 def _normalize_script_name(script_name: str | None = None) -> str | None:
@@ -1505,7 +2078,21 @@ _SAFE_ROUTING_INPUT_FORMATS = {"auto", "json", "markdown"}
 _SAFE_ROUTING_FILE_KEYS = {"context_brief", "daily_log", "rolling_summary", "update_protocol"}
 _SAFE_ROUTING_WRITE_TYPES = {"current-state", "protocol-rules", "stable-context"}
 _SAFE_ROUTING_PREPARED_BUILDERS = {"rolling_summary_json"}
-_SAFE_ROUTING_SIDE_EFFECTS = {"none", "partial", "write_attempted", "unknown"}
+_SAFE_ROUTING_SIDE_EFFECTS = {
+    "none",
+    "partial",
+    "write_attempted",
+    "unknown",
+    "external_state_modification_preserved",
+    "external_target_modification_preserved",
+    "provenance_validation_failed",
+    "review_evidence_recorded_state_unchanged",
+    "target_and_state_written_receipt_store_verified_unchanged",
+    "target_and_state_written_receipt_not_stored",
+    "target_restored_external_state_preserved",
+    "target_state_and_receipt_store_write_unknown_review_required",
+    "target_state_and_receipt_store_written_review_required",
+}
 _SAFE_ROUTING_REASON_CODES = {
     "all_sections_empty",
     "archive_before_date_invalid",
@@ -1523,6 +2110,27 @@ _SAFE_ROUTING_REASON_CODES = {
     "missing_write_type",
     "provenance_scope_required",
     "provenance_scope_without_requirement",
+    "concurrent_external_modification_detected",
+    "state_write_failed_target_preserved",
+    "post_hash_inconsistent_review_binding_changed",
+    "post_hash_inconsistent_review_eligible",
+    "post_hash_inconsistent_review_promotion_not_committed",
+    "review_imported_baseline_material_invalid",
+    "receipt_failure_provenance_restore_failed",
+    "receipt_store_contract_invalid",
+    "receipt_store_concurrent_change_detected",
+    "receipt_store_duplicate_digest",
+    "receipt_store_index_mismatch",
+    "receipt_store_missing",
+    "receipt_store_not_written_verified",
+    "receipt_store_post_write_unreadable",
+    "receipt_store_revision_invalid",
+    "receipt_store_schema_version_mismatch",
+    "receipt_store_snapshot_invalid",
+    "receipt_store_snapshot_mismatch",
+    "receipt_store_type_mismatch",
+    "receipt_store_unreadable",
+    "receipt_store_write_failed",
     "repair_apply_requires_preview_binding",
     "repair_preview_digest_mismatch",
     "reserved_marker_injection",
@@ -1534,6 +2142,8 @@ _SAFE_ROUTING_REASON_CODES = {
     "unsupported_write_type",
     "write_argument_invalid",
     "json_input_requires_current_state",
+    "invalid_support_advisory",
+    *_INVALID_LOCAL_SUPPORT_CACHE_REASON_CODES,
 }
 
 
@@ -1736,6 +2346,7 @@ def _apply_additive_failure_fields(
     payload: dict,
     *,
     reason: str,
+    language: str,
     details: dict | None,
 ) -> None:
     side_effect = _explicit_side_effect(payload, details)
@@ -1765,6 +2376,35 @@ def _apply_additive_failure_fields(
             "rerun_repair_preview",
             "retry_with_fresh_preview_binding",
         ]
+    route = _canonical_failure_route(
+        reason,
+        language=language,
+        details=details,
+    )
+    if route is None:
+        return
+    for key in (
+        "blocked",
+        "recoverability",
+        "trust_effect",
+        "next_actions",
+        "user_message",
+        "suggestion",
+        "recovery_command",
+        "operator_note",
+        "single_next_command",
+        "safe_to_retry",
+    ):
+        if key in route:
+            value = route[key]
+            payload[key] = list(value) if isinstance(value, list) else value
+    if isinstance(route.get("side_effect"), str):
+        payload["side_effect"] = route["side_effect"]
+    public_details = payload.get("details")
+    if isinstance(public_details, dict) and isinstance(route.get("next_action"), str):
+        public_details["next_action"] = route["next_action"]
+        if isinstance(route.get("side_effect"), str):
+            public_details["side_effect"] = route["side_effect"]
 
 
 def preferred_failure_language(env: dict[str, str] | None = None) -> str:
@@ -1797,14 +2437,19 @@ def failure_payload(
     normalized_reason = normalize_failure_reason(reason)
     contract = failure_reason_contract(normalized_reason)
     normalized_script_name = _normalize_script_name(script_name)
-    normalized_details = _public_failure_details(details)
+    canonical_details = _canonicalize_failure_details(
+        normalized_reason,
+        language=language,
+        details=details,
+    )
+    normalized_details = _public_failure_details(canonical_details)
     _augment_archive_before_details(normalized_reason, normalized_details)
-    routing_details = _failure_routing_details(details)
+    routing_details = _failure_routing_details(canonical_details)
     suggestion_details = dict(normalized_details or {})
     if routing_details:
         suggestion_details.update(routing_details)
     suggestion_details = suggestion_details or None
-    normalized_error = _public_failure_error(error, details)
+    normalized_error = _public_failure_error(error, canonical_details)
     payload = {
         "ok": False,
         "schema_version": FAILURE_PAYLOAD_SCHEMA_VERSION,
@@ -1870,16 +2515,20 @@ def failure_payload(
     _apply_additive_failure_fields(
         payload,
         reason=normalized_reason,
+        language=language,
         details=routing_details,
     )
     publicized_payload = publicize_json_value(
         payload,
-        project_root=_infer_project_root(details) or (details or {}).get("project_root"),
+        project_root=(
+            _infer_project_root(canonical_details)
+            or (canonical_details or {}).get("project_root")
+        ),
         private=private_json_paths_enabled(),
     )
     if isinstance(publicized_payload, dict):
         public_details = publicized_payload.get("details")
-        safe_command = _safe_command_value((details or {}).get("command"))
+        safe_command = _safe_command_value((canonical_details or {}).get("command"))
         if isinstance(public_details, dict) and safe_command is not None:
             public_details["command"] = safe_command
     return publicized_payload if isinstance(publicized_payload, dict) else payload

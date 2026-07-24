@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
+DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR = 3
+
 RECOMMENDATION_TYPES = (
     "continue_active_day",
     "start_new_active_day",

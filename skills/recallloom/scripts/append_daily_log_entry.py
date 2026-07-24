@@ -11,7 +11,10 @@ import os
 from pathlib import Path
 import sys
 
-from core.continuity.workday import logical_workday_for
+from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
+    logical_workday_for,
+)
 from core.failure.contracts import failure_payload, preferred_failure_language
 from core.output.privacy import publicize_json_value
 from core.protocol.contracts import FILE_KEYS, SECTION_KEYS
@@ -37,16 +40,28 @@ from core.provenance.evidence import (
     strict_sidecar_integrity_gate,
     strict_sidecar_integrity_gate_public_summary,
 )
+from core.provenance.inconsistent_review import (
+    InconsistentReviewContractError,
+    build_inconsistent_review_evidence,
+)
 from core.provenance.receipts import RECEIPT_SCHEMA_VERSION, assert_public_safe_json, public_receipt_claim
 from core.provenance.state import (
     helper_evidenced_metadata,
+    helper_write_gate_failure_reason,
     helper_write_gate_from_state,
     inconsistent_evidence_metadata,
     provenance_contract_identity,
     preflight_write_binding_hash,
     unproven_sidecar_metadata,
 )
-from core.provenance.store import ReceiptStoreError, finalize_receipt_in_store, receipt_store_summary
+from core.provenance.store import (
+    RECEIPT_STORE_NOT_WRITTEN_VERIFIED,
+    ReceiptStoreError,
+    ReceiptStoreSnapshot,
+    capture_receipt_store_snapshot,
+    finalize_receipt_in_store,
+    receipt_store_snapshot_matches_current,
+)
 from core.safety.attached_text import scan_auto_attached_context_text
 from core.safety.prepared_input import (
     PreparedInputSafetyError,
@@ -56,7 +71,7 @@ from core.safety.prepared_input import (
 )
 
 from _common import (
-    atomic_write_if_unchanged,
+    atomic_write_and_verify_if_unchanged,
     cli_failure_payload,
     cli_failure_payload_for_exception,
     ConfigContractError,
@@ -71,7 +86,6 @@ from _common import (
     daily_log_cursor_from_text,
     daily_log_cursor_is_legacy_empty,
     daily_log_cursor_state_fields,
-    dump_json,
     detect_update_protocol_time_policy_cues,
     enforce_package_support_gate,
     ensure_supported_python_version,
@@ -90,15 +104,15 @@ from _common import (
     public_project_path,
     read_text,
     resolve_writer_attribution,
-    restore_text_snapshot,
+    stable_text_readback,
     validate_iso_date,
     WrapperMetadataSecurityError,
     workspace_write_lock,
+    write_text_create_only,
 )
 
 
 DEFAULT_MAX_INPUT_BYTES = 4 * 1024 * 1024
-DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR = 3
 DAILY_LOG_ENTRY_JSON_RETRY_PAYLOAD_SHAPE = {
     key: "non-empty string | list[non-empty string]"
     for key in SECTION_KEYS["daily_log"]
@@ -351,37 +365,259 @@ def enforce_strict_sidecar_integrity_gate(
     )
 
 
-def restore_provenance_after_receipt_failure(
+def exit_concurrent_external_modification(
     parser,
     *,
     json_mode: bool,
-    state_path: Path,
-    state: dict,
-    previous_provenance: object,
-    failure_message: str,
-    reason_code: str,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+    side_effect: str,
 ) -> None:
-    previous_state_label = (
-        previous_provenance.get("state_label")
-        if isinstance(previous_provenance, dict)
-        else None
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=3,
+        message=(
+            "A daily-log or state snapshot changed outside the bounded append transaction. "
+            "RecallLoom preserved the detected external state."
+        ),
+        reason="damaged_sidecar",
+        details={
+            "reason_code": "concurrent_external_modification_detected",
+            "side_effect": side_effect,
+            "file_key": "daily_log",
+            "target_entry_seq": target_entry_seq,
+            "new_workspace_revision": new_workspace_revision,
+        },
     )
-    state["provenance"] = unproven_sidecar_metadata(
-        timestamp=now_iso_timestamp(),
-        reason_code=reason_code,
-        previous_state_label=previous_state_label if isinstance(previous_state_label, str) else None,
-    )
+
+
+def stable_path_absent(path: Path) -> bool:
     try:
-        dump_json(state_path, state)
-    except OSError as rollback_exc:
+        path.lstat()
+    except FileNotFoundError:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return True
+    return False
+
+
+def handle_target_write_failure(
+    parser,
+    *,
+    json_mode: bool,
+    failure: BaseException,
+    target_path: Path,
+    previous_target_existed: bool,
+    previous_target_text: str | None,
+    expected_target_text: str,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+) -> None:
+    target_status, target_text, _ = stable_text_readback(target_path)
+    previous_snapshot_matches = (
+        target_status == "read" and target_text == previous_target_text
+        if previous_target_existed
+        else stable_path_absent(target_path)
+    )
+    if previous_snapshot_matches:
+        if isinstance(failure, LockBusyError):
+            exit_concurrent_external_modification(
+                parser,
+                json_mode=json_mode,
+                new_workspace_revision=new_workspace_revision,
+                target_entry_seq=target_entry_seq,
+                side_effect="external_target_modification_preserved",
+            )
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message="The daily-log target write failed before a new target snapshot was verified.",
+            reason="damaged_sidecar",
+            details={
+                "reason_code": "target_write_failed",
+                "side_effect": "none",
+            },
+        )
+    if target_status == "read" and target_text == expected_target_text:
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message="The daily-log target was written, but its write result was not verified in-line.",
+            reason="damaged_sidecar",
+            details={
+                "reason_code": "target_write_post_verify_failed",
+                "side_effect": "write_attempted",
+            },
+        )
+    if target_status in {"read", "changed"}:
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="external_target_modification_preserved",
+        )
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message="The daily-log target write outcome is unreadable and must be reviewed.",
+        reason="damaged_sidecar",
+        details={
+            "reason_code": "target_write_outcome_unknown",
+            "side_effect": "unknown",
+        },
+    )
+
+
+def handle_state_write_failure(
+    parser,
+    *,
+    json_mode: bool,
+    target_path: Path,
+    state_path: Path,
+    expected_target_text: str,
+    previous_state_text: str,
+    expected_state_text: str,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+) -> None:
+    state_status, state_text, _ = stable_text_readback(state_path)
+    target_status, target_text, _ = stable_text_readback(target_path)
+    if state_status == "read" and state_text == previous_state_text:
+        if target_status == "read" and target_text == expected_target_text:
+            exit_with_failure_contract(
+                parser,
+                json_mode=json_mode,
+                exit_code=2,
+                message=(
+                    "The state write failed after the daily-log target was written; "
+                    "all target bytes were preserved for read-only validation."
+                ),
+                reason="damaged_sidecar",
+                details={
+                    "reason_code": "state_write_failed_target_preserved",
+                    "side_effect": "write_attempted",
+                },
+            )
+        if target_status in {"read", "changed"}:
+            exit_concurrent_external_modification(
+                parser,
+                json_mode=json_mode,
+                new_workspace_revision=new_workspace_revision,
+                target_entry_seq=target_entry_seq,
+                side_effect="external_target_modification_preserved",
+            )
         exit_with_failure_contract(
             parser,
             json_mode=json_mode,
             exit_code=2,
             message=(
-                f"{failure_message}. Also failed to restore provenance metadata after "
-                f"receipt finalization failure: {rollback_exc}"
+                "The state write failed and the daily-log target cannot be read; "
+                "no automatic rollback was attempted."
             ),
+            reason="damaged_sidecar",
+            details={
+                "reason_code": "state_write_outcome_unknown",
+                "side_effect": "unknown",
+            },
+        )
+    if state_status == "read" and state_text == expected_state_text:
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message="Daily-log target and state were written, but state verification failed in-line.",
+            reason="damaged_sidecar",
+            details={
+                "reason_code": "state_write_post_verify_failed",
+                "side_effect": "target_and_state_written_receipt_not_stored",
+            },
+        )
+    if state_status in {"read", "changed"}:
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="external_state_modification_preserved",
+        )
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=2,
+        message="The state write outcome is unreadable; the daily-log target was not rolled back.",
+        reason="damaged_sidecar",
+        details={
+            "reason_code": "state_write_outcome_unknown",
+            "side_effect": "unknown",
+        },
+    )
+
+
+def downgrade_after_verified_receipt_not_written(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: Path,
+    storage_root: Path,
+    target_path: Path,
+    state_path: Path,
+    state: dict,
+    expected_target_text: str,
+    expected_state_text: str,
+    receipt_store_snapshot: ReceiptStoreSnapshot,
+    previous_state_label: str,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+) -> None:
+    downgraded_state = dict(state)
+    downgraded_state["provenance"] = unproven_sidecar_metadata(
+        timestamp=now_iso_timestamp(),
+        reason_code=RECEIPT_STORE_NOT_WRITTEN_VERIFIED,
+        previous_state_label=previous_state_label,
+    )
+    target_status, target_text, _ = stable_text_readback(target_path)
+    if (
+        target_status != "read"
+        or target_text != expected_target_text
+        or not receipt_store_snapshot_matches_current(
+            storage_root=storage_root,
+            project_root=project_root,
+            snapshot=receipt_store_snapshot,
+        )
+    ):
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    try:
+        atomic_write_and_verify_if_unchanged(
+            state_path,
+            expected_text=expected_state_text,
+            new_text=expected_state_json_text(downgraded_state),
+        )
+    except LockBusyError:
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    except (OSError, UnicodeDecodeError):
+        exit_with_failure_contract(
+            parser,
+            json_mode=json_mode,
+            exit_code=2,
+            message="Receipt finalization failed and provenance downgrade was not verified.",
             reason="damaged_sidecar",
             details={
                 "reason_code": "receipt_failure_provenance_restore_failed",
@@ -420,7 +656,6 @@ def exit_receipt_finalization_failure(
         "new_workspace_revision": new_workspace_revision,
         "receipt_finalization_status": "failed",
         "receipt_store_file": "derived/helper-receipts.json",
-        "next_action": "review_or_repair_receipt_store_before_claiming_helper_evidenced",
         **(extra or {}),
     }
     exit_with_failure_contract(
@@ -442,14 +677,13 @@ def prevalidate_receipt_store_before_append(
     preflight_binding: dict | None,
     new_workspace_revision: int,
     target_entry_seq: int,
-) -> None:
+) -> ReceiptStoreSnapshot | None:
     if preflight_binding is None:
-        return
+        return None
     try:
-        receipt_store_summary(
+        return capture_receipt_store_snapshot(
             storage_root=storage_root,
             project_root=project_root,
-            require_exists=False,
         )
     except ReceiptStoreError as exc:
         exit_receipt_finalization_failure(
@@ -467,71 +701,219 @@ def prevalidate_receipt_store_before_append(
                 "receipt_precheck": True,
             },
         )
+    raise AssertionError("unreachable")
 
 
 def verify_post_append_hashes(
     parser,
     *,
     json_mode: bool,
+    project_root: Path,
+    storage_root: Path,
     target_path: Path,
     state_path: Path,
     expected_target_text: str,
     expected_state_text: str,
     new_workspace_revision: int,
     target_entry_seq: int,
+    target_date: str,
     state: dict,
-    previous_provenance: object,
+    previous_state_label: str,
+    preflight_binding_digest: str,
+    receipt_store_snapshot: ReceiptStoreSnapshot,
 ) -> tuple[str, str]:
-    def downgrade_before_exit(reason_code: str) -> None:
-        previous_state_label = (
-            previous_provenance.get("state_label")
-            if isinstance(previous_provenance, dict)
-            else None
+    target_status, post_target_text, target_error_class = stable_text_readback(target_path)
+    state_status, post_state_text, _ = stable_text_readback(state_path)
+    if target_status == "changed" or state_status == "changed":
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="target_and_state_written_receipt_not_stored",
         )
-        state["provenance"] = inconsistent_evidence_metadata(
-            timestamp=now_iso_timestamp(),
-            reason_code=reason_code,
-            previous_state_label=previous_state_label if isinstance(previous_state_label, str) else None,
-        )
-        try:
-            dump_json(state_path, state)
-        except OSError:
-            pass
-
-    try:
-        post_target_text = read_text(target_path)
-        post_state_text = read_text(state_path)
-    except (OSError, UnicodeDecodeError) as exc:
-        downgrade_before_exit("post_hash_read_failed")
+    if state_status != "read" or post_state_text is None:
         exit_receipt_finalization_failure(
             parser,
             json_mode=json_mode,
-            message=f"Could not re-read post-append target/state for receipt finalization: {exc}",
+            message="Could not stably re-read post-append state for receipt finalization.",
             reason_code="post_hash_read_failed",
             side_effect="target_and_state_written_receipt_not_stored",
             new_workspace_revision=new_workspace_revision,
             target_entry_seq=target_entry_seq,
         )
-    target_digest = sha256_text_digest(post_target_text)
     state_digest = sha256_text_digest(post_state_text)
-    if post_target_text != expected_target_text or post_state_text != expected_state_text:
-        downgrade_before_exit("post_hash_mismatch")
+    expected_state_digest = sha256_text_digest(expected_state_text)
+    if post_state_text != expected_state_text:
+        mismatch_details = {
+            "state_digest": state_digest,
+            "expected_state_digest": expected_state_digest,
+        }
+        if target_status == "read" and post_target_text is not None:
+            mismatch_details.update(
+                {
+                    "target_digest": sha256_text_digest(post_target_text),
+                    "expected_target_digest": sha256_text_digest(expected_target_text),
+                }
+            )
         exit_receipt_finalization_failure(
             parser,
             json_mode=json_mode,
-            message="Post-append hash check failed; receipt finalization was not stored.",
+            message="Post-append state no longer matches the expected helper-written state.",
             reason_code="post_hash_mismatch",
             side_effect="target_and_state_written_receipt_not_stored",
             new_workspace_revision=new_workspace_revision,
             target_entry_seq=target_entry_seq,
-            extra={
-                "target_digest": target_digest,
-                "state_digest": state_digest,
-                "expected_target_digest": sha256_text_digest(expected_target_text),
-                "expected_state_digest": sha256_text_digest(expected_state_text),
-            },
+            extra=mismatch_details,
         )
-    return target_digest, state_digest
+    if target_status == "read" and post_target_text == expected_target_text:
+        return sha256_text_digest(post_target_text), state_digest
+
+    if not receipt_store_snapshot_matches_current(
+        storage_root=storage_root,
+        project_root=project_root,
+        snapshot=receipt_store_snapshot,
+    ):
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+
+    reason_code = (
+        "post_hash_read_failed" if target_status == "read_failed" else "post_hash_mismatch"
+    )
+    observed_target_digest = (
+        sha256_text_digest(post_target_text)
+        if target_status == "read" and post_target_text is not None
+        else None
+    )
+    target_failure_details = None
+    if observed_target_digest is not None:
+        target_failure_details = {
+            "target_digest": observed_target_digest,
+            "state_digest": state_digest,
+            "expected_target_digest": sha256_text_digest(expected_target_text),
+            "expected_state_digest": expected_state_digest,
+        }
+    try:
+        failure_evidence = build_inconsistent_review_evidence(
+            reason_code=reason_code,
+            operation_class="daily_log_append",
+            target_file_key="daily_log",
+            target_date=target_date,
+            target_verification=(
+                "read_failed" if target_status == "read_failed" else "mismatch"
+            ),
+            target_error_class=(
+                target_error_class if target_status == "read_failed" else None
+            ),
+            expected_target_digest=sha256_text_digest(expected_target_text),
+            observed_target_digest=observed_target_digest,
+            expected_state_digest=expected_state_digest,
+            observed_state_digest=state_digest,
+            expected_workspace_revision=new_workspace_revision - 1,
+            result_workspace_revision=new_workspace_revision,
+            expected_file_revision=target_entry_seq - 1,
+            result_file_revision=target_entry_seq,
+            preflight_binding_digest=preflight_binding_digest,
+            receipt_store_snapshot=receipt_store_snapshot,
+            previous_state_label=previous_state_label,
+        )
+    except InconsistentReviewContractError:
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message="Post-append target verification failed and recovery evidence was ineligible.",
+            reason_code=reason_code,
+            side_effect="target_and_state_written_receipt_not_stored",
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            extra=target_failure_details,
+        )
+
+    failure_metadata = inconsistent_evidence_metadata(
+        timestamp=now_iso_timestamp(),
+        reason_code=reason_code,
+        previous_state_label=previous_state_label,
+    )
+    failure_metadata["inconsistent_review_evidence"] = failure_evidence
+    failure_state = dict(state)
+    failure_state["provenance"] = failure_metadata
+    try:
+        atomic_write_and_verify_if_unchanged(
+            state_path,
+            expected_text=expected_state_text,
+            new_text=expected_state_json_text(failure_state),
+        )
+    except LockBusyError:
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    except (OSError, UnicodeDecodeError):
+        exit_receipt_finalization_failure(
+            parser,
+            json_mode=json_mode,
+            message="Post-append target verification failed and recovery metadata was not verified.",
+            reason_code=reason_code,
+            side_effect="target_and_state_written_receipt_not_stored",
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            extra=target_failure_details,
+        )
+    exit_receipt_finalization_failure(
+        parser,
+        json_mode=json_mode,
+        message="Post-append target verification failed; bounded recovery evidence was recorded.",
+        reason_code=reason_code,
+        side_effect="target_and_state_written_receipt_not_stored",
+        new_workspace_revision=new_workspace_revision,
+        target_entry_seq=target_entry_seq,
+        extra=target_failure_details,
+    )
+    raise AssertionError("unreachable")
+
+
+def verify_finalized_append_evidence(
+    parser,
+    *,
+    json_mode: bool,
+    project_root: Path,
+    storage_root: Path,
+    target_path: Path,
+    state_path: Path,
+    expected_target_text: str,
+    expected_state_text: str,
+    receipt_store_snapshot: ReceiptStoreSnapshot,
+    new_workspace_revision: int,
+    target_entry_seq: int,
+) -> None:
+    target_status, target_text, _ = stable_text_readback(target_path)
+    state_status, state_text, _ = stable_text_readback(state_path)
+    if (
+        target_status != "read"
+        or target_text != expected_target_text
+        or state_status != "read"
+        or state_text != expected_state_text
+        or not receipt_store_snapshot_matches_current(
+            storage_root=storage_root,
+            project_root=project_root,
+            snapshot=receipt_store_snapshot,
+        )
+    ):
+        exit_concurrent_external_modification(
+            parser,
+            json_mode=json_mode,
+            new_workspace_revision=new_workspace_revision,
+            target_entry_seq=target_entry_seq,
+            side_effect="target_state_and_receipt_store_written_review_required",
+        )
 
 
 def build_append_receipt_seed(
@@ -751,7 +1133,7 @@ def enforce_provenance_write_gate(
     state: dict,
     preflight_binding: dict | None,
     strict_gate: dict | None = None,
-) -> None:
+) -> dict:
     receipts_verified = (
         strict_gate_current_receipts_verified(strict_gate)
         if isinstance(strict_gate, dict)
@@ -821,12 +1203,8 @@ def enforce_provenance_write_gate(
                     extra={"required_confirmation": REVIEW_IMPORTED_BASELINE_CONFIRMATION},
                 )
     if gate["allowed"]:
-        return
-    reason = (
-        "stale_write_context"
-        if gate["blocked_reason_code"] == "preflight_required_for_review_imported_baseline"
-        else "trust_review_required"
-    )
+        return gate
+    reason = helper_write_gate_failure_reason(gate)
     message = (
         "Refusing to append because this RecallLoom sidecar requires provenance review "
         "or a fresh preflight binding before any mutating helper write."
@@ -846,12 +1224,6 @@ def enforce_provenance_write_gate(
             "write_readiness": gate["write_readiness"],
             "preflight_binding_present": gate["preflight_binding_present"],
             "side_effect": "none",
-            "next_actions": [
-                "stage_recovery_proposal.py",
-                "record_recovery_review.py",
-                "prepare_recovery_promotion.py",
-                "preflight_context_check.py",
-            ],
         },
     )
 
@@ -1904,6 +2276,7 @@ def main() -> None:
             )
             state_path = workspace.storage_root / FILE_KEYS["state"]
             state = load_workspace_state(state_path)
+            current_state_text = read_text(state_path)
             binding_expected_workspace_revision = (
                 state["workspace_revision"]
                 if args.expected_workspace_revision is None
@@ -1923,7 +2296,7 @@ def main() -> None:
                 project_root=workspace.project_root,
                 preflight_binding=preflight_binding,
             )
-            enforce_provenance_write_gate(
+            write_gate = enforce_provenance_write_gate(
                 parser,
                 json_mode=args.json,
                 state=state,
@@ -2173,9 +2546,21 @@ def main() -> None:
                     },
                 )
             next_seq = 1
-            target_existed = target_path.exists()
-            current_text = read_text(target_path) if target_existed else ""
-            if target_path.exists():
+            try:
+                current_text = read_text(target_path)
+                target_existed = True
+            except FileNotFoundError:
+                if not stable_path_absent(target_path):
+                    exit_concurrent_external_modification(
+                        parser,
+                        json_mode=args.json,
+                        new_workspace_revision=state["workspace_revision"] + 1,
+                        target_entry_seq=next_seq,
+                        side_effect="external_target_modification_preserved",
+                    )
+                current_text = ""
+                target_existed = False
+            if target_existed:
                 marker = parse_file_marker(current_text)
                 if marker is None or marker.file_key != "daily_log":
                     exit_with_failure_contract(
@@ -2227,64 +2612,54 @@ def main() -> None:
                         + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq)
                         + "\n"
                     )
-                prevalidate_receipt_store_before_append(
+            else:
+                header = file_marker("daily_log", workspace.workspace_language)
+                updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
+
+            confirmed_state = load_workspace_state(state_path)
+            if confirmed_state != state or read_text(state_path) != current_state_text:
+                exit_concurrent_external_modification(
                     parser,
                     json_mode=args.json,
-                    storage_root=workspace.storage_root,
-                    project_root=workspace.project_root,
-                    preflight_binding=preflight_binding,
                     new_workspace_revision=state["workspace_revision"] + 1,
                     target_entry_seq=next_seq,
+                    side_effect="external_state_modification_preserved",
                 )
-                try:
-                    atomic_write_if_unchanged(
+            new_workspace_revision = state["workspace_revision"] + 1
+            receipt_store_snapshot = prevalidate_receipt_store_before_append(
+                parser,
+                json_mode=args.json,
+                storage_root=workspace.storage_root,
+                project_root=workspace.project_root,
+                preflight_binding=preflight_binding,
+                new_workspace_revision=new_workspace_revision,
+                target_entry_seq=next_seq,
+            )
+            try:
+                if target_existed:
+                    atomic_write_and_verify_if_unchanged(
                         target_path,
                         expected_text=current_text,
                         new_text=updated_text,
                     )
-                except OSError as exc:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=f"Filesystem error while writing {target_path}: {exc}",
-                        reason="damaged_sidecar",
-                    )
-            else:
-                header = file_marker("daily_log", workspace.workspace_language)
-                updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
-                prevalidate_receipt_store_before_append(
+                else:
+                    write_text_create_only(target_path, updated_text)
+            except (LockBusyError, OSError, UnicodeDecodeError) as exc:
+                handle_target_write_failure(
                     parser,
                     json_mode=args.json,
-                    storage_root=workspace.storage_root,
-                    project_root=workspace.project_root,
-                    preflight_binding=preflight_binding,
-                    new_workspace_revision=state["workspace_revision"] + 1,
+                    failure=exc,
+                    target_path=target_path,
+                    previous_target_existed=target_existed,
+                    previous_target_text=current_text if target_existed else None,
+                    expected_target_text=updated_text,
+                    new_workspace_revision=new_workspace_revision,
                     target_entry_seq=next_seq,
                 )
-                try:
-                    atomic_write_if_unchanged(
-                        target_path,
-                        expected_text="",
-                        new_text=updated_text,
-                    )
-                except OSError as exc:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=f"Filesystem error while writing {target_path}: {exc}",
-                        reason="damaged_sidecar",
-                    )
 
-            previous_provenance = state.get("provenance")
-            previous_state_label = (
-                previous_provenance.get("state_label")
-                if isinstance(previous_provenance, dict)
-                else None
-            )
+            previous_state_label = str(write_gate["provenance_state"])
             previous_entry_seq = next_seq - 1
-            state["workspace_revision"] += 1
+            state["workspace_revision"] = new_workspace_revision
             target_is_latest_after_write = (
                 latest_existing_date is None or target_date >= latest_existing_date
             )
@@ -2293,11 +2668,10 @@ def main() -> None:
                 state["daily_logs"]["latest_entry_id"] = f"entry-{next_seq}"
                 state["daily_logs"]["latest_entry_seq"] = next_seq
                 state["daily_logs"]["entry_count"] = next_seq
-                if "updated_at" in state["daily_logs"]:
-                    refreshed_at = now_iso_timestamp()
-                    if refreshed_at == state["daily_logs"].get("updated_at"):
-                        refreshed_at = datetime.now().astimezone().isoformat(timespec="microseconds")
-                    state["daily_logs"]["updated_at"] = refreshed_at
+                refreshed_at = now_iso_timestamp()
+                if refreshed_at == state["daily_logs"].get("updated_at"):
+                    refreshed_at = datetime.now().astimezone().isoformat(timespec="microseconds")
+                state["daily_logs"]["updated_at"] = refreshed_at
             receipt_timestamp = now_iso_timestamp()
             if preflight_binding is not None and target_is_latest_after_write:
                 state["provenance"] = helper_evidenced_metadata(
@@ -2308,43 +2682,44 @@ def main() -> None:
                 )
             expected_state_text = expected_state_json_text(state)
             try:
-                dump_json(state_path, state)
-            except OSError as exc:
-                try:
-                    restore_text_snapshot(target_path, existed=target_existed, text=current_text)
-                except OSError as rollback_exc:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=(
-                            f"Failed to update state after writing {target_path}: {exc}. "
-                            f"Rollback also failed: {rollback_exc}. Workspace may be partially updated."
-                        ),
-                        reason="damaged_sidecar",
-                    )
-                exit_with_failure_contract(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=2,
-                    message=(
-                        f"Failed to update state after writing {target_path}: {exc}. "
-                        "The target file was restored to its previous content."
-                    ),
-                    reason="damaged_sidecar",
+                atomic_write_and_verify_if_unchanged(
+                    state_path,
+                    expected_text=current_state_text,
+                    new_text=expected_state_text,
                 )
-            if preflight_binding is not None and target_is_latest_after_write:
-                target_digest, state_digest = verify_post_append_hashes(
+            except (LockBusyError, OSError, UnicodeDecodeError):
+                handle_state_write_failure(
                     parser,
                     json_mode=args.json,
                     target_path=target_path,
                     state_path=state_path,
                     expected_target_text=updated_text,
+                    previous_state_text=current_state_text,
                     expected_state_text=expected_state_text,
-                    new_workspace_revision=state["workspace_revision"],
+                    new_workspace_revision=new_workspace_revision,
                     target_entry_seq=next_seq,
+                )
+            if preflight_binding is not None and target_is_latest_after_write:
+                if not isinstance(receipt_store_snapshot, ReceiptStoreSnapshot):
+                    raise AssertionError("Receipt-backed appends require a frozen store snapshot.")
+                target_digest, state_digest = verify_post_append_hashes(
+                    parser,
+                    json_mode=args.json,
+                    project_root=workspace.project_root,
+                    storage_root=workspace.storage_root,
+                    target_path=target_path,
+                    state_path=state_path,
+                    expected_target_text=updated_text,
+                    expected_state_text=expected_state_text,
+                    new_workspace_revision=new_workspace_revision,
+                    target_entry_seq=next_seq,
+                    target_date=target_date_iso,
                     state=state,
-                    previous_provenance=previous_provenance,
+                    previous_state_label=previous_state_label,
+                    preflight_binding_digest=str(
+                        preflight_binding["preflight_contract_hash"]
+                    ),
+                    receipt_store_snapshot=receipt_store_snapshot,
                 )
                 receipt_seed = build_append_receipt_seed(
                     preflight_binding=preflight_binding,
@@ -2353,34 +2728,58 @@ def main() -> None:
                     state_digest=state_digest,
                     previous_entry_seq=previous_entry_seq,
                     next_entry_seq=next_seq,
-                    new_workspace_revision=state["workspace_revision"],
+                    new_workspace_revision=new_workspace_revision,
                 )
                 try:
                     receipt_finalization = finalize_receipt_in_store(
                         storage_root=workspace.storage_root,
                         receipt=receipt_seed,
                         project_root=workspace.project_root,
+                        expected_snapshot=receipt_store_snapshot,
                     )
                 except ReceiptStoreError as exc:
-                    restore_provenance_after_receipt_failure(
-                        parser,
-                        json_mode=args.json,
-                        state_path=state_path,
-                        state=state,
-                        previous_provenance=previous_provenance,
-                        failure_message=str(exc),
-                        reason_code=exc.reason_code,
-                    )
+                    if exc.reason_code == RECEIPT_STORE_NOT_WRITTEN_VERIFIED:
+                        downgrade_after_verified_receipt_not_written(
+                            parser,
+                            json_mode=args.json,
+                            project_root=workspace.project_root,
+                            storage_root=workspace.storage_root,
+                            target_path=target_path,
+                            state_path=state_path,
+                            state=state,
+                            expected_target_text=updated_text,
+                            expected_state_text=expected_state_text,
+                            receipt_store_snapshot=receipt_store_snapshot,
+                            previous_state_label=previous_state_label,
+                            new_workspace_revision=new_workspace_revision,
+                            target_entry_seq=next_seq,
+                        )
                     exit_receipt_finalization_failure(
                         parser,
                         json_mode=args.json,
                         message=str(exc),
                         reason_code=exc.reason_code,
                         side_effect=exc.side_effect,
-                        new_workspace_revision=state["workspace_revision"],
+                        new_workspace_revision=new_workspace_revision,
                         target_entry_seq=next_seq,
                         extra=exc.details,
                     )
+                finalized_store_snapshot = receipt_finalization.get("store_snapshot")
+                if not isinstance(finalized_store_snapshot, ReceiptStoreSnapshot):
+                    raise AssertionError("Finalized append receipts require a verified store snapshot.")
+                verify_finalized_append_evidence(
+                    parser,
+                    json_mode=args.json,
+                    project_root=workspace.project_root,
+                    storage_root=workspace.storage_root,
+                    target_path=target_path,
+                    state_path=state_path,
+                    expected_target_text=updated_text,
+                    expected_state_text=expected_state_text,
+                    receipt_store_snapshot=finalized_store_snapshot,
+                    new_workspace_revision=new_workspace_revision,
+                    target_entry_seq=next_seq,
+                )
     except LockBusyError as exc:
         exit_with_failure_contract(
             parser,

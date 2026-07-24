@@ -108,6 +108,7 @@ PROVENANCE_ACTION_MATRIX = {
             "read_continuity",
             "run_preflight",
             "refresh_or_validate_sidecar_state",
+            "run_existing_revision_checked_helper_write_after_preflight",
         ],
         "blocked_actions": [
             "claim_receipt_backed_provenance",
@@ -218,6 +219,72 @@ def review_imported_baseline_metadata(
     if review_digest is not None:
         payload["review_digest"] = review_digest
     return payload
+
+
+def inconsistent_review_imported_baseline_metadata(
+    *,
+    timestamp: str,
+    review_action: str,
+    source_reason_code: str,
+    inconsistent_review_binding: Mapping[str, Any],
+    inconsistent_review_binding_digest: str,
+    proposal_digest: str,
+    review_digest: str,
+) -> dict:
+    if review_action != "accept":
+        raise ValueError("D5 reviewed-baseline metadata requires an accept review action.")
+    if source_reason_code not in {"post_hash_read_failed", "post_hash_mismatch"}:
+        raise ValueError("D5 reviewed-baseline metadata has an invalid source reason.")
+    if not (
+        isinstance(inconsistent_review_binding_digest, str)
+        and len(inconsistent_review_binding_digest) == 71
+        and inconsistent_review_binding_digest.startswith("sha256:")
+        and all(
+            character in "0123456789abcdef"
+            for character in inconsistent_review_binding_digest[7:]
+        )
+    ):
+        raise ValueError("D5 reviewed-baseline metadata has an invalid binding digest.")
+    if not isinstance(inconsistent_review_binding, Mapping):
+        raise ValueError("D5 reviewed-baseline metadata requires the exact binding object.")
+    binding_payload = dict(inconsistent_review_binding)
+    canonical_binding_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            binding_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if canonical_binding_digest != inconsistent_review_binding_digest:
+        raise ValueError("D5 reviewed-baseline metadata binding does not match its digest.")
+    for field_name, digest in (
+        ("proposal_digest", proposal_digest),
+        ("review_digest", review_digest),
+    ):
+        if not (
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                f"D5 reviewed-baseline metadata has an invalid {field_name}."
+            )
+    return {
+        "schema_version": PROVENANCE_METADATA_SCHEMA_VERSION,
+        "state_label": "review_imported_baseline",
+        "baseline_kind": "review_import",
+        "review_action": review_action,
+        "updated_at": timestamp,
+        "receipt_backed": False,
+        "proposal_digest": proposal_digest,
+        "review_digest": review_digest,
+        "source_state_label": "inconsistent_or_tampered_evidence",
+        "source_reason_code": source_reason_code,
+        "inconsistent_review_binding": binding_payload,
+        "inconsistent_review_binding_digest": inconsistent_review_binding_digest,
+    }
 
 
 def helper_evidenced_metadata(
@@ -373,6 +440,7 @@ def provenance_facts_from_state(
             "review_imported_baseline": False,
             "helper_evidenced": False,
             "inconsistent_evidence": False,
+            "unproven_sidecar_state": False,
         }
 
     metadata = state.get("provenance")
@@ -384,6 +452,7 @@ def provenance_facts_from_state(
             "review_imported_baseline": False,
             "helper_evidenced": False,
             "inconsistent_evidence": False,
+            "unproven_sidecar_state": False,
         }
 
     schema_version = metadata.get("schema_version")
@@ -396,6 +465,7 @@ def provenance_facts_from_state(
             "review_imported_baseline": False,
             "helper_evidenced": False,
             "inconsistent_evidence": False,
+            "unproven_sidecar_state": False,
         }
     if state_label == "helper_evidenced":
         return {
@@ -405,6 +475,7 @@ def provenance_facts_from_state(
             "review_imported_baseline": False,
             "helper_evidenced": True,
             "inconsistent_evidence": False,
+            "unproven_sidecar_state": False,
         }
     if state_label == "review_imported_baseline":
         return {
@@ -414,6 +485,7 @@ def provenance_facts_from_state(
             "review_imported_baseline": True,
             "helper_evidenced": False,
             "inconsistent_evidence": False,
+            "unproven_sidecar_state": False,
         }
     if state_label == "structurally_valid":
         return {
@@ -423,6 +495,17 @@ def provenance_facts_from_state(
             "review_imported_baseline": False,
             "helper_evidenced": False,
             "inconsistent_evidence": False,
+            "unproven_sidecar_state": False,
+        }
+    if state_label == "unproven_sidecar_state":
+        return {
+            "metadata_status": "unproven_sidecar_state",
+            "legacy_sidecar": False,
+            "review_required": False,
+            "review_imported_baseline": False,
+            "helper_evidenced": False,
+            "inconsistent_evidence": False,
+            "unproven_sidecar_state": True,
         }
     if state_label == "inconsistent_or_tampered_evidence":
         return {
@@ -432,6 +515,7 @@ def provenance_facts_from_state(
             "review_imported_baseline": False,
             "helper_evidenced": False,
             "inconsistent_evidence": True,
+            "unproven_sidecar_state": False,
         }
     return {
         "metadata_status": "metadata_state_review_required",
@@ -440,6 +524,7 @@ def provenance_facts_from_state(
         "review_imported_baseline": False,
         "helper_evidenced": False,
         "inconsistent_evidence": False,
+        "unproven_sidecar_state": False,
     }
 
 
@@ -627,6 +712,7 @@ def classify_provenance_state(
     legacy_sidecar: bool = False,
     review_required: bool = False,
     review_imported_baseline: bool = False,
+    unproven_sidecar_state: bool = False,
 ) -> str:
     if sidecar_trust_state in _INCONSISTENT_SIDECAR_STATES:
         return "inconsistent_or_tampered_evidence"
@@ -634,6 +720,8 @@ def classify_provenance_state(
         return "helper_evidenced"
     if imported_baseline_review_required or review_imported_baseline:
         return "review_imported_baseline"
+    if unproven_sidecar_state:
+        return "unproven_sidecar_state"
     if review_required or sidecar_trust_state == "review_required":
         return "review_required"
     if legacy_sidecar or sidecar_trust_state == "structurally_valid_legacy":
@@ -765,7 +853,10 @@ def build_write_readiness(
             "Read continuity normally, then run preflight/recovery review before any "
             "mutating helper write."
         )
-    elif preflight_gate_open and state_label == "structurally_valid":
+    elif preflight_gate_open and state_label in {
+        "structurally_valid",
+        "unproven_sidecar_state",
+    }:
         readiness = "structural_only_ready_after_preflight"
         next_action = (
             "Use the existing revision-checked helper write path with the expected revisions; "
@@ -824,6 +915,7 @@ def build_provenance_report(
     legacy_sidecar: bool = False,
     review_required: bool = False,
     review_imported_baseline: bool = False,
+    unproven_sidecar_state: bool = False,
     metadata_status: str | None = None,
 ) -> dict:
     state_label = classify_provenance_state(
@@ -836,6 +928,7 @@ def build_provenance_report(
         legacy_sidecar=legacy_sidecar,
         review_required=review_required,
         review_imported_baseline=review_imported_baseline,
+        unproven_sidecar_state=unproven_sidecar_state,
     )
     return {
         "state_label": state_label,
@@ -885,6 +978,7 @@ def helper_write_gate_from_state(
         legacy_sidecar=provenance_facts["legacy_sidecar"],
         review_required=provenance_facts["review_required"],
         review_imported_baseline=provenance_facts["review_imported_baseline"],
+        unproven_sidecar_state=provenance_facts["unproven_sidecar_state"],
     )
     write_readiness = build_write_readiness(
         provenance_state=state_label,
@@ -930,3 +1024,14 @@ def helper_write_gate_from_state(
             require_preflight_for_review_imported_baseline
         ),
     }
+
+
+def helper_write_gate_failure_reason(gate: Mapping[str, Any]) -> str:
+    """Map a denied helper gate to its canonical public failure family."""
+
+    blocked_reason_code = gate.get("blocked_reason_code")
+    if isinstance(blocked_reason_code, str) and blocked_reason_code.startswith(
+        "preflight_required_"
+    ):
+        return "stale_write_context"
+    return "trust_review_required"

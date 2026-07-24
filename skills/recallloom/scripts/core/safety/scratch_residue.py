@@ -26,6 +26,14 @@ DEFAULT_STORAGE_SCAN_DEPTH = 6
 DEFAULT_EXTERNAL_SCAN_DEPTH = 1
 MAX_RESIDUE_COUNT = 100
 
+_STARTUP_RESIDUE_ERROR = (
+    "RecallLoom startup scratch residue detected; no files were changed."
+)
+_STARTUP_SCAN_ROOT_SYMLINK_ERROR = (
+    "RecallLoom startup safety check found a symlinked directory root; "
+    "no files were changed."
+)
+
 _EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -103,11 +111,23 @@ class ScratchResidueReport:
         }
 
 
+def startup_scratch_residue_error_message(report: ScratchResidueReport) -> str:
+    """Return the canonical public error for a blocking startup scan."""
+
+    if any(
+        finding.reason_code == "scratch_scan_area_root_symlink"
+        for finding in report.blocking_findings
+    ):
+        return _STARTUP_SCAN_ROOT_SYMLINK_ERROR
+    return _STARTUP_RESIDUE_ERROR
+
+
 @dataclass(frozen=True)
 class _ScanArea:
     root: Path
     max_depth: int
     external: bool = False
+    allow_root_symlink: bool = False
 
 
 def findings_from_report(report: ScratchResidueReport) -> tuple[ScratchResidueFinding, ...]:
@@ -135,9 +155,14 @@ def _raw_scan_key(path: Path) -> str:
 
 def _dedupe_scan_areas(areas: Iterable[_ScanArea]) -> list[_ScanArea]:
     deduped: list[_ScanArea] = []
-    seen: set[tuple[str, int, bool]] = set()
+    seen: set[tuple[str, int, bool, bool]] = set()
     for area in areas:
-        key = (_raw_scan_key(area.root), area.max_depth, area.external)
+        key = (
+            _raw_scan_key(area.root),
+            area.max_depth,
+            area.external,
+            area.allow_root_symlink,
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -157,11 +182,23 @@ def _scan_areas(
     ]
     versions_root = project_root / "docs" / "versions"
     if versions_root.is_dir() or versions_root.is_symlink():
-        areas.append(_ScanArea(versions_root, DEFAULT_STORAGE_SCAN_DEPTH))
+        areas.append(
+            _ScanArea(
+                versions_root,
+                DEFAULT_STORAGE_SCAN_DEPTH,
+                allow_root_symlink=True,
+            )
+        )
     for name in ("artifact", "artifacts", "dist", "release", "releases"):
         candidate = project_root / name
         if candidate.is_dir() or candidate.is_symlink():
-            areas.append(_ScanArea(candidate, DEFAULT_STORAGE_SCAN_DEPTH))
+            areas.append(
+                _ScanArea(
+                    candidate,
+                    DEFAULT_STORAGE_SCAN_DEPTH,
+                    allow_root_symlink=True,
+                )
+            )
     for raw_root in external_roots or ():
         if raw_root is None:
             continue
@@ -377,6 +414,8 @@ def _scan_area_root_finding(
         reason_code = "scratch_scan_area_root_inspect_failed"
     else:
         if stat.S_ISLNK(root_stat.st_mode):
+            if area.allow_root_symlink:
+                return None
             reason_code = "scratch_scan_area_root_symlink"
         elif not stat.S_ISDIR(root_stat.st_mode):
             reason_code = "scratch_scan_area_root_not_directory"
@@ -388,7 +427,10 @@ def _scan_area_root_finding(
         project_root=project_root,
         storage_root=storage_root,
     )
-    blocking = path_category != "external_helper_scratch"
+    blocking = (
+        reason_code == "scratch_scan_area_root_symlink"
+        or path_category != "external_helper_scratch"
+    )
     return ScratchResidueFinding(
         reason_code=reason_code,
         path_category=path_category,
@@ -506,13 +548,16 @@ def scan_startup_scratch_residue(
     """Scan bounded startup surfaces for helper-owned scratch residue."""
 
     project = _safe_resolve(Path(project_root).expanduser())
-    storage = _safe_resolve(Path(storage_root).expanduser())
+    storage_scan_root = Path(storage_root).expanduser()
+    if not storage_scan_root.is_absolute():
+        storage_scan_root = storage_scan_root.absolute()
+    storage = _safe_resolve(storage_scan_root)
     blocking: list[ScratchResidueFinding] = []
     report_only: list[ScratchResidueFinding] = []
     seen_markers: set[str] = set()
     scan_areas = _scan_areas(
         project_root=project,
-        storage_root=storage,
+        storage_root=storage_scan_root,
         external_roots=external_roots,
     )
     for area in scan_areas:

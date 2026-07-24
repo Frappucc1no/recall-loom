@@ -18,6 +18,7 @@ from core.continuity.freshness import (
     summary_matches_empty_shell_template as shared_summary_matches_empty_shell_template,
 )
 from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
     build_workday_decision,
     build_write_tier_judgment,
     detect_closure_signal,
@@ -66,10 +67,6 @@ from _common import (
     read_text,
     StorageResolutionError,
 )
-
-
-DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR = 3
-
 
 def sha256_text_digest(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -864,6 +861,7 @@ def main() -> None:
             review_required=provenance_facts["review_required"],
             review_imported_baseline=provenance_facts["review_imported_baseline"],
             helper_evidenced_baseline=provenance_facts["helper_evidenced"],
+            unproven_sidecar_state=provenance_facts["unproven_sidecar_state"],
             metadata_status=provenance_facts["metadata_status"],
         )
     except (OSError, UnicodeDecodeError, ConfigContractError) as exc:

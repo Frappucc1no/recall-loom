@@ -101,10 +101,9 @@ python skills/recallloom/scripts/recallloom.py record /absolute/path/to/project 
 python skills/recallloom/scripts/recallloom.py record /absolute/path/to/project --suggest --intent-text "Completed a durable public-safe milestone." --json
 python skills/recallloom/scripts/recallloom.py append /absolute/path/to/project --entry-json '{"work_completed":"Recorded the milestone.","confirmed_facts":"The prepared entry was reviewed before append.","key_decisions":"Keep the entry scoped to current work.","risks_blockers":"None.","recommended_next_step":"Continue from the refreshed summary."}' --json
 python skills/recallloom/scripts/recallloom.py write /absolute/path/to/project --type current-state --source-file /absolute/path/to/prepared-current-state.md --dry-run --json
-python skills/recallloom/scripts/recallloom.py sync-current-state-after-append /absolute/path/to/project --reuse-current-summary --semantic-unchanged-assertion-json '{"semantic_unchanged":true,"assertion_source_kind":"record_plan_output_id","assertion_source_id":"record-plan-output:sha256:<64-hex>","record_plan_output":{}}' --json
 python skills/recallloom/scripts/recallloom.py repair-daily-log-cursor /absolute/path/to/project --json
 python skills/recallloom/scripts/recallloom.py repair-daily-log-cursor /absolute/path/to/project --apply --yes --expected-workspace-revision 12 --json
-python skills/recallloom/scripts/recallloom.py bridge /absolute/path/to/project --file AGENTS.md --yes
+python skills/recallloom/scripts/recallloom.py bridge /absolute/path/to/project --file AGENTS.md --json
 ```
 
 `repair-daily-log-cursor` previews by default. Use apply mode only after
@@ -113,6 +112,16 @@ repairs `state.json.daily_logs` from the parsed latest active daily log and
 does not create helper receipts or rewrite daily-log content. A successful
 apply remains `review_required`; rerun repair preview or validation before any
 later write.
+
+`sync-current-state-after-append --reuse-current-summary` requires the complete
+bound semantic-unchanged assertion emitted for the current preflight/record
+plan; a partial hand-written JSON object is rejected. See the recording
+workflow reference before using that lane.
+
+Bridge and archive operations are preview-only in the current public package
+contract. Review their candidate targets, but do not rely on or document an
+apply command such as `bridge --yes` until each surface has its own
+receipt-backed contract.
 
 ## Recording Workflow
 
@@ -135,6 +144,34 @@ confirmations, stale plan ids, and legacy `source_id` are rejected.
 
 The detailed public-safe input and retry templates live in
 [skills/recallloom/references/recording-workflow.md](./skills/recallloom/references/recording-workflow.md).
+
+## Provenance Recovery Boundary
+
+A general, legacy, or unbound `inconsistent_or_tampered_evidence` state blocks
+mutating writes and is non-waivable. Run structural validation and the bounded
+current provenance check; do not hand-edit the sidecar, reuse stale material,
+or treat the failure as an ordinary retry.
+
+D5 is the sole narrow recovery transition. It applies only to helper-path
+evidence that is contract-valid for the current D5 schema, for a target-only post-hash read failure or
+mismatch with an exact failure-time state match, then requires a fresh binding,
+human proposal, human review, and expected-binding promotion. This is not a
+waiver and does not establish cryptographic authorship. A promotion creates a
+non-receipt-backed reviewed baseline, so run fresh validate, status, and
+preflight afterwards. The exact human-material sections, JSON keys, and
+proposal/review promotion commands are in the
+[operation playbook](./skills/recallloom/references/operation-playbooks.md#d5-human-material-and-promotion).
+
+For the first write from that reviewed baseline, use dispatcher `write` or
+`append` with `--confirm-review-imported-baseline`; it issues the
+confirmation-bound binding and matching lease. The underlying commit/append
+helpers do not accept that flag. Normal operation never calls the underlying
+helpers directly: they are internal dispatcher/integration surfaces. A read-only preflight does not issue
+a binding or lease, there is no independent operator pickup interface, and a
+hand-invoked helper without dispatcher-issued material is expected to fail.
+The existing `sync-current-state-after-append` lane also accepts the confirmation
+when its own post-append contract requires it; this does not make the internal
+helpers standalone entrypoints.
 
 ## Native Wrappers
 
@@ -160,23 +197,45 @@ requests.
 - `preflight_context_check.py`
 - `summarize_continuity_status.py`
 - `query_continuity.py`
+- `validate_context.py`
 
 These helpers are read-only and keep the same freshness baseline. Use them when
 you need orientation, trust/drift signals, or write-target guidance before a
-formal write.
+formal write. `validate_context.py` performs structural or bounded provenance
+diagnosis; it is not a repair or promotion write surface.
 
 ## Write Helpers
 
+Normal operator writes use dispatcher subcommands only:
+
+- `init`
+- `append`
+- `write`
+- `sync-current-state-after-append`
+- `repair-daily-log-cursor`
+
+The dispatcher owns fresh preflight, revision checks, bindings, leases, and the
+shared failure contract. `repair-daily-log-cursor` remains the real public
+cursor-repair entry; use its preview first and its documented apply contract
+only when eligible.
+
+## Internal Implementation Helpers
+
 - `init_context.py`
-- `validate_context.py`
 - `append_daily_log_entry.py`
 - `commit_context_file.py`
+
+These are internal dispatcher/integration helpers, not standalone operator
+commands. They do not provide an independent write path.
+
+## Preview-Only Helpers
+
 - `archive_logs.py`
 - `manage_entry_bridge.py`
-- `repair_daily_log_cursor.py`
 
-Use the concrete helper scripts for managed sidecar writes. Preserve revision
-checks and the shared failure contract.
+These helpers are preview-only in the current public contract. Treat legacy
+archive-apply and bridge `--yes` attempts as unsupported/blocked; they are not
+public write operations or a replacement for receipt-backed mutation.
 
 ## Where To Read More
 

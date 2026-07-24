@@ -120,7 +120,11 @@ def _exit_if_runtime_unsupported() -> None:
 _exit_if_runtime_unsupported()
 
 from core.continuity.quick_summary import build_no_project_payload, build_quick_summary_payload
-from core.continuity.workday import RECOMMENDATION_TYPES, describe_workday_guidance
+from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
+    RECOMMENDATION_TYPES,
+    describe_workday_guidance,
+)
 from core.failure.contracts import failure_payload, preferred_failure_language
 from core.output.confirmation_material import (
     print_confirmation_material,
@@ -182,6 +186,7 @@ from _common import (
     public_project_root_label,
     read_text,
     StorageResolutionError,
+    startup_scratch_residue_error_message,
     startup_scratch_residue_report,
     WrapperMetadataSecurityError,
 )
@@ -205,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Unified RecallLoom command entry for init, resume, validate, status, "
-            "quick-summary, append, write, post-append summary sync, and bridge flows."
+            "quick-summary, append, write, post-append summary sync, and bridge preview flows."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -257,12 +262,18 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--bridge",
         choices=SUPPORTED_BRIDGE_TARGETS,
-        help="Optionally apply a thin bridge to one supported root entry file after successful init+validate.",
+        help=(
+            "Legacy post-init bridge-apply target selector. It is currently unsupported and "
+            "blocked; omit --bridge and --yes to inspect bridge candidates in normal init output."
+        ),
     )
     init_parser.add_argument(
         "--yes",
         action="store_true",
-        help="Required together with --bridge to apply the bridge instead of only suggesting it.",
+        help=(
+            "Legacy bridge-apply confirmation flag. It is currently unsupported and blocked; "
+            "omit --bridge and --yes to inspect bridge candidates in normal init output."
+        ),
     )
     init_parser.add_argument(
         "--json",
@@ -322,7 +333,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume_parser.add_argument(
         "--rollover-hour",
         type=int,
-        default=3,
+        default=DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
         help="Logical day rollover hour in 24-hour form. Defaults to 3.",
     )
     resume_parser.add_argument(
@@ -368,7 +379,7 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument(
         "--rollover-hour",
         type=int,
-        default=3,
+        default=DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
         help="Logical day rollover hour in 24-hour form. Defaults to 3.",
     )
     status_parser.add_argument(
@@ -721,7 +732,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     bridge_parser = subparsers.add_parser(
         "bridge",
-        help="Preview, apply, or remove a RecallLoom thin bridge in one supported root entry file.",
+        help=(
+            "Preview adding, updating, or removing a RecallLoom thin bridge. Bridge apply is "
+            "currently unsupported and blocked."
+        ),
     )
     bridge_parser.add_argument(
         "target",
@@ -738,12 +752,15 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_parser.add_argument(
         "--remove",
         action="store_true",
-        help="Remove RecallLoom managed bridge blocks instead of adding or updating them.",
+        help="Preview removal of managed bridge blocks instead of an add/update preview.",
     )
     bridge_parser.add_argument(
         "--yes",
         action="store_true",
-        help="Apply the change. Without this flag, the command runs in preview mode.",
+        help=(
+            "Legacy bridge-apply confirmation flag. It is currently unsupported and blocked; "
+            "bridge remains preview-only."
+        ),
     )
     bridge_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
 
@@ -804,7 +821,7 @@ def _exit_if_startup_scratch_residue_with_support(
     )
     if report.blocked:
         public_report = report.public_dict()
-        message = "RecallLoom startup scratch residue detected; no files were changed."
+        message = startup_scratch_residue_error_message(report)
         _exit_with_support(
             parser,
             json_mode=json_mode,
@@ -1219,7 +1236,7 @@ def _append_helper_args(
         else _append_expected_workspace_revision(preflight_payload)
     )
     helper_args.extend(["--expected-workspace-revision", str(expected_workspace_revision)])
-    if _write_readiness_label(preflight_payload) in {
+    if _append_write_readiness_label(preflight_payload) in {
         "structural_only_ready_after_preflight",
         "helper_evidenced_ready_after_preflight",
         "review_imported_baseline_ready_after_preflight",
@@ -2035,7 +2052,7 @@ def _enforce_append_preflight_gate(
             file_key="daily_log",
         )
     provenance_state = preflight_payload.get("provenance_state")
-    readiness_label = _write_readiness_label(preflight_payload)
+    readiness_label = _append_write_readiness_label(preflight_payload)
     if provenance_state == "review_imported_baseline":
         if readiness_label != "review_imported_baseline_ready_after_preflight":
             message = (
@@ -2269,6 +2286,38 @@ def _write_readiness_label(preflight_payload: dict) -> str | None:
     return None
 
 
+def _strict_preflight_daily_log_receipts_verified(preflight_payload: dict) -> bool:
+    strict_gate = preflight_payload.get("strict_sidecar_integrity_gate")
+    if not isinstance(strict_gate, dict) or strict_gate.get("allowed_for_mutation") is not True:
+        return False
+    verified_file_keys = strict_gate.get("verified_current_file_keys")
+    receipt_store = strict_gate.get("receipt_store")
+    target_file_keys = (
+        receipt_store.get("target_file_keys") if isinstance(receipt_store, dict) else None
+    )
+    return (
+        isinstance(verified_file_keys, list)
+        and "daily_log" in verified_file_keys
+        and isinstance(receipt_store, dict)
+        and receipt_store.get("verified") is True
+        and isinstance(target_file_keys, list)
+        and "daily_log" in target_file_keys
+    )
+
+
+def _append_write_readiness_label(preflight_payload: dict) -> str | None:
+    readiness_label = _write_readiness_label(preflight_payload)
+    if _is_ready_after_preflight_label(readiness_label):
+        return readiness_label
+    if (
+        preflight_payload.get("provenance_state") == "helper_evidenced"
+        and readiness_label == "helper_evidenced"
+        and _strict_preflight_daily_log_receipts_verified(preflight_payload)
+    ):
+        return "helper_evidenced_ready_after_preflight"
+    return readiness_label
+
+
 def _is_ready_after_preflight_label(label: str | None) -> bool:
     return label in {
         "structural_only_ready_after_preflight",
@@ -2278,7 +2327,7 @@ def _is_ready_after_preflight_label(label: str | None) -> bool:
 
 
 def _ready_after_preflight_label_for_provenance(provenance_state: object) -> str | None:
-    if provenance_state == "structurally_valid":
+    if provenance_state in {"structurally_valid", "unproven_sidecar_state"}:
         return "structural_only_ready_after_preflight"
     if provenance_state == "helper_evidenced":
         return "helper_evidenced_ready_after_preflight"
@@ -2396,7 +2445,7 @@ def _append_preflight_binding_json(
             or provenance_contract_identity()
         ),
         "provenance_state": preflight_payload.get("provenance_state"),
-        "write_readiness_label": _write_readiness_label(preflight_payload),
+        "write_readiness_label": _append_write_readiness_label(preflight_payload),
     }
     if isinstance(write_readiness, dict):
         for key in ("ux_gate", "ux_gate_requires_confirmation", "ux_gate_reason"):
@@ -4785,6 +4834,7 @@ def _build_progressive_resume_payload(
         review_required=provenance_facts["review_required"],
         review_imported_baseline=provenance_facts["review_imported_baseline"],
         helper_evidenced_baseline=provenance_facts["helper_evidenced"],
+        unproven_sidecar_state=provenance_facts["unproven_sidecar_state"],
         metadata_status=provenance_facts["metadata_status"],
     )
     base_payload = {

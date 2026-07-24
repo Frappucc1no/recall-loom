@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass, field
+import copy
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 from typing import Any
 
@@ -65,6 +68,71 @@ STORE_BINDING_FIELDS = (
     "store_contract_identity",
 )
 CONTRACT_IDENTITY_FIELDS = ("contract_name", "contract_version", "contract_hash")
+RECEIPT_STORE_SNAPSHOT_STATUSES = ("absent", "present")
+RECEIPT_STORE_NOT_WRITTEN_VERIFIED = "receipt_store_not_written_verified"
+RECEIPT_STORE_NOT_WRITTEN_SIDE_EFFECT = (
+    "target_and_state_written_receipt_store_verified_unchanged"
+)
+_RECEIPT_STORE_SNAPSHOT_TOKEN = object()
+
+
+def _is_sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+class _DuplicateReceiptStoreKey(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ReceiptStoreSnapshot:
+    status: str
+    revision: int | None
+    digest: str | None
+    contract_identity: dict | None
+    receipt_digests: tuple[str, ...]
+    index_keys: tuple[str, ...]
+    _payload: dict = field(repr=False, compare=False)
+    _source_identity: tuple[int, ...] | None = field(repr=False, compare=False)
+    _raw_digest: str | None = field(repr=False, compare=False)
+    _construction_token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.status not in RECEIPT_STORE_SNAPSHOT_STATUSES:
+            raise ValueError("Receipt-store snapshot status is invalid.")
+        if self.status == "absent":
+            if (
+                self.revision is not None
+                or self.digest is not None
+                or self.contract_identity is not None
+                or self.receipt_digests
+                or self.index_keys
+                or self._source_identity is not None
+                or self._raw_digest is not None
+            ):
+                raise ValueError("Absent receipt-store snapshot fields must use null/empty sentinels.")
+            return
+        if (
+            not _is_json_int(self.revision)
+            or self.revision < 0
+            or not _is_sha256_digest(self.digest)
+            or not isinstance(self.contract_identity, dict)
+            or not isinstance(self.receipt_digests, tuple)
+            or not isinstance(self.index_keys, tuple)
+            or not all(_is_sha256_digest(digest) for digest in self.receipt_digests)
+            or self.index_keys != tuple(sorted(self.receipt_digests))
+            or self.revision != len(self.receipt_digests)
+            or not isinstance(self._source_identity, tuple)
+            or len(self._source_identity) != 6
+            or not all(_is_json_int(value) for value in self._source_identity)
+            or not _is_sha256_digest(self._raw_digest)
+        ):
+            raise ValueError("Present receipt-store snapshot fields are incomplete.")
 
 
 class ReceiptStoreError(RuntimeError):
@@ -146,17 +214,39 @@ def _receipt_store_contract_error(message: str) -> ReceiptStoreError:
     )
 
 
-def _load_store(path: Path, *, project_root: str | Path) -> dict:
-    if not path.exists():
-        return _empty_store()
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise _DuplicateReceiptStoreKey(key)
+        payload[key] = value
+    return payload
+
+
+def _decode_receipt_store_payload(raw_bytes: bytes) -> Any:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise ReceiptStoreError(
-            f"Receipt store is not readable JSON: {exc}",
+            "Receipt store is not valid UTF-8.",
             reason_code="receipt_store_unreadable",
             side_effect="target_and_state_written_receipt_not_stored",
         ) from exc
+    try:
+        return json.loads(text, object_pairs_hook=_strict_json_object)
+    except _DuplicateReceiptStoreKey as exc:
+        raise _receipt_store_contract_error(
+            "Receipt store contains duplicate JSON object keys."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ReceiptStoreError(
+            "Receipt store is not readable JSON.",
+            reason_code="receipt_store_unreadable",
+            side_effect="target_and_state_written_receipt_not_stored",
+        ) from exc
+
+
+def _validate_receipt_store_payload(payload: Any, *, project_root: str | Path) -> dict:
     if not isinstance(payload, dict):
         raise _receipt_store_contract_error("Receipt store must be a JSON object.")
     if set(payload) != set(RECEIPT_STORE_FIELDS):
@@ -191,6 +281,21 @@ def _load_store(path: Path, *, project_root: str | Path) -> dict:
     return payload
 
 
+def _load_store(path: Path, *, project_root: str | Path) -> dict:
+    if not path.exists():
+        return _empty_store()
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError as exc:
+        raise ReceiptStoreError(
+            "Receipt store could not be read.",
+            reason_code="receipt_store_unreadable",
+            side_effect="target_and_state_written_receipt_not_stored",
+        ) from exc
+    payload = _decode_receipt_store_payload(raw_bytes)
+    return _validate_receipt_store_payload(payload, project_root=project_root)
+
+
 def _receipt_summary_entry(receipt: dict) -> dict:
     return {key: receipt[key] for key in RECEIPT_SUMMARY_FIELDS if key in receipt}
 
@@ -221,6 +326,272 @@ def receipt_store_summary(
         "target_file_keys": sorted(latest_receipts_by_file_key),
         "latest_receipts_by_file_key": latest_receipts_by_file_key,
     }
+
+
+def capture_receipt_store_snapshot(
+    *,
+    storage_root: str | Path,
+    project_root: str | Path,
+) -> ReceiptStoreSnapshot:
+    """Capture a bounded, contract-validated snapshot of the optional receipt store."""
+
+    path = receipt_store_path(storage_root)
+    try:
+        before_stat = path.lstat()
+    except FileNotFoundError:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return ReceiptStoreSnapshot(
+                status="absent",
+                revision=None,
+                digest=None,
+                contract_identity=None,
+                receipt_digests=(),
+                index_keys=(),
+                _payload=_empty_store(),
+                _source_identity=None,
+                _raw_digest=None,
+                _construction_token=_RECEIPT_STORE_SNAPSHOT_TOKEN,
+            )
+        else:
+            raise ReceiptStoreError(
+                "Receipt store changed while its absent snapshot was captured.",
+                reason_code="receipt_store_concurrent_change_detected",
+                side_effect="target_and_state_written_receipt_not_stored",
+            )
+    if not stat.S_ISREG(before_stat.st_mode):
+        raise _receipt_store_contract_error(
+            "Receipt store snapshot source must be a regular file."
+        )
+    try:
+        before_bytes = path.read_bytes()
+        store = _load_store(path, project_root=project_root)
+        after_bytes = path.read_bytes()
+        after_stat = path.lstat()
+    except OSError as exc:
+        raise ReceiptStoreError(
+            "Receipt store snapshot could not be read.",
+            reason_code="receipt_store_unreadable",
+            side_effect="target_and_state_written_receipt_not_stored",
+        ) from exc
+    before_identity = (
+        before_stat.st_dev,
+        before_stat.st_ino,
+        before_stat.st_mode,
+        before_stat.st_size,
+        before_stat.st_mtime_ns,
+        before_stat.st_ctime_ns,
+    )
+    after_identity = (
+        after_stat.st_dev,
+        after_stat.st_ino,
+        after_stat.st_mode,
+        after_stat.st_size,
+        after_stat.st_mtime_ns,
+        after_stat.st_ctime_ns,
+    )
+    if before_identity != after_identity or before_bytes != after_bytes:
+        raise ReceiptStoreError(
+            "Receipt store changed while its snapshot was captured.",
+            reason_code="receipt_store_concurrent_change_detected",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    canonical_bytes = json.dumps(
+        store,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return ReceiptStoreSnapshot(
+        status="present",
+        revision=store["store_revision"],
+        digest="sha256:" + hashlib.sha256(canonical_bytes).hexdigest(),
+        contract_identity=dict(store["contract_identity"]),
+        receipt_digests=tuple(
+            receipt["digest"]
+            for receipt in store["receipts"]
+            if isinstance(receipt, dict) and isinstance(receipt.get("digest"), str)
+        ),
+        index_keys=tuple(sorted(store["index"])),
+        _payload=copy.deepcopy(store),
+        _source_identity=after_identity,
+        _raw_digest="sha256:" + hashlib.sha256(after_bytes).hexdigest(),
+        _construction_token=_RECEIPT_STORE_SNAPSHOT_TOKEN,
+    )
+
+
+def validate_receipt_store_snapshot(snapshot: ReceiptStoreSnapshot) -> None:
+    """Reject hand-built or internally inconsistent receipt-store snapshots."""
+
+    if not isinstance(snapshot, ReceiptStoreSnapshot):
+        raise ReceiptStoreError(
+            "Expected receipt-store snapshot is not a ReceiptStoreSnapshot.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    if snapshot._construction_token is not _RECEIPT_STORE_SNAPSHOT_TOKEN:
+        raise ReceiptStoreError(
+            "Expected receipt-store snapshot was not captured by this module.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    try:
+        snapshot.__post_init__()
+    except ValueError as exc:
+        raise ReceiptStoreError(
+            "Expected receipt-store snapshot fields are invalid.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        ) from exc
+    payload = snapshot._payload
+    if not isinstance(payload, dict):
+        raise ReceiptStoreError(
+            "Expected receipt-store snapshot payload is invalid.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    if snapshot.status == "absent":
+        if payload != _empty_store():
+            raise ReceiptStoreError(
+                "Absent receipt-store snapshot payload is invalid.",
+                reason_code="receipt_store_snapshot_invalid",
+                side_effect="target_and_state_written_receipt_not_stored",
+            )
+        return
+    receipts = payload.get("receipts")
+    index = payload.get("index")
+    if (
+        not isinstance(receipts, list)
+        or not all(isinstance(receipt, dict) for receipt in receipts)
+        or not isinstance(index, dict)
+    ):
+        raise ReceiptStoreError(
+            "Present receipt-store snapshot payload collections are invalid.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    if (
+        payload.get("store_revision") != snapshot.revision
+        or payload.get("contract_identity") != snapshot.contract_identity
+        or tuple(receipt.get("digest") for receipt in receipts) != snapshot.receipt_digests
+        or tuple(sorted(index)) != snapshot.index_keys
+    ):
+        raise ReceiptStoreError(
+            "Present receipt-store snapshot payload does not match its public fields.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+    try:
+        canonical_bytes = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ReceiptStoreError(
+            "Present receipt-store snapshot payload is not canonical JSON.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        ) from exc
+    if snapshot.digest != "sha256:" + hashlib.sha256(canonical_bytes).hexdigest():
+        raise ReceiptStoreError(
+            "Present receipt-store snapshot digest is invalid.",
+            reason_code="receipt_store_snapshot_invalid",
+            side_effect="target_and_state_written_receipt_not_stored",
+        )
+
+
+def receipt_store_snapshot_fields(snapshot: ReceiptStoreSnapshot) -> dict[str, object]:
+    validate_receipt_store_snapshot(snapshot)
+    return {
+        "receipt_store_snapshot_status": snapshot.status,
+        "receipt_store_revision": snapshot.revision,
+        "receipt_store_digest": snapshot.digest,
+        "receipt_store_contract_identity": (
+            dict(snapshot.contract_identity)
+            if isinstance(snapshot.contract_identity, dict)
+            else None
+        ),
+    }
+
+
+def _receipt_store_snapshots_equal(
+    left: ReceiptStoreSnapshot,
+    right: ReceiptStoreSnapshot,
+) -> bool:
+    return (
+        left.status == right.status
+        and left.revision == right.revision
+        and left.digest == right.digest
+        and left.contract_identity == right.contract_identity
+        and left.receipt_digests == right.receipt_digests
+        and left.index_keys == right.index_keys
+        and left._source_identity == right._source_identity
+        and left._raw_digest == right._raw_digest
+    )
+
+
+def receipt_store_snapshot_matches_current(
+    *,
+    storage_root: str | Path,
+    project_root: str | Path,
+    snapshot: ReceiptStoreSnapshot,
+    expected_receipt_digest: str | None = None,
+) -> bool:
+    """Positively prove that the receipt store is still the frozen snapshot."""
+
+    try:
+        validate_receipt_store_snapshot(snapshot)
+        current = capture_receipt_store_snapshot(
+            storage_root=storage_root,
+            project_root=project_root,
+        )
+    except ReceiptStoreError:
+        return False
+    if not _receipt_store_snapshots_equal(current, snapshot):
+        return False
+    if expected_receipt_digest is None:
+        return True
+    if not _is_sha256_digest(expected_receipt_digest):
+        return False
+    expected_binding = {
+        "store_file": RECEIPT_STORE_RELATIVE_PATH,
+        "store_revision": (snapshot.revision or 0) + 1,
+        "index_key": expected_receipt_digest,
+        "receipt_digest": expected_receipt_digest,
+        "store_contract_identity": receipt_store_contract_identity(),
+    }
+    if expected_receipt_digest in current.receipt_digests or expected_receipt_digest in current.index_keys:
+        return False
+    return not any(
+        isinstance(receipt, dict) and receipt.get("store_binding") == expected_binding
+        for receipt in current._payload.get("receipts", [])
+    )
+
+
+def expected_finalized_receipt_digest(
+    *,
+    receipt: dict,
+    snapshot: ReceiptStoreSnapshot,
+) -> str:
+    """Project the digest that finalization would bind to the frozen store revision."""
+
+    validate_receipt_store_snapshot(snapshot)
+    store_revision = (snapshot.revision or 0) + 1
+    finalized_receipt = {
+        **receipt,
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "revision": store_revision,
+        "finalization_status": "finalized",
+        "redaction_policy_version": RECEIPT_REDACTION_POLICY_VERSION,
+        "contract_identity": receipt_contract_identity(),
+    }
+    created_at = _coarse_timestamp(finalized_receipt.get("created_at"))
+    if created_at is not None:
+        finalized_receipt["created_at"] = created_at
+    return receipt_payload_digest(finalized_receipt)
 
 
 def _has_exact_keys(value: Any, expected: tuple[str, ...]) -> bool:
@@ -363,7 +734,13 @@ def _validate_loaded_store_payload(payload: dict, *, project_root: str | Path) -
             )
 
 
-def _write_json_atomic(path: Path, payload: dict) -> None:
+def _write_json_atomic(
+    path: Path,
+    payload: dict,
+    *,
+    create_only: bool = False,
+    before_replace=None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
@@ -377,7 +754,14 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
             handle.write((json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        if before_replace is not None:
+            before_replace()
+        if create_only:
+            os.link(temp_path, path)
+            temp_path.unlink()
+            temp_path = None
+        else:
+            os.replace(temp_path, path)
     except BaseException:
         if temp_path is not None:
             with suppress(FileNotFoundError):
@@ -418,50 +802,39 @@ def _index_entry(*, receipt: dict, receipt_offset: int, binding: dict) -> dict:
     }
 
 
-def _verified_reloaded_binding(
+def _verified_reloaded_store(
     *,
     path: Path,
-    receipt_digest: str,
-    expected_binding: dict,
-    expected_index_entry: dict,
+    expected_store: dict,
+    project_root: str | Path,
 ) -> None:
     try:
-        reloaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raw_bytes = path.read_bytes()
+    except OSError as exc:
         raise ReceiptStoreError(
             f"Receipt store could not be verified after write: {exc}",
             reason_code="receipt_store_post_write_unreadable",
             side_effect="target_state_and_receipt_store_write_unknown_review_required",
         ) from exc
-    index = reloaded.get("index") if isinstance(reloaded, dict) else None
-    receipts = reloaded.get("receipts") if isinstance(reloaded, dict) else None
-    if not isinstance(index, dict) or not isinstance(receipts, list):
-        raise ReceiptStoreError(
-            "Receipt store verification failed because index or receipts are malformed.",
-            reason_code="receipt_store_index_mismatch",
-            side_effect="target_state_and_receipt_store_written_review_required",
+    try:
+        reloaded = _validate_receipt_store_payload(
+            _decode_receipt_store_payload(raw_bytes),
+            project_root=project_root,
         )
-    if index.get(receipt_digest) != expected_index_entry:
+    except ReceiptStoreError as exc:
         raise ReceiptStoreError(
-            "Receipt store index does not bind to the finalized receipt.",
-            reason_code="receipt_store_index_mismatch",
+            "Receipt store failed its complete contract after write.",
+            reason_code=exc.reason_code,
             side_effect="target_state_and_receipt_store_written_review_required",
-        )
-    if not receipts:
+            details=exc.details,
+        ) from exc
+    expected_bytes = (
+        json.dumps(expected_store, ensure_ascii=False, indent=2) + "\n"
+    ).encode("utf-8")
+    if raw_bytes != expected_bytes or reloaded != expected_store:
         raise ReceiptStoreError(
-            "Receipt store verification found no stored receipts.",
+            "Receipt store does not exactly match the complete finalized store.",
             reason_code="receipt_store_index_mismatch",
-            side_effect="target_state_and_receipt_store_written_review_required",
-        )
-    stored_receipt = receipts[-1]
-    if (
-        not isinstance(stored_receipt, dict)
-        or stored_receipt.get("digest") != receipt_digest
-        or stored_receipt.get("store_binding") != expected_binding
-    ):
-        raise ReceiptStoreError(
-            "Receipt store receipt entry does not match its store binding.",
-            reason_code="receipt_store_binding_mismatch",
             side_effect="target_state_and_receipt_store_written_review_required",
         )
 
@@ -471,11 +844,27 @@ def finalize_receipt_in_store(
     storage_root: str | Path,
     receipt: dict,
     project_root: str | Path,
+    expected_snapshot: ReceiptStoreSnapshot | None = None,
 ) -> dict:
     """Finalize a receipt and append it to the optional local receipt store."""
 
     path = receipt_store_path(storage_root)
-    store = _load_store(path, project_root=project_root)
+    if expected_snapshot is None:
+        store = _load_store(path, project_root=project_root)
+    else:
+        validate_receipt_store_snapshot(expected_snapshot)
+        current_snapshot = capture_receipt_store_snapshot(
+            storage_root=storage_root,
+            project_root=project_root,
+        )
+        if not _receipt_store_snapshots_equal(current_snapshot, expected_snapshot):
+            raise ReceiptStoreError(
+                "Receipt store no longer matches the expected pre-write snapshot.",
+                reason_code="receipt_store_snapshot_mismatch",
+                side_effect="target_and_state_written_receipt_not_stored",
+                details=receipt_store_snapshot_fields(expected_snapshot),
+            )
+        store = copy.deepcopy(expected_snapshot._payload)
     store_revision = store["store_revision"] + 1
     finalized_receipt = {
         **receipt,
@@ -519,7 +908,14 @@ def finalize_receipt_in_store(
     receipts = [*store["receipts"], persisted_receipt]
     index = dict(store["index"])
     receipt_digest = finalized_receipt["digest"]
-    if receipt_digest in index:
+    if (
+        receipt_digest in index
+        or any(
+            stored_receipt.get("digest") == receipt_digest
+            or stored_receipt.get("store_binding") == binding
+            for stored_receipt in store["receipts"]
+        )
+    ):
         raise ReceiptStoreError(
             "Receipt store already contains this receipt digest.",
             reason_code="receipt_store_duplicate_digest",
@@ -540,25 +936,80 @@ def finalize_receipt_in_store(
         "index": index,
     }
 
+    def verify_expected_snapshot_before_replace() -> None:
+        if expected_snapshot is None:
+            return
+        current_snapshot = capture_receipt_store_snapshot(
+            storage_root=storage_root,
+            project_root=project_root,
+        )
+        if not _receipt_store_snapshots_equal(current_snapshot, expected_snapshot):
+            raise ReceiptStoreError(
+                "Receipt store changed before the finalized store replace.",
+                reason_code="receipt_store_snapshot_mismatch",
+                side_effect="target_and_state_written_receipt_not_stored",
+                details=receipt_store_snapshot_fields(expected_snapshot),
+            )
+
     try:
-        _write_json_atomic(path, next_store)
+        _write_json_atomic(
+            path,
+            next_store,
+            create_only=expected_snapshot is not None and expected_snapshot.status == "absent",
+            before_replace=(
+                verify_expected_snapshot_before_replace
+                if expected_snapshot is not None
+                else None
+            ),
+        )
     except OSError as exc:
+        if (
+            expected_snapshot is not None
+            and receipt_store_snapshot_matches_current(
+                storage_root=storage_root,
+                project_root=project_root,
+                snapshot=expected_snapshot,
+                expected_receipt_digest=receipt_digest,
+            )
+        ):
+            raise ReceiptStoreError(
+                "Receipt store write failed, and the unchanged pre-write snapshot proves "
+                "that the receipt was not stored.",
+                reason_code=RECEIPT_STORE_NOT_WRITTEN_VERIFIED,
+                side_effect=RECEIPT_STORE_NOT_WRITTEN_SIDE_EFFECT,
+                details={
+                    "store_failure_reason_code": "receipt_store_write_failed",
+                    "expected_receipt_digest": receipt_digest,
+                    "expected_store_binding": binding,
+                    **receipt_store_snapshot_fields(expected_snapshot),
+                },
+            ) from exc
         raise ReceiptStoreError(
             f"Receipt store could not be written: {exc}",
             reason_code="receipt_store_write_failed",
             side_effect="target_state_and_receipt_store_write_unknown_review_required",
         ) from exc
 
-    _verified_reloaded_binding(
+    _verified_reloaded_store(
         path=path,
-        receipt_digest=receipt_digest,
-        expected_binding=binding,
-        expected_index_entry=index_entry,
+        expected_store=next_store,
+        project_root=project_root,
     )
+    final_snapshot = capture_receipt_store_snapshot(
+        storage_root=storage_root,
+        project_root=project_root,
+    )
+    if final_snapshot._payload != next_store:
+        raise ReceiptStoreError(
+            "Receipt store changed after finalized-store verification.",
+            reason_code="receipt_store_index_mismatch",
+            side_effect="target_state_and_receipt_store_written_review_required",
+        )
     return {
         "receipt": finalized_receipt,
         "store_binding": binding,
         "store_path": path,
         "receipt_digest": receipt_digest,
         "store_revision": store_revision,
+        "store_snapshot": final_snapshot,
     }

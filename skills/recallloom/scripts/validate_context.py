@@ -13,7 +13,11 @@ from core.bridge.blocks import (
     exclude_block_integrity,
     managed_exclude_block_text,
 )
-from core.continuity.workday import logical_workday_for
+from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
+    logical_workday_for,
+)
+from core.failure.contracts import canonical_detail_reason_contract
 from core.output.privacy import (
     display_project_path,
     display_project_root_label,
@@ -21,11 +25,18 @@ from core.output.privacy import (
     redact_public_text,
 )
 from core.output.user_status import print_user_summary, validate_user_summary
+from core.provenance.inconsistent_review import (
+    INCONSISTENT_REVIEW_EVIDENCE_KEY,
+    REVIEW_IMPORTED_BASELINE_MATERIAL_FAILURE_REASONS,
+    evaluate_current_inconsistent_review_orphan,
+    evaluate_review_imported_baseline_materials,
+)
 from core.provenance.store import (
     RECEIPT_STORE_RELATIVE_PATH,
 )
 from core.provenance.evidence import (
     bounded_current_helper_evidence_check,
+    capture_actual_daily_log_cursor_evidence,
     current_receipt_required_file_keys as evidence_current_receipt_required_file_keys,
     current_receipt_target_path as evidence_current_receipt_target_path,
 )
@@ -85,9 +96,6 @@ from _common import (
     sorted_daily_log_files,
     validate_iso_date,
 )
-
-DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR = 3
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -989,11 +997,18 @@ def current_receipt_required_file_keys(workspace, state: dict) -> list[str]:
     )
 
 
-def current_receipt_target_path(workspace, state: dict, file_key: str) -> Path:
+def current_receipt_target_path(
+    workspace,
+    state: dict,
+    file_key: str,
+    *,
+    daily_log_cursor: dict[str, object] | None = None,
+) -> Path:
     return evidence_current_receipt_target_path(
         storage_root=workspace.storage_root,
         state=state,
         file_key=file_key,
+        daily_log_cursor=daily_log_cursor,
     )
 
 
@@ -1038,6 +1053,84 @@ def validate_provenance_receipts(
         )
         return result
 
+    reviewed_baseline = evaluate_review_imported_baseline_materials(
+        project_root=workspace.project_root,
+        storage_root=workspace.storage_root,
+        state=state,
+        state_text=state_text,
+    )
+    if reviewed_baseline.status == "invalid":
+        route_reason_code = reviewed_baseline.reason_code
+        material_reason_code = None
+        if route_reason_code in REVIEW_IMPORTED_BASELINE_MATERIAL_FAILURE_REASONS:
+            material_reason_code = route_reason_code
+            route_reason_code = "review_imported_baseline_material_invalid"
+        result["receipt_store"]["reason_code"] = (
+            "review_imported_baseline_non_receipt_backed"
+        )
+        result["review_imported_baseline_validation"] = {
+            "verified": False,
+            "reason_code": route_reason_code,
+            "receipt_backed": False,
+        }
+        if material_reason_code is not None:
+            result["review_imported_baseline_validation"][
+                "material_reason_code"
+            ] = material_reason_code
+        add_finding(
+            findings,
+            "error",
+            f"provenance_{reviewed_baseline.reason_code}",
+            "The exact reviewed-baseline binding or human review material is no longer current.",
+            workspace.storage_root / FILE_KEYS["state"],
+        )
+        return result
+    if reviewed_baseline.status == "verified":
+        result["receipt_store"]["reason_code"] = (
+            "review_imported_baseline_non_receipt_backed"
+        )
+        result["review_imported_baseline_validation"] = {
+            "verified": True,
+            "reason_code": reviewed_baseline.reason_code,
+            "receipt_backed": False,
+            "inconsistent_review_binding_digest": reviewed_baseline.binding_digest,
+            "proposal_digest": reviewed_baseline.proposal_digest,
+            "review_digest": reviewed_baseline.review_digest,
+        }
+        return result
+
+    actual_daily_log_cursor = None
+    actual_daily_log_cursor_evidence = None
+    try:
+        parsed_daily_log_cursor, actual_daily_log_cursor_evidence = (
+            capture_actual_daily_log_cursor_evidence(
+                storage_root=workspace.storage_root,
+                state=state,
+                state_text=state_text,
+            )
+        )
+        actual_daily_log_cursor = parsed_daily_log_cursor.as_state_fields()
+    except DailyLogCursorError as exc:
+        result["receipt_store"]["reason_code"] = exc.reason_code
+        add_finding(
+            findings,
+            "error",
+            f"provenance_{exc.reason_code}",
+            "The current daily-log cursor could not be captured as a stable on-disk snapshot.",
+            exc.path or workspace.storage_root / DAILY_LOGS_DIRNAME,
+        )
+        return result
+    if actual_daily_log_cursor_evidence is None:
+        result["receipt_store"]["reason_code"] = "daily_log_cursor_mismatch"
+        add_finding(
+            findings,
+            "error",
+            "provenance_daily_log_cursor_mismatch",
+            "The current daily-log cursor could not be bound to the exact state snapshot.",
+            workspace.storage_root / FILE_KEYS["state"],
+        )
+        return result
+
     check = bounded_current_helper_evidence_check(
         project_root=workspace.project_root,
         storage_root=workspace.storage_root,
@@ -1045,6 +1138,8 @@ def validate_provenance_receipts(
         state_text=state_text,
         helper_evidenced_only=False,
         require_receipt_store=True,
+        daily_log_cursor=actual_daily_log_cursor,
+        actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
     )
     result["required_current_file_keys"] = check.get("required_current_file_keys", [])
     result["verified_current_file_keys"] = check.get("verified_current_file_keys", [])
@@ -1062,7 +1157,12 @@ def validate_provenance_receipts(
                 "error",
                 f"provenance_{file_key}_receipt_missing",
                 "Current managed surface is missing finalized receipt-store evidence for this file.",
-                current_receipt_target_path(workspace, state, file_key),
+                current_receipt_target_path(
+                    workspace,
+                    state,
+                    file_key,
+                    daily_log_cursor=actual_daily_log_cursor,
+                ),
             )
 
     if check.get("verified") is not True:
@@ -1155,6 +1255,7 @@ def main() -> None:
     )
 
     findings: list[ValidationFinding] = []
+    inconsistent_review_result = None
     try:
         validate_config(workspace, findings)
         validate_state_file(workspace, findings)
@@ -1167,6 +1268,25 @@ def main() -> None:
         validate_bridge_blocks(workspace, state, findings)
         validate_exclude_block(workspace, state, findings)
         validate_unknown_storage_assets(workspace, findings)
+        structural_errors = [finding for finding in findings if finding.level == "error"]
+        provenance_metadata = state.get("provenance") if isinstance(state, dict) else None
+        if (
+            args.json
+            and args.require_provenance
+            and args.changed_only
+            and not structural_errors
+            and isinstance(provenance_metadata, dict)
+            and provenance_metadata.get("state_label")
+            == "inconsistent_or_tampered_evidence"
+            and INCONSISTENT_REVIEW_EVIDENCE_KEY in provenance_metadata
+        ):
+            state_text = read_text(workspace.storage_root / FILE_KEYS["state"])
+            inconsistent_review_result = evaluate_current_inconsistent_review_orphan(
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+                state=state,
+                state_text=state_text,
+            )
         provenance_validation = None
         if args.require_provenance:
             audit_scope = (
@@ -1174,7 +1294,6 @@ def main() -> None:
                 if args.full
                 else "changed_only_current_receipt_store"
             )
-            structural_errors = [finding for finding in findings if finding.level == "error"]
             if structural_errors:
                 provenance_validation = skipped_provenance_validation(
                     audit_scope=audit_scope,
@@ -1230,6 +1349,7 @@ def main() -> None:
         helper_evidenced_baseline=(
             provenance_facts["helper_evidenced"] if provenance_receipts_verified else False
         ),
+        unproven_sidecar_state=provenance_facts["unproven_sidecar_state"],
         metadata_status=provenance_facts["metadata_status"],
     )
 
@@ -1243,6 +1363,7 @@ def main() -> None:
         "provenance_state": provenance["state_label"],
         "provenance_metadata_status": provenance["metadata_status"],
         "write_readiness": provenance["write_readiness"],
+        "side_effect": "none",
         "valid": not errors,
         "error_count": len(errors),
         "warning_count": len(warnings),
@@ -1262,6 +1383,37 @@ def main() -> None:
     )
     payload["user_visible_category"] = user_summary["category"]
     payload["user_summary"] = user_summary
+    if inconsistent_review_result is not None:
+        if inconsistent_review_result.status == "exact_orphan":
+            diagnostic_reason = (
+                "post_hash_inconsistent_review_promotion_not_committed"
+            )
+        elif inconsistent_review_result.status == "current_no_orphan":
+            diagnostic_reason = "post_hash_inconsistent_review_eligible"
+        else:
+            diagnostic_reason = "post_hash_inconsistent_review_binding_changed"
+        route = canonical_detail_reason_contract(diagnostic_reason, language="en") or {}
+        diagnostic_details = {
+            "reason_code": diagnostic_reason,
+            "safe_to_retry": False,
+            "side_effect": "none",
+            "next_action": route.get("next_action"),
+        }
+        if inconsistent_review_result.status in {
+            "current_no_orphan",
+            "exact_orphan",
+        }:
+            diagnostic_details["inconsistent_review_binding"] = (
+                inconsistent_review_result.binding
+            )
+            diagnostic_details["inconsistent_review_binding_digest"] = (
+                inconsistent_review_result.binding_digest
+            )
+        payload["details"] = diagnostic_details
+        payload["write_readiness"]["next_action"] = route.get(
+            "suggestion",
+            route.get("next_action"),
+        )
     if args.require_provenance:
         payload["provenance_validation"] = provenance_validation
 

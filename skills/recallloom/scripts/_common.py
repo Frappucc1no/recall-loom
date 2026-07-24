@@ -61,6 +61,7 @@ from core.safety.scratch_residue import (
     ScratchResidueReport,
     external_scratch_roots_for_sources,
     scan_startup_scratch_residue,
+    startup_scratch_residue_error_message,
 )
 from core.support.cache import SUPPORT_STATE_ENV, package_support_result
 from core.support.policy import action_level_for_script, user_message_for_state
@@ -1538,6 +1539,24 @@ def read_text(path: Path) -> str:
     return path.read_bytes().decode("utf-8")
 
 
+def stable_text_readback(path: Path) -> tuple[str, str | None, str | None]:
+    try:
+        first_text = read_text(path)
+    except UnicodeDecodeError:
+        return "read_failed", None, "unicode_decode_error"
+    except OSError:
+        return "read_failed", None, "os_error"
+    try:
+        second_text = read_text(path)
+    except UnicodeDecodeError:
+        return "read_failed", None, "unicode_decode_error"
+    except OSError:
+        return "read_failed", None, "os_error"
+    if first_text != second_text:
+        return "changed", None, None
+    return "read", second_text, None
+
+
 def exit_with_cli_error(
     parser,
     *,
@@ -1870,7 +1889,7 @@ def exit_if_startup_scratch_residue(
     )
     if report.blocked:
         public_report = report.public_dict()
-        message = "RecallLoom startup scratch residue detected; no files were changed."
+        message = startup_scratch_residue_error_message(report)
         exit_with_cli_error(
             parser,
             json_mode=json_mode,
@@ -1924,6 +1943,71 @@ def atomic_write_if_unchanged(path: Path, *, expected_text: str, new_text: str) 
     if current_text != expected_text:
         raise LockBusyError(f"Refusing to write {path} because the file changed after it was read.")
     write_text(path, new_text)
+
+
+def atomic_write_and_verify_if_unchanged(
+    path: Path,
+    *,
+    expected_text: str,
+    new_text: str,
+) -> None:
+    """Bound a helper-owned atomic replace to exact before/after text snapshots."""
+
+    atomic_write_if_unchanged(path, expected_text=expected_text, new_text=new_text)
+    try:
+        verified_text = read_text(path)
+    except FileNotFoundError as exc:
+        raise LockBusyError(
+            f"Refusing to continue because {path} disappeared after the helper write."
+        ) from exc
+    if verified_text != new_text:
+        raise LockBusyError(
+            f"Refusing to continue because {path} changed during post-write verification."
+        )
+
+
+def write_text_create_only(path: Path, text: str) -> None:
+    """Atomically create immutable helper evidence without an overwrite path."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            dir=path.parent,
+            prefix=f".{path.name}.create-",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temp_path, path)
+    except FileExistsError as exc:
+        if temp_path is not None:
+            with suppress(FileNotFoundError):
+                temp_path.unlink()
+        raise LockBusyError(
+            f"Refusing to create {path} because it already exists."
+        ) from exc
+    except BaseException:
+        if temp_path is not None:
+            with suppress(FileNotFoundError):
+                temp_path.unlink()
+        raise
+    if temp_path is not None:
+        with suppress(FileNotFoundError):
+            temp_path.unlink()
+    try:
+        verified_text = read_text(path)
+    except FileNotFoundError as exc:
+        raise LockBusyError(
+            f"Refusing to continue because create-only evidence {path} disappeared."
+        ) from exc
+    if verified_text != text:
+        raise LockBusyError(
+            f"Refusing to continue because create-only evidence {path} did not verify."
+        )
 
 
 def restore_text_snapshot(path: Path, *, existed: bool, text: str) -> None:

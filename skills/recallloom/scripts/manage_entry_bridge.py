@@ -47,7 +47,10 @@ from _common import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Preview, apply, or remove RecallLoom thin bridges in root entry files."
+        description=(
+            "Preview adding, updating, or removing RecallLoom thin bridges in root entry "
+            "files. Bridge apply is currently unsupported and blocked."
+        )
     )
     parser.add_argument(
         "path",
@@ -68,12 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remove",
         action="store_true",
-        help="Remove RecallLoom managed bridge blocks instead of adding or updating them.",
+        help="Preview removal of managed bridge blocks instead of an add/update preview.",
     )
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Apply the change. Without this flag, the script runs in preview mode.",
+        help=(
+            "Legacy bridge-apply confirmation flag. It is currently unsupported and blocked; "
+            "the script remains preview-only."
+        ),
     )
     parser.add_argument(
         "--json",

@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 
 from core.provenance.evidence import (
+    ActualDailyLogCursorEvidence,
     bounded_current_helper_evidence_check,
+    capture_actual_daily_log_cursor_evidence,
     current_config_marker_consistency_check,
     current_receipt_required_file_keys,
 )
@@ -41,7 +43,6 @@ from _common import (
     exit_with_cli_error,
     find_recallloom_root,
     invalid_iso_like_daily_log_files,
-    latest_active_daily_log_cursor,
     load_workspace_state,
     now_iso_timestamp,
     public_json_payload,
@@ -309,12 +310,16 @@ def config_marker_guard_check(
     *,
     storage_root: Path,
     state: dict,
+    state_text: str,
     daily_log_cursor: dict[str, object] | None = None,
+    actual_daily_log_cursor_evidence: ActualDailyLogCursorEvidence | None = None,
 ) -> dict[str, object]:
     required_file_keys = current_receipt_required_file_keys(
         storage_root=storage_root,
         state=state,
+        state_text=state_text,
         daily_log_cursor=daily_log_cursor,
+        actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
     )
     config_guard = current_config_marker_consistency_check(
         storage_root=storage_root,
@@ -357,6 +362,7 @@ def evaluate_cursor_repair_provenance(
     state_text: str,
     current_cursor: dict[str, object],
     expected_cursor: dict[str, object],
+    actual_daily_log_cursor_evidence: ActualDailyLogCursorEvidence | None,
     timestamp: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
     evidence_check = bounded_current_helper_evidence_check(
@@ -367,6 +373,7 @@ def evaluate_cursor_repair_provenance(
         helper_evidenced_only=False,
         require_config_guard=True,
         daily_log_cursor=expected_cursor,
+        actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
     )
     provenance_facts = provenance_facts_from_state(state, review_intent=True)
     receipt_store_present = (storage_root / RECEIPT_STORE_RELATIVE_PATH).is_file()
@@ -506,7 +513,13 @@ def load_repair_view(
     *,
     state_path: Path,
     storage_root: Path,
-) -> tuple[str, dict, dict[str, object], dict[str, object]]:
+) -> tuple[
+    str,
+    dict,
+    dict[str, object],
+    dict[str, object],
+    ActualDailyLogCursorEvidence | None,
+]:
     state_text = read_text(state_path)
     state = load_workspace_state(state_path)
     invalid_daily_logs = invalid_iso_like_daily_log_files(storage_root / DAILY_LOGS_DIRNAME)
@@ -517,9 +530,16 @@ def load_repair_view(
             message="Refusing cursor repair because an active daily-log filename is not a valid ISO date.",
             details={"latest_file": first},
         )
-    expected = cursor_from_calculation(latest_active_daily_log_cursor(storage_root))
+    actual_cursor, actual_daily_log_cursor_evidence = (
+        capture_actual_daily_log_cursor_evidence(
+            storage_root=storage_root,
+            state=state,
+            state_text=state_text,
+        )
+    )
+    expected = cursor_from_calculation(actual_cursor)
     current = cursor_from_state(state)
-    return state_text, state, current, expected
+    return state_text, state, current, expected, actual_daily_log_cursor_evidence
 
 
 def print_payload(payload: dict[str, object], *, json_mode: bool) -> None:
@@ -650,7 +670,13 @@ def main() -> None:
 
     if not args.apply:
         try:
-            state_text, state, current, expected = load_repair_view(
+            (
+                state_text,
+                state,
+                current,
+                expected,
+                actual_daily_log_cursor_evidence,
+            ) = load_repair_view(
                 state_path=state_path,
                 storage_root=workspace.storage_root,
             )
@@ -689,6 +715,7 @@ def main() -> None:
                 state_text=state_text,
                 current_cursor=current,
                 expected_cursor=expected,
+                actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
                 timestamp=now_iso_timestamp(),
             )
             if not provenance_decision.get("allowed"):
@@ -721,7 +748,13 @@ def main() -> None:
 
     try:
         with workspace_write_lock(workspace.project_root, "repair_daily_log_cursor.py"):
-            state_text, state, current, expected = load_repair_view(
+            (
+                state_text,
+                state,
+                current,
+                expected,
+                actual_daily_log_cursor_evidence,
+            ) = load_repair_view(
                 state_path=state_path,
                 storage_root=workspace.storage_root,
             )
@@ -769,7 +802,9 @@ def main() -> None:
                 evidence_check = config_marker_guard_check(
                     storage_root=workspace.storage_root,
                     state=state,
+                    state_text=state_text,
                     daily_log_cursor=expected,
+                    actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
                 )
                 evidence_block_reason_code = evidence_check.get("evidence_block_reason_code")
                 if isinstance(evidence_block_reason_code, str):
@@ -803,6 +838,7 @@ def main() -> None:
                     timestamp=repair_timestamp,
                     current_cursor=current,
                     expected_cursor=expected,
+                    actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
                 )
                 if not provenance_decision.get("allowed"):
                     exit_with_provenance_refusal(

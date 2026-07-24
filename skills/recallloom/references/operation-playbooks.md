@@ -40,10 +40,10 @@ That means:
 
 ## Write Protocol Red Lines
 
-- For managed sidecar writes, use the concrete helper scripts. Do not bypass them with blind file replacement, blind patching, or by hand-building sidecar files.
-- If a helper write fails, follow this order: diagnose the failure, fix the cause, retry the helper, then surface or return the helper's blocked failure contract if the helper still cannot complete.
+- For normal managed sidecar mutations, use the applicable dispatcher surface: `write` for managed-file writes, `append` for daily-log entries, `sync-current-state-after-append` only when its post-append contract requires that lane, and `repair-daily-log-cursor` for cursor repair. The dispatcher invokes its internal helpers. Do not bypass it with blind file replacement, blind patching, hand-built sidecar files, or hand-invoked internal helpers.
+- If a dispatched write fails, follow this order: diagnose the failure, fix the cause, obtain fresh dispatcher context, retry the dispatcher operation, then surface or return its blocked failure contract if it still cannot complete.
 - Never hand-edit `STORAGE_ROOT/state.json` or `STORAGE_ROOT/config.json`. This includes `.recallloom/state.json` and `.recallloom/config.json`.
-- For overwrite-style managed files, use revision-aware helper commits and do not use blind file replacement.
+- For overwrite-style managed files, use dispatcher `write`, which performs the revision-aware internal commit; do not use blind file replacement.
 
 ## Public Surface Boundary
 
@@ -77,11 +77,18 @@ RecallLoom Core stays non-invasive by default.
 - Use `ask` for legacy review / repair import or reviewed imported baseline
   actions; require explicit operator confirmation before higher-risk writes.
 - Use `block` for forged markers, detected receipt/store inconsistency, direct
-  `state.json` / `config.json` edits, privacy violations, and any state
-  classified as `inconsistent_or_tampered_evidence`.
-- `block` is non-waivable. Recovery guidance should point to validate and the
-  canonical recovery proposal/review/promotion helpers, not manual sidecar
-  editing.
+  `state.json` / `config.json` edits, privacy violations, and any general,
+  legacy, or unbound state classified as `inconsistent_or_tampered_evidence`.
+- A general, legacy, or unbound `inconsistent_or_tampered_evidence` mutating
+  block is non-waivable. Use structural validation and the bounded current
+  provenance check; do not edit the sidecar, treat it as retryable, or use a
+  legacy recovery route to bypass the block.
+- D5 is the only narrow transition from that failure family: it requires
+  helper-path evidence that is contract-valid for the current D5 schema, for a target-only post-hash read
+  failure or mismatch, an exact failure-time state match, and the fresh
+  binding, proposal, review, and expected-binding promotion checks. It is not a
+  waiver and does not prove cryptographic authorship. After promotion, run
+  fresh validate, status, and preflight before the first write.
 - Do not present remote services, host memory, plugins, MCP, hooks, or wrappers
   as authority for local helper evidence.
 - In the current package line, receipt-backed mutation covers
@@ -271,22 +278,188 @@ They are not project facts and should not be copied into a workspace sidecar.
 Before a helper proceeds, it may perform the daily package-support check described in `package-support-policy.md`.
 
 - `supported` and `upgrade_recommended` do not block actions
-- `unknown_offline` allows diagnostic and read-only actions, but blocks mutating helpers until support can be verified
+- offline with no support cache returns `unknown_offline` and allows local diagnostic, read-only, and mutating actions; network access is not a local-use prerequisite
+- a structurally valid stale cache is re-evaluated against the current package version and continues its cached support restriction offline
+- an invalid or uninterpretable cache is distinct from a missing cache and permits diagnostic actions only while offline
+- a valid online advisory takes precedence over an invalid cache, atomically repairs it, and returns a machine-readable cache-repaired diagnostic
+- invalid-cache `package_support` guidance uses public-safe machine reasons and directs the operator to a read-only diagnostic, online refresh and atomic replacement, or removal of the invalid package-scoped local cache before retrying; it does not treat package upgrade as cache repair or claim tampering
+- malformed online or configured advisory input remains `invalid_support_advisory`; correct or refresh the advisory instead of applying invalid-cache cleanup guidance
 - `readonly_only` blocks mutating helpers but permits diagnostic and read-only helpers
 - `diagnostic_only` permits diagnostic helpers only
 - dispatcher may share the same-day support payload through `RECALLLOOM_SUPPORT_STATE_JSON`, but child helpers still authorize from cache or advisory state instead of trusting env payloads alone
 - support cache is user-scoped and package-path-scoped, never stored in the project sidecar
+- the cache is structurally validated but non-authenticated local policy data; it does not resist a local writer and is not a permission boundary, tamper-proof record, or authenticated remote witness
 
 If a package support gate blocks the action, stop and surface the returned failure contract instead of falling back to manual file edits.
 
 When deterministic write safety matters, use this flow:
 
-1. run `preflight_context_check.py` for the default quick path, or `preflight_context_check.py --full` when you intentionally want the heavier workspace artifact scan
-2. prepare the content change outside the managed file
-3. use `commit_context_file.py` for `rolling_summary.md`, `context_brief.md`, or `update_protocol.md`
-4. use `append_daily_log_entry.py` for daily-log milestone entries
+1. prepare the content change outside the managed file
+2. use dispatcher `write` for `rolling_summary.md`, `context_brief.md`, or
+   `update_protocol.md`
+3. use dispatcher `append` for a daily-log milestone entry
+4. let the dispatcher run its fresh preflight and invoke its internal helper
+   only after the relevant gates authorize the operation
 
-In the current package line, those revision-aware write helpers do not independently reread `update_protocol.md` before every write.
+For normal operations, use only the applicable dispatcher surface: managed-file
+writes and daily-log entries use `write` and `append`, while
+`sync-current-state-after-append` is used only when its post-append contract
+requires that lane. Do not invoke `commit_context_file.py` or
+`append_daily_log_entry.py` by hand. Those helpers
+are internal dispatcher/integration surfaces. Dispatcher runs its own fresh
+preflight, constructs the binding, and persists the matching lease immediately
+before calling a helper. A read-only `preflight_context_check.py <project>
+--json` result does not issue either material, and there is no independent
+operator binding/lease pickup interface. A hand-invoked helper without the
+still-current dispatcher-issued material is expected to fail; do not synthesize,
+copy from preflight output, reuse, or amend it.
+For the first write from `review_imported_baseline`, use dispatcher `write` or
+`append` with the existing `--confirm-review-imported-baseline` confirmation;
+the dispatcher issues the confirmation-bound binding plus matching lease. The
+existing `sync-current-state-after-append` lane also accepts that confirmation
+when its own post-append contract requires it. The internal helpers do not
+accept a confirmation flag and only consume dispatcher-issued material.
+
+### D5 Human Material And Promotion
+
+Use this lane only after `recallloom.py validate <project> --json
+--require-provenance --changed-only` returns a current D5
+`inconsistent_review_binding_digest`. The validation is read-only. If it does
+not return that digest, remains blocked, or later changes, do not stage or
+promote D5 material.
+
+Prepare complete proposal and review documents. The following copyable
+skeletons include every ordinary required heading, the ordinary promotion-target
+and hint-only checks, and exactly one D5 JSON fenced block in its required
+section. Replace every angle-bracket placeholder with public-safe, human-reviewed
+content. The `accept` review example is valid only after the operator has
+actually completed the human review; do not use it to choose an outcome
+automatically.
+
+Proposal skeleton:
+
+````markdown
+# Source summary
+
+<public-safe summary of the current D5 evidence>
+
+# Source type and confidence
+
+<human assessment of source type and confidence>
+
+# Candidate current-state facts
+
+<candidate fact, or none>
+
+# Candidate milestone events
+
+<candidate event, or none>
+
+# Candidate judgment reversals
+
+<candidate reversal, or none>
+
+# Candidate next-step changes
+
+<candidate next step, or none>
+
+# Conflicts with current sidecar
+
+<identified conflict, or none>
+
+# Suggested promotion actions
+
+Target: rolling_summary.md
+
+```json
+{
+  "schema_version": "1.0",
+  "material_type": "inconsistent_recovery_proposal",
+  "inconsistent_review_binding_digest": "sha256:<64-lowercase-hex>",
+  "proposed_action": "accept_current_target_as_reviewed_baseline"
+}
+```
+
+# Review conclusion
+
+<human review is required before any promotion>
+````
+
+The proposal's D5 block must remain under `Suggested promotion actions` (or
+`建议提升动作`) and have exactly these keys:
+
+```json
+{
+  "schema_version": "1.0",
+  "material_type": "inconsistent_recovery_proposal",
+  "inconsistent_review_binding_digest": "sha256:<64-lowercase-hex>",
+  "proposed_action": "accept_current_target_as_reviewed_baseline"
+}
+```
+
+Review skeleton (use its `accept` values only after human review has accepted
+the same bound material):
+
+````markdown
+# Proposal reference
+
+<staged proposal filename>
+
+# Review outcome
+
+accept
+
+# Approved items
+
+<human-approved item>
+
+# Rejected items
+
+<none, or a human-rejected item>
+
+# Promotion status
+
+No items remain hint-only.
+
+```json
+{
+  "schema_version": "1.0",
+  "material_type": "inconsistent_recovery_review",
+  "inconsistent_review_binding_digest": "sha256:<64-lowercase-hex>",
+  "decision": "accept",
+  "accept_current_target_as_reviewed_baseline": true
+}
+```
+
+# Next action
+
+<run promotion only when this complete review is accepted>
+````
+
+The review D5 block must remain under `Promotion status` (or `提升状态`) and
+have exactly these keys. For promotion, its digest must be character-for-character
+the same as the proposal digest, and its ordinary review outcome must also
+classify as `accept`.
+
+Unknown or duplicate keys, a duplicate D5 block, a block in another section,
+or free text used instead of this JSON block are rejected. Stage the prepared
+proposal, then record the prepared review and promote in the same command:
+
+```bash
+python skills/recallloom/scripts/stage_recovery_proposal.py <project> \
+  --source-file <prepared-d5-proposal.md> --json
+
+python skills/recallloom/scripts/record_recovery_review.py <project> \
+  --proposal-file <staged-proposal-file> \
+  --source-file <prepared-d5-review.md> \
+  --expected-inconsistent-review-binding-digest sha256:<64-lowercase-hex> \
+  --json
+```
+
+`<staged-proposal-file>` is the staged filename returned by the first command,
+and the digest in the second command and both JSON blocks is the exact current
+digest returned by validation. Any target, state, store, revision, material, or
+binding change blocks promotion with no state promotion.
 
 ## End-of-Day Update
 
@@ -330,14 +503,20 @@ Archive old daily logs when:
 
 Archived logs should remain retrievable on demand, but fall out of the default cold-start path.
 
-Archive actions should be preview-first.
+Archive is preview-only in the current public package contract. Do not move
+files or present an archive apply command as available until archive has its own
+receipt-backed contract.
 
 Recommended behavior:
 
 - preview targets first
-- require explicit confirmation before moving files
-- refuse the whole operation if archive-target collisions are detected
+- refuse the preview if archive-target collisions are detected
 - if `update_protocol.md` exists, surface it for review before archiving
+
+Bridge work follows the same public boundary: use dispatcher `bridge` only for
+preview and review the candidate target. Do not document or rely on
+`bridge --yes`; bridge apply is not a supported public operation in this
+package line.
 
 ## Daily-log Cursor Repair
 

@@ -70,11 +70,12 @@ _SENSITIVE_FIELD_NAMES = {
     "token",
 }
 _TRAILING_PATH_PUNCTUATION = ".,:;!?)]}"
+_REDACTED_PATH_LABEL = "redacted-path"
 _QUOTED_PATH_PATTERN = re.compile(
-    r"(?P<quote>[\"'])(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/]|\\\\\\\\)[^\"']+)(?P=quote)"
+    r"(?P<quote>[\"'])(?P<path>(?<![A-Za-z0-9._-])(?:~[\\/]|/|[A-Za-z]:[\\\\/]|\\\\(?=[^\\/\s\"']+\\[^\\/\s\"']+))[^\"']+)(?P=quote)"
 )
 _UNQUOTED_PATH_PATTERN = re.compile(
-    r"(?P<path>(?<![A-Za-z0-9._-])(?:~|/|[A-Za-z]:[\\\\/]|\\\\\\\\)\S+)"
+    r"(?P<path>(?<![A-Za-z0-9._-])(?:~[\\/]|/|[A-Za-z]:[\\\\/]|\\\\(?=[^\\/\s\"']+\\[^\\/\s\"']+))\S+)"
 )
 _LOCAL_ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![A-Za-z0-9._:/\\-])(?:"
@@ -122,17 +123,20 @@ def public_project_path(
 ) -> str | None:
     if path is None:
         return None
-    root = _resolve_path(Path(project_root).expanduser())
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    resolved = _resolve_path(candidate)
-    if resolved == root:
-        return public_project_root_label(root)
     try:
-        return resolved.relative_to(root).as_posix()
-    except ValueError:
-        return resolved.name or candidate.name or resolved.as_posix()
+        root = _resolve_path(Path(project_root).expanduser())
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = _resolve_path(candidate)
+        if resolved == root:
+            return public_project_root_label(root)
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            return resolved.name or candidate.name or resolved.as_posix()
+    except (TypeError, ValueError, RuntimeError, OSError):
+        return _REDACTED_PATH_LABEL
 
 
 def display_project_root_label(
@@ -174,7 +178,7 @@ def _portable_foreign_path_label(raw_path: str) -> str | None:
     ):
         return None
     parts = [part for part in raw_path.replace("\\", "/").split("/") if part]
-    return parts[-1] if parts else "redacted-path"
+    return parts[-1] if parts else _REDACTED_PATH_LABEL
 
 
 def _publicize_path_fragment(

@@ -38,7 +38,12 @@ from _common import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Archive old RecallLoom daily logs.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Preview candidates for archiving old RecallLoom daily logs. Archive apply is "
+            "currently unsupported and blocked."
+        )
+    )
     parser.add_argument("path", nargs="?", default=".", help="Project path or a descendant path.")
     parser.add_argument(
         "--max-active",
@@ -53,7 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Perform the archive move. Without this flag, the script only reports what would be archived.",
+        help=(
+            "Legacy archive-apply confirmation flag. It is currently unsupported and blocked; "
+            "the script remains preview-only."
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser

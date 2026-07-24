@@ -121,11 +121,13 @@ from core.continuity.freshness import (
     summary_matches_empty_shell_template as shared_summary_matches_empty_shell_template,
 )
 from core.continuity.workday import (
+    DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
     RECOMMENDATION_TYPES,
     build_workday_decision,
     describe_workday_guidance,
     detect_closure_signal,
 )
+from core.failure.contracts import canonical_detail_reason_contract
 from core.output.user_status import print_user_summary, read_surface_user_summary
 from core.trust.state import evaluate_trust_state
 from core.provenance.evidence import (
@@ -139,6 +141,10 @@ from core.provenance.state import (
     expected_revisions_payload,
     provenance_facts_from_state,
     provenance_contract_identity,
+)
+from core.provenance.inconsistent_review import (
+    INCONSISTENT_REVIEW_EVIDENCE_KEY,
+    evaluate_current_inconsistent_review_orphan,
 )
 from core.protocol.contracts import FILE_KEYS
 from core.protocol.markers import parse_file_state_marker
@@ -202,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rollover-hour",
         type=int,
-        default=3,
+        default=DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
         help="Logical day rollover hour in 24-hour form. Defaults to 3.",
     )
     parser.add_argument(
@@ -571,6 +577,8 @@ def main() -> None:
             ),
         )
     startup_residue_report = None
+    inconsistent_review_result = None
+    inconsistent_review_target_file_key = None
 
     try:
         summary_path = workspace.storage_root / FILE_KEYS["rolling_summary"]
@@ -614,6 +622,28 @@ def main() -> None:
                     default_reason="damaged_sidecar",
                     extra=strict_gate_status_failure_extra(workspace),
                 ),
+            )
+        provenance_metadata = state.get("provenance") if isinstance(state, dict) else None
+        if (
+            args.json
+            and isinstance(provenance_metadata, dict)
+            and provenance_metadata.get("state_label")
+            == "inconsistent_or_tampered_evidence"
+            and INCONSISTENT_REVIEW_EVIDENCE_KEY in provenance_metadata
+        ):
+            inconsistent_review_evidence = provenance_metadata.get(
+                INCONSISTENT_REVIEW_EVIDENCE_KEY
+            )
+            if isinstance(inconsistent_review_evidence, dict):
+                target_file_key = inconsistent_review_evidence.get("target_file_key")
+                if isinstance(target_file_key, str):
+                    inconsistent_review_target_file_key = target_file_key
+            state_text = read_text(workspace.storage_root / FILE_KEYS["state"])
+            inconsistent_review_result = evaluate_current_inconsistent_review_orphan(
+                project_root=workspace.project_root,
+                storage_root=workspace.storage_root,
+                state=state,
+                state_text=state_text,
             )
 
         context_brief_path = workspace.storage_root / FILE_KEYS["context_brief"]
@@ -764,7 +794,10 @@ def main() -> None:
             preferred_date=preferred_date,
             session_intent=args.session_intent,
             project_time_policy_cues=project_time_policy_cues,
-            host_explicit=args.timezone is not None or args.rollover_hour != 3,
+            host_explicit=(
+                args.timezone is not None
+                or args.rollover_hour != DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR
+            ),
         )
         workday.update(
             {
@@ -835,6 +868,7 @@ def main() -> None:
             review_required=provenance_facts["review_required"],
             review_imported_baseline=provenance_facts["review_imported_baseline"],
             helper_evidenced_baseline=provenance_facts["helper_evidenced"],
+            unproven_sidecar_state=provenance_facts["unproven_sidecar_state"],
             metadata_status=provenance_facts["metadata_status"],
         )
         read_plan = build_status_read_plan(
@@ -879,19 +913,39 @@ def main() -> None:
             ),
         )
 
+    fast_lane_contract = {
+        "read_only": True,
+        "attach_safe": True,
+        "receipt_store_audit_performed": False,
+        "receipt_chain_scan_performed": False,
+        "daily_log_content_read": bool(args.expanded and latest_daily_log is not None),
+        "context_brief_read": bool(args.expanded and context_brief_path.is_file()),
+        "update_protocol_read": bool(args.expanded and update_protocol_path.is_file()),
+        "startup_scratch_scan_performed": False,
+    }
+    if inconsistent_review_result is not None:
+        fast_lane_contract["receipt_store_audit_performed"] = (
+            inconsistent_review_result.receipt_store_snapshot_performed
+        )
+        fast_lane_contract["inconsistent_review_binding_evaluation_performed"] = True
+        fast_lane_contract["inconsistent_review_target_read_performed"] = (
+            inconsistent_review_result.target_read_performed
+        )
+        fast_lane_contract["inconsistent_review_material_scan_performed"] = (
+            inconsistent_review_result.material_scan_performed
+        )
+        if inconsistent_review_result.target_read_performed:
+            if inconsistent_review_target_file_key == "daily_log":
+                fast_lane_contract["daily_log_content_read"] = True
+            elif inconsistent_review_target_file_key == "context_brief":
+                fast_lane_contract["context_brief_read"] = True
+            elif inconsistent_review_target_file_key == "update_protocol":
+                fast_lane_contract["update_protocol_read"] = True
+
     payload = {
         "schema_version": "1.1",
         "status_mode": "expanded" if args.expanded else "fast",
-        "fast_lane_contract": {
-            "read_only": True,
-            "attach_safe": True,
-            "receipt_store_audit_performed": False,
-            "receipt_chain_scan_performed": False,
-            "daily_log_content_read": bool(args.expanded and latest_daily_log is not None),
-            "context_brief_read": bool(args.expanded and context_brief_path.is_file()),
-            "update_protocol_read": bool(args.expanded and update_protocol_path.is_file()),
-            "startup_scratch_scan_performed": False,
-        },
+        "fast_lane_contract": fast_lane_contract,
         "project_root": public_project_root,
         "storage_root": public_storage_root,
         "timezone": zone_label,
@@ -964,6 +1018,37 @@ def main() -> None:
     )
     payload["user_visible_category"] = user_summary["category"]
     payload["user_summary"] = user_summary
+    if inconsistent_review_result is not None:
+        if inconsistent_review_result.status == "exact_orphan":
+            diagnostic_reason = (
+                "post_hash_inconsistent_review_promotion_not_committed"
+            )
+        elif inconsistent_review_result.status == "current_no_orphan":
+            diagnostic_reason = "post_hash_inconsistent_review_eligible"
+        else:
+            diagnostic_reason = "post_hash_inconsistent_review_binding_changed"
+        route = canonical_detail_reason_contract(diagnostic_reason, language="en") or {}
+        diagnostic_details = {
+            "reason_code": diagnostic_reason,
+            "safe_to_retry": False,
+            "side_effect": "none",
+            "next_action": route.get("next_action"),
+        }
+        if inconsistent_review_result.status in {
+            "current_no_orphan",
+            "exact_orphan",
+        }:
+            diagnostic_details["inconsistent_review_binding"] = (
+                inconsistent_review_result.binding
+            )
+            diagnostic_details["inconsistent_review_binding_digest"] = (
+                inconsistent_review_result.binding_digest
+            )
+        payload["details"] = diagnostic_details
+        payload["write_readiness"]["next_action"] = route.get(
+            "suggestion",
+            route.get("next_action"),
+        )
 
     if args.json:
         if startup_residue_report is not None:

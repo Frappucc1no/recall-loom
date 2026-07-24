@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from urllib.parse import unquote, urlsplit
 
-INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u2060\u2066-\u2069\ufeff]")
+INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
 SAFE_REMOTE_URL_RE = re.compile(r"\bhttps?://[^\s`\"'<>]+", re.I)
 PATH_TOKEN_BOUNDARY = r"(?=$|[\s`\"'<>.,;:!?)\]}])"
 PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~%-]+$")
