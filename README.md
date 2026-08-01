@@ -124,9 +124,9 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.8.3`
-- protocol version: `1.0`
-- supported protocol versions:
+- 包版本：`0.4.8.3`
+- 协议版本：`1.0`
+- 当前支持的协议版本：
   - `1.0`
 <!-- RecallLoom metadata sync end: package-metadata -->
 
@@ -136,11 +136,11 @@ rl-init
 <summary>使用环境与入口</summary>
 
 <!-- RecallLoom metadata sync start: runtime-assumptions -->
-- Python 3.10 or newer
-- supported workspace languages:
+- Python 版本要求：`3.10` 及以上
+- 支持的工作区语言：
   - `en`
   - `zh-CN`
-- supported bridge targets:
+- 支持的入口桥接文件：
   - `AGENTS.md`
   - `CLAUDE.md`
   - `GEMINI.md`
