@@ -2177,7 +2177,6 @@ def _enforce_append_preflight_gate(
                 "stage_recovery_proposal.py",
                 "record_recovery_review.py",
                 "prepare_recovery_promotion.py",
-                "preflight_context_check.py",
             ],
         },
     )
@@ -2636,7 +2635,11 @@ def _post_append_sync_review_summary(*, reason_code: str) -> dict:
             reason_code,
             "The post-append closeout contract is not safe enough for automatic sync.",
         ),
-        next_step="Rerun preflight and review the post-append closeout state before writing.",
+        next_step=(
+            "Rerun preflight, then use the official escape: recallloom.py write "
+            "<project-path> --type current-state with the reviewed current-state input. "
+            "Retry this sync command only when preflight allows a single append delta."
+        ),
     )
 
 
@@ -2708,6 +2711,66 @@ def _post_append_sync_retry_payload(
     }
 
 
+def _post_append_sync_escape_payload(
+    args: argparse.Namespace,
+    *,
+    input_mode: str,
+) -> dict:
+    writer_args: list[str] = []
+    writer_fields: dict[str, str | bool] = {}
+    if args.writer_id is not None:
+        safe_writer_id = normalize_safe_writer_id(args.writer_id)
+        writer_arg = safe_writer_id or "same_explicit_writer_id"
+        writer_args = ["--writer-id", writer_arg]
+        writer_fields = {
+            "writer_id_source": "explicit_cli",
+            "writer_id_ref": "same_explicit_writer_id",
+            "writer_id_public_safe": safe_writer_id is not None,
+        }
+        if safe_writer_id is not None:
+            writer_fields["writer_id"] = safe_writer_id
+
+    if input_mode == "reuse-current-summary":
+        escape_input_mode = "file"
+        input_ref = "prepared_reviewed_current_state_file"
+        input_format = "markdown"
+        input_contract = "managed_markdown_write"
+        input_args = ["--source-file", "prepared_reviewed_current_state_file"]
+    else:
+        escape_input_mode = "stdin"
+        input_ref = "resubmit_same_stdin_payload"
+        input_format = "json"
+        input_contract = "json-stdin"
+        input_args = ["--stdin", "--input-format", "json"]
+    if args.max_input_bytes is not None:
+        input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    if getattr(args, "confirm_review_imported_baseline", False):
+        input_args.append("--confirm-review-imported-baseline")
+    return {
+        "command": "recallloom.py write",
+        "project_ref": "same_project",
+        "write_type": "current-state",
+        "file_key": "rolling_summary",
+        "input_mode": escape_input_mode,
+        "input_ref": input_ref,
+        "input_format": input_format,
+        "input_contract": input_contract,
+        "argv_template": [
+            "recallloom.py",
+            "write",
+            "same_project",
+            "--type",
+            "current-state",
+            *input_args,
+            *writer_args,
+            "--json",
+        ],
+        "requires_repair_command_first": True,
+        "side_effect": "none_until_preflight_allows_current_state_write",
+        **writer_fields,
+    }
+
+
 def _post_append_sync_failure_payload(
     args: argparse.Namespace,
     *,
@@ -2746,10 +2809,12 @@ def _post_append_sync_failure_payload(
         "user_summary": user_summary,
         "user_message": "Post-append summary sync is not allowed for the current sidecar state.",
         "operator_note": (
-            "Rerun preflight and only retry this command when the post_append_summary_sync "
-            "contract is allowed for a single append delta."
+            "Official escape: rerun preflight, then run recallloom.py write "
+            "<project-path> --type current-state with the reviewed current-state input. "
+            "Only retry this sync command when the post_append_summary_sync contract "
+            "allows a single append delta."
         ),
-        "next_actions": ["rerun_preflight", "review_post_append_summary_sync_contract"],
+        "next_actions": ["rerun_preflight", "write_current_state_via_dispatcher"],
         "single_next_command": "recallloom.py status <project-path> --json",
         "safe_to_retry": False,
         "append_cursor": append_cursor if isinstance(append_cursor, dict) else None,
@@ -2760,7 +2825,7 @@ def _post_append_sync_failure_payload(
             else None
         ),
         "ordinary_write_gate": ordinary_write_gate if isinstance(ordinary_write_gate, dict) else None,
-        "retry_payload": _post_append_sync_retry_payload(args, input_mode=input_mode),
+        "retry_payload": _post_append_sync_escape_payload(args, input_mode=input_mode),
     }
 
 
@@ -3499,7 +3564,9 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
             return
         message = (
             "Preflight did not authorize post-append current-state summary sync "
-            f"for this sidecar state: {reason_code}."
+            f"for this sidecar state: {reason_code}. "
+            "Official escape: rerun preflight, then refresh current state with "
+            "recallloom.py write <project-path> --type current-state."
         )
         payload = _post_append_sync_failure_payload(
             args,

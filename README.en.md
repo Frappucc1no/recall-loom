@@ -12,7 +12,7 @@
 
 <p>RecallLoom is a file-based project memory layer for AI collaboration. It stores background, progress, key decisions, and next steps in Markdown / JSON files beside or inside the project, with no database, RAG layer, or background service required; the next session, model, or tool can more easily start from the current state.</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.8.2-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.4.8.3-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 <summary>Version and compatibility</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.8.2`
+- package version: `0.4.8.3`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -311,6 +311,7 @@ Detailed script entrypoints, protocol notes, and file contracts live in [`USAGE.
 
 | Version | Highlights | User value |
 |---|---|---|
+| `v0.4.8.3` | Windows write-recovery hotfix: a leftover lock file on Windows no longer makes every later write fail with a misleading error, and when the workspace enters the stale-summary locked state, failure output now names the official recovery path and the concrete reason code | Windows users are no longer permanently stuck by one stale lock file; when a write is blocked, the cause and the way out are visible directly, without modifying the installed package or sidecar files |
 | `v0.4.8.2` | Narrow legacy reviewed-baseline compatibility fix: full provenance validation now verifies the exact proposal and review material for an ordinary pre-D5 `review_imported_baseline` instead of treating it as current receipt evidence | No sidecar migration or historical receipt rewrite; the first mutation still requires explicit confirmation, and changed or missing review material remains blocked |
 | `v0.4.8.1` | Narrow upgrade-compatibility hotfix: `v0.4.8` now accepts legitimate finalized receipts created by the public `v0.4.6.2-v0.4.7` recording implementation; unknown receipt identities remain rejected | Projects recorded normally with those earlier versions no longer look like damaged receipt stores after upgrade; no sidecar migration or historical receipt rewrite is required |
 | `v0.4.8` | Reliability hardening for sequential writes and recovery: initialized multi-file workspaces no longer deadlock on partial receipt state; failures route into safe retry, review-required, or stop paths; local work continues when version checks are offline; approximate-text path detection, legitimate symlink handling, bidi controls, and logical-workday boundaries are corrected | More reliable recording after first attach, clearer next steps when something fails, local work remains available during temporary advisory outages, and real paths or legitimate project links are less likely to be exposed or blocked by mistake |

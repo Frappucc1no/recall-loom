@@ -41,7 +41,7 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.8.2`
+- package version: `0.4.8.3`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`

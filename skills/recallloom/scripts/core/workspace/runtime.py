@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import sys
 import tempfile
 
 from core.errors import (
@@ -457,9 +458,62 @@ def parse_lock_timestamp(value: str | None) -> datetime | None:
     return parsed
 
 
+# Windows process-liveness probe seam. On Windows os.kill(pid, 0) maps to
+# TerminateProcess for a live pid and raises OSError WinError 87 for a dead one,
+# so liveness is probed through OpenProcess/GetExitCodeProcess instead and
+# TerminateProcess is never called. Tests may monkeypatch _WINDOWS_PLATFORM to
+# force the Windows branch and pass a fake ctypes module to _pid_is_alive_windows.
+_WINDOWS_PLATFORM = sys.platform.startswith("win")
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_INVALID_PARAMETER = 87
+
+
+def _pid_is_alive_windows(pid: int, ctypes_module=None, wintypes_module=None) -> bool:
+    """Probe pid liveness via OpenProcess + GetExitCodeProcess.
+
+    Fail-safe mapping: only ERROR_INVALID_PARAMETER (pid does not exist) reports
+    dead; ERROR_ACCESS_DENIED or any other probe failure reports alive so a live
+    owner's lock is never reclaimed. ``ctypes_module`` is injectable for tests.
+    """
+    if ctypes_module is None:
+        import ctypes as ctypes_module
+    if wintypes_module is None:
+        from ctypes import wintypes as wintypes_module
+    try:
+        kernel32 = ctypes_module.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            wintypes_module.DWORD,
+            wintypes_module.BOOL,
+            wintypes_module.DWORD,
+        ]
+        kernel32.OpenProcess.restype = wintypes_module.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes_module.HANDLE,
+            ctypes_module.POINTER(wintypes_module.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes_module.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes_module.HANDLE]
+        kernel32.CloseHandle.restype = wintypes_module.BOOL
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes_module.get_last_error() != _ERROR_INVALID_PARAMETER
+        try:
+            exit_code = wintypes_module.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes_module.byref(exit_code)):
+                return True
+            return exit_code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return True
+
+
 def pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if _WINDOWS_PLATFORM:
+        return _pid_is_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -485,6 +539,12 @@ def reclaim_stale_workspace_lock(lock_path: Path) -> bool:
         return True
     except FileNotFoundError:
         return False
+    except PermissionError:
+        # A sharing violation or denied delete means the lock file may still be
+        # held open; treat the lock as busy and let LockBusyError surface.
+        if _WINDOWS_PLATFORM:
+            return False
+        raise
 
 
 @contextmanager

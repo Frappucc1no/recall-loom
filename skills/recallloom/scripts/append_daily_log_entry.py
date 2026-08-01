@@ -1207,7 +1207,8 @@ def enforce_provenance_write_gate(
     reason = helper_write_gate_failure_reason(gate)
     message = (
         "Refusing to append because this RecallLoom sidecar requires provenance review "
-        "or a fresh preflight binding before any mutating helper write."
+        "or a fresh preflight binding before any mutating helper write "
+        f"(reason_code: {gate['blocked_reason_code']})."
     )
     exit_with_failure_contract(
         parser,

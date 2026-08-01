@@ -12,7 +12,7 @@
 
 <p>RecallLoom 是给 AI 协作使用的文件化项目记忆层：把背景、进展、关键决策和下一步保存到项目旁边/项目内的 Markdown / JSON 文件里，不需要数据库、RAG 或后台服务。换会话、换模型、换工具，下一次 AI 协作更容易接上当前状态。</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.8.2-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.4.8.3-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,9 +124,9 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- 包版本：`0.4.8.2`
-- 协议版本：`1.0`
-- 当前支持的协议版本：
+- package version: `0.4.8.3`
+- protocol version: `1.0`
+- supported protocol versions:
   - `1.0`
 <!-- RecallLoom metadata sync end: package-metadata -->
 
@@ -136,11 +136,11 @@ rl-init
 <summary>使用环境与入口</summary>
 
 <!-- RecallLoom metadata sync start: runtime-assumptions -->
-- Python 版本要求：`3.10` 及以上
-- 支持的工作区语言：
+- Python 3.10 or newer
+- supported workspace languages:
   - `en`
   - `zh-CN`
-- 支持的入口桥接文件：
+- supported bridge targets:
   - `AGENTS.md`
   - `CLAUDE.md`
   - `GEMINI.md`
@@ -311,6 +311,7 @@ RecallLoom 的工程原则很简单：项目事实留在项目里，AI 工具只
 
 | 版本 | 重点更新 | 对用户的价值 |
 |---|---|---|
+| `v0.4.8.3` | Windows 写入恢复热修复：修复 Windows 上残留锁文件会让之后所有写入失败并报错误导的问题；摘要落后过多进入锁定状态时，失败输出现在直接给出官方恢复路径和具体原因码 | Windows 用户不再被一个残留锁文件永久卡住；写入受阻时能直接看到原因和出路，无需改动安装包或 sidecar 文件 |
 | `v0.4.8.2` | 窄范围旧评审基线兼容修复：完整 provenance 校验现在会核对普通 pre-D5 `review_imported_baseline` 的精确提案与评审材料，而不会误按当前收据证据处理 | 无需迁移 sidecar 或重写历史 receipt；首次变更仍需明确确认，材料缺失或变化继续阻断 |
 | `v0.4.8.1` | 窄范围升级兼容热修复：`v0.4.8` 现在可以准确接受由公开 `v0.4.6.2-v0.4.7` recording 实现合法生成的 finalized receipt；未知 receipt identity 仍保持拒绝 | 使用旧版正常记录过项目记忆的用户升级后不会再被误判为 receipt store 损坏；无需迁移 sidecar 或重写历史 receipt |
 | `v0.4.8` | 连续写入与失败恢复根因修复：初始化后的多文件写入不再因半成品收据状态互相卡住；失败结果按可安全重试、需复核和不可继续路径分流；断网时本地工作仍可继续；修复约数文本误判路径、合法 symlink 误拦、bidi 控制符和逻辑工作日边界问题 | 首次接入后的连续记录更可靠，遇到异常时下一步更清楚；版本检查暂时不可用时不会把本地工作一并锁住；真实本地路径和合法项目链接更不容易被误报或回显 |

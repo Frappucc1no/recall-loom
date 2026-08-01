@@ -243,14 +243,14 @@ FAILURE_REASON_REGISTRY = {
         "recoverability": "retryable",
         "surface_level": "operator",
         "trust_effect": "review_required",
-        "next_actions": ["wait_for_active_writer", "retry_helper"],
+        "next_actions": ["wait_for_active_writer", "inspect_write_lock", "retry_helper"],
         "user_message": {
             "en": "Another RecallLoom write appears to be in progress.",
             "zh-CN": "当前似乎已有另一个 RecallLoom 写入正在进行。",
         },
         "operator_note": {
-            "en": "Wait for the active writer to finish, then retry. Only clear a stale lock after checking ownership and age.",
-            "zh-CN": "请等待当前写入完成后再重试；只有在确认锁已过期且归属清楚后，才清理 stale lock。",
+            "en": "Wait for the active writer to finish, then retry. Inspect the lock with unlock_write_lock.py (read-only by default) and only clear it with an explicit --yes after confirming it is stale.",
+            "zh-CN": "请等待当前写入完成后再重试。先用 unlock_write_lock.py 检查锁状态（默认只读），确认锁已过期后再显式使用 --yes 清理。",
         },
     },
     "malformed_managed_file": {
@@ -387,15 +387,14 @@ FAILURE_REASON_REGISTRY = {
             "stage_recovery_proposal.py",
             "record_recovery_review.py",
             "prepare_recovery_promotion.py",
-            "preflight_context_check.py",
         ],
         "user_message": {
             "en": "RecallLoom needs a continuity review before a higher-risk action can continue.",
             "zh-CN": "在继续更高风险动作前，需要先复核当前 RecallLoom continuity。",
         },
         "operator_note": {
-            "en": "Use the recovery proposal/review/promotion helpers, then rerun preflight before mutating sidecar state.",
-            "zh-CN": "请先使用 recovery proposal/review/promotion helpers，然后重新运行 preflight，再修改 sidecar state。",
+            "en": "Use the recovery proposal/review/promotion helpers before mutating sidecar state.",
+            "zh-CN": "请先使用 recovery proposal/review/promotion helpers，再修改 sidecar state。",
         },
     },
     "continuity_drift_review_required": {
@@ -1814,11 +1813,11 @@ def _failure_suggestion(
             language,
             en=(
                 "Use stage_recovery_proposal.py, record_recovery_review.py, "
-                "and prepare_recovery_promotion.py, then rerun preflight_context_check.py."
+                "and prepare_recovery_promotion.py for reviewed recovery."
             ),
             zh_cn=(
                 "请使用 stage_recovery_proposal.py、record_recovery_review.py "
-                "和 prepare_recovery_promotion.py，然后重新运行 preflight_context_check.py。"
+                "和 prepare_recovery_promotion.py 完成受控复核恢复。"
             ),
         )
     if reason == "review_imported_baseline_confirmation_required":
@@ -1836,8 +1835,15 @@ def _failure_suggestion(
     if reason == "write_lock_busy":
         return _localized_text(
             language,
-            en="Let the active writer finish, or inspect the lock and only clear it when you are sure it is stale.",
-            zh_cn="请等待当前写入完成，或者先检查锁状态；只有确认它已经过期时才清理。",
+            en=(
+                "Let the active writer finish, or inspect the lock with unlock_write_lock.py "
+                "(read-only by default) and only clear it with an explicit --yes when you are "
+                "sure it is stale."
+            ),
+            zh_cn=(
+                "请等待当前写入完成，或者先用 unlock_write_lock.py 检查锁状态（默认只读）；"
+                "只有确认它已经过期时才显式使用 --yes 清理。"
+            ),
         )
     if reason == "python_runtime_unavailable":
         if _python_runtime_stage(error) == "runtime_bootstrap":
@@ -1947,7 +1953,11 @@ def _failure_recovery_command(
     if reason == "write_lock_busy":
         if isinstance(project_root, str):
             return _script_command("unlock_write_lock.py", project_arg, "--json")
-        return "Wait for the active writer to finish, then rerun the helper after the lock clears."
+        return (
+            "Wait for the active writer to finish, then retry. Inspect the lock with "
+            "unlock_write_lock.py <project-path> --json (read-only by default) and only "
+            "clear it with an explicit --yes after confirming it is stale."
+        )
     if reason == "invalid_prepared_input":
         command = details.get("command") if details else None
         operation = details.get("operation") if details else None
@@ -2020,7 +2030,7 @@ def _failure_recovery_command(
             return _script_command("stage_recovery_proposal.py", project_arg, "--source-file", "<proposal.md>", "--json")
         return (
             "Use stage_recovery_proposal.py, record_recovery_review.py, and "
-            "prepare_recovery_promotion.py, then rerun preflight_context_check.py."
+            "prepare_recovery_promotion.py for reviewed recovery."
         )
     if reason == "review_imported_baseline_confirmation_required":
         return (
