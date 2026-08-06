@@ -5,83 +5,43 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime
-import hashlib
 import json
-import os
 from pathlib import Path
-import sys
 
 from core.continuity.workday import (
     DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
     logical_workday_for,
 )
-from core.failure.contracts import failure_payload, preferred_failure_language
+from core.failure.context import (
+    COMMAND_APPEND,
+    OPERATION_DAILY_LOG_APPEND,
+    STAGE_PREFLIGHT,
+    OperationContext,
+)
+from core.failure.contracts import failure_payload
 from core.output.privacy import publicize_json_value
-from core.protocol.contracts import FILE_KEYS, SECTION_KEYS
-from core.protocol.markers import (
-    daily_log_entry_marker,
-    file_marker,
-    parse_daily_log_scaffold_marker,
-    parse_file_marker,
-    section_marker,
-)
-from core.protocol.sections import (
-    duplicate_section_keys,
-    missing_section_keys,
-    unknown_section_keys,
-)
+from core.protocol.contracts import FILE_KEYS
 from core.provenance.bindings import (
     PreflightBindingLeaseError,
     verify_preflight_binding_lease,
 )
-from core.provenance.evidence import (
-    strict_gate_current_receipts_verified,
-    strict_sidecar_no_write_failure_extra_from_summary,
-    strict_sidecar_integrity_gate,
-    strict_sidecar_integrity_gate_public_summary,
-)
-from core.provenance.inconsistent_review import (
-    InconsistentReviewContractError,
-    build_inconsistent_review_evidence,
-)
-from core.provenance.receipts import RECEIPT_SCHEMA_VERSION, assert_public_safe_json, public_receipt_claim
+from core.provenance.receipts import assert_public_safe_json, public_receipt_claim
 from core.provenance.state import (
-    helper_evidenced_metadata,
-    helper_write_gate_failure_reason,
-    helper_write_gate_from_state,
-    inconsistent_evidence_metadata,
     provenance_contract_identity,
     preflight_write_binding_hash,
-    unproven_sidecar_metadata,
 )
-from core.provenance.store import (
-    RECEIPT_STORE_NOT_WRITTEN_VERIFIED,
-    ReceiptStoreError,
-    ReceiptStoreSnapshot,
-    capture_receipt_store_snapshot,
-    finalize_receipt_in_store,
-    receipt_store_snapshot_matches_current,
-)
-from core.safety.attached_text import scan_auto_attached_context_text
-from core.safety.prepared_input import (
-    PreparedInputSafetyError,
-    PreparedInputSource,
-    read_prepared_input_source_text,
-    validate_prepared_input_source_path,
-)
+from core.recording import daily_log_append
+from core.recording import transaction as recording_transaction
+from core.safety import input_transport
 
 from _common import (
-    atomic_write_and_verify_if_unchanged,
     cli_failure_payload,
     cli_failure_payload_for_exception,
     ConfigContractError,
-    DAILY_LOG_ENTRY_RE,
     DAILY_LOGS_DIRNAME,
     DailyLogCursorError,
     EnvironmentContractError,
-    LockBusyError,
     StorageResolutionError,
-    canonicalize_managed_text_newlines,
     daily_log_cursors_equivalent,
     daily_log_cursor_from_text,
     daily_log_cursor_is_legacy_empty,
@@ -97,34 +57,17 @@ from _common import (
     latest_active_daily_log_cursor,
     load_workspace_state,
     normalize_wrapper_metadata_json,
-    now_iso_timestamp,
     PACKAGE_VERSION,
-    parse_daily_log_entry_line,
     parse_iso_date,
     public_project_path,
     read_text,
     resolve_writer_attribution,
-    stable_text_readback,
     validate_iso_date,
     WrapperMetadataSecurityError,
-    workspace_write_lock,
-    write_text_create_only,
 )
 
 
 DEFAULT_MAX_INPUT_BYTES = 4 * 1024 * 1024
-DAILY_LOG_ENTRY_JSON_RETRY_PAYLOAD_SHAPE = {
-    key: "non-empty string | list[non-empty string]"
-    for key in SECTION_KEYS["daily_log"]
-}
-DAILY_LOG_ENTRY_JSON_ACCEPTED_SHAPES = ("string", "list[string]")
-RESERVED_MARKER_FAMILIES = (
-    ("<!-- recallloom:file=", "file_marker"),
-    ("<!-- last-writer:", "last_writer_marker"),
-    ("<!-- file-state:", "file_state_marker"),
-    ("<!-- daily-log-entry:", "daily_log_entry_marker"),
-    ("<!-- daily-log-scaffold", "daily_log_scaffold_marker"),
-)
 PREFLIGHT_BINDING_TYPE = "recallloom.preflight_write_binding"
 PREFLIGHT_BINDING_VERSION = "0.1"
 REVIEW_IMPORTED_BASELINE_CONFIRMATION = "review_imported_baseline_confirmed"
@@ -176,11 +119,9 @@ PREFLIGHT_WRITE_READINESS_LABELS = {
 
 
 def sha256_text_digest(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return daily_log_append.sha256_text_digest(text)
 
 
-def expected_state_json_text(state: dict) -> str:
-    return json.dumps(state, ensure_ascii=False, indent=2) + "\n"
 
 
 def positive_int(value: str) -> int:
@@ -254,50 +195,75 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def prepared_input_failure_details(
-    error: PreparedInputSafetyError,
-    *,
-    input_mode: str | None = None,
-) -> dict[str, object]:
-    details = error.details
-    if input_mode is not None:
-        details["input_mode"] = input_mode
-    return details
-
-
-def exit_prepared_input_safety_error(
+def _exit_input_transport_error(
     parser,
     *,
     json_mode: bool,
-    error: PreparedInputSafetyError,
-    input_mode: str | None = None,
+    error: input_transport.InputTransportError,
 ) -> None:
+    """Project a typed input-transport failure onto the legacy exit contract."""
     exit_with_failure_contract(
         parser,
         json_mode=json_mode,
-        exit_code=2,
+        exit_code=error.exit_code,
         message=error.message,
-        reason="invalid_prepared_input",
-        details=prepared_input_failure_details(error, input_mode=input_mode),
+        reason=error.reason,
+        details=error.details,
     )
 
 
-def read_limited_file_text(
+def _exit_daily_log_append_planner_error(
     parser,
     *,
     json_mode: bool,
-    entry_source: PreparedInputSource,
-    max_input_bytes: int,
-) -> str:
-    try:
-        return read_prepared_input_source_text(
-            entry_source,
-            max_input_bytes=max_input_bytes,
-            label="entry",
+    error: daily_log_append.DailyLogAppendPlannerError,
+    legacy_details: dict | None = None,
+) -> None:
+    """Project a typed pure-planner failure onto the legacy exit contract."""
+    def needs_legacy_details(details: dict) -> bool:
+        return (
+            "hard_block_reasons" in details
+            or (
+                "missing_section_keys" in details
+                and details.get("input_mode") == "stdin"
+            )
         )
-    except PreparedInputSafetyError as exc:
-        exit_prepared_input_safety_error(parser, json_mode=json_mode, error=exc)
-    raise AssertionError("unreachable")
+
+    if legacy_details:
+        if error.details is not None and needs_legacy_details(error.details):
+            error.details = {**legacy_details, **error.details}
+        if (
+            error.payload is not None
+            and isinstance(error.payload.get("details"), dict)
+            and needs_legacy_details(error.payload["details"])
+        ):
+            error.payload["details"] = {
+                **legacy_details,
+                **error.payload["details"],
+            }
+    if error.payload is not None:
+        exit_with_cli_error(
+            parser,
+            json_mode=json_mode,
+            exit_code=error.exit_code,
+            message=error.message,
+            payload=error.payload,
+        )
+        raise AssertionError("unreachable")
+    exit_with_failure_contract(
+        parser,
+        json_mode=json_mode,
+        exit_code=error.exit_code,
+        message=error.message,
+        reason=error.reason,
+        details=error.details,
+    )
+
+
+
+
+
+
 
 
 def preflight_binding_failure(
@@ -325,628 +291,6 @@ def preflight_binding_failure(
     )
 
 
-def enforce_strict_sidecar_integrity_gate(
-    parser,
-    *,
-    json_mode: bool,
-    project_root: Path,
-    storage_root: Path,
-) -> dict:
-    gate = strict_sidecar_integrity_gate(
-        project_root=project_root,
-        storage_root=storage_root,
-    )
-    if gate.get("allowed_for_mutation") is True:
-        return gate
-    gate_summary = strict_sidecar_integrity_gate_public_summary(gate)
-    message = (
-        "Strict sidecar integrity gate blocked this daily-log append. "
-        "Review or repair sidecar evidence before writing."
-    )
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=3,
-        message=message,
-        reason="trust_review_required",
-        details={
-            "reason_code": "strict_sidecar_integrity_failed",
-            "strict_gate_reason_code": gate_summary.get("reason_code"),
-            "strict_sidecar_integrity_gate": gate_summary,
-            "command": "append",
-            "operation": "daily_log_append",
-            "side_effect": "none",
-        },
-        extra=strict_sidecar_no_write_failure_extra_from_summary(
-            gate_summary,
-            continuity_confidence="broken",
-            include_recovery_actions=False,
-        ),
-    )
-
-
-def exit_concurrent_external_modification(
-    parser,
-    *,
-    json_mode: bool,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-    side_effect: str,
-) -> None:
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=3,
-        message=(
-            "A daily-log or state snapshot changed outside the bounded append transaction. "
-            "RecallLoom preserved the detected external state."
-        ),
-        reason="damaged_sidecar",
-        details={
-            "reason_code": "concurrent_external_modification_detected",
-            "side_effect": side_effect,
-            "file_key": "daily_log",
-            "target_entry_seq": target_entry_seq,
-            "new_workspace_revision": new_workspace_revision,
-        },
-    )
-
-
-def stable_path_absent(path: Path) -> bool:
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            return True
-    return False
-
-
-def handle_target_write_failure(
-    parser,
-    *,
-    json_mode: bool,
-    failure: BaseException,
-    target_path: Path,
-    previous_target_existed: bool,
-    previous_target_text: str | None,
-    expected_target_text: str,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-) -> None:
-    target_status, target_text, _ = stable_text_readback(target_path)
-    previous_snapshot_matches = (
-        target_status == "read" and target_text == previous_target_text
-        if previous_target_existed
-        else stable_path_absent(target_path)
-    )
-    if previous_snapshot_matches:
-        if isinstance(failure, LockBusyError):
-            exit_concurrent_external_modification(
-                parser,
-                json_mode=json_mode,
-                new_workspace_revision=new_workspace_revision,
-                target_entry_seq=target_entry_seq,
-                side_effect="external_target_modification_preserved",
-            )
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="The daily-log target write failed before a new target snapshot was verified.",
-            reason="damaged_sidecar",
-            details={
-                "reason_code": "target_write_failed",
-                "side_effect": "none",
-            },
-        )
-    if target_status == "read" and target_text == expected_target_text:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="The daily-log target was written, but its write result was not verified in-line.",
-            reason="damaged_sidecar",
-            details={
-                "reason_code": "target_write_post_verify_failed",
-                "side_effect": "write_attempted",
-            },
-        )
-    if target_status in {"read", "changed"}:
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="external_target_modification_preserved",
-        )
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=2,
-        message="The daily-log target write outcome is unreadable and must be reviewed.",
-        reason="damaged_sidecar",
-        details={
-            "reason_code": "target_write_outcome_unknown",
-            "side_effect": "unknown",
-        },
-    )
-
-
-def handle_state_write_failure(
-    parser,
-    *,
-    json_mode: bool,
-    target_path: Path,
-    state_path: Path,
-    expected_target_text: str,
-    previous_state_text: str,
-    expected_state_text: str,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-) -> None:
-    state_status, state_text, _ = stable_text_readback(state_path)
-    target_status, target_text, _ = stable_text_readback(target_path)
-    if state_status == "read" and state_text == previous_state_text:
-        if target_status == "read" and target_text == expected_target_text:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=(
-                    "The state write failed after the daily-log target was written; "
-                    "all target bytes were preserved for read-only validation."
-                ),
-                reason="damaged_sidecar",
-                details={
-                    "reason_code": "state_write_failed_target_preserved",
-                    "side_effect": "write_attempted",
-                },
-            )
-        if target_status in {"read", "changed"}:
-            exit_concurrent_external_modification(
-                parser,
-                json_mode=json_mode,
-                new_workspace_revision=new_workspace_revision,
-                target_entry_seq=target_entry_seq,
-                side_effect="external_target_modification_preserved",
-            )
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=(
-                "The state write failed and the daily-log target cannot be read; "
-                "no automatic rollback was attempted."
-            ),
-            reason="damaged_sidecar",
-            details={
-                "reason_code": "state_write_outcome_unknown",
-                "side_effect": "unknown",
-            },
-        )
-    if state_status == "read" and state_text == expected_state_text:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Daily-log target and state were written, but state verification failed in-line.",
-            reason="damaged_sidecar",
-            details={
-                "reason_code": "state_write_post_verify_failed",
-                "side_effect": "target_and_state_written_receipt_not_stored",
-            },
-        )
-    if state_status in {"read", "changed"}:
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="external_state_modification_preserved",
-        )
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=2,
-        message="The state write outcome is unreadable; the daily-log target was not rolled back.",
-        reason="damaged_sidecar",
-        details={
-            "reason_code": "state_write_outcome_unknown",
-            "side_effect": "unknown",
-        },
-    )
-
-
-def downgrade_after_verified_receipt_not_written(
-    parser,
-    *,
-    json_mode: bool,
-    project_root: Path,
-    storage_root: Path,
-    target_path: Path,
-    state_path: Path,
-    state: dict,
-    expected_target_text: str,
-    expected_state_text: str,
-    receipt_store_snapshot: ReceiptStoreSnapshot,
-    previous_state_label: str,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-) -> None:
-    downgraded_state = dict(state)
-    downgraded_state["provenance"] = unproven_sidecar_metadata(
-        timestamp=now_iso_timestamp(),
-        reason_code=RECEIPT_STORE_NOT_WRITTEN_VERIFIED,
-        previous_state_label=previous_state_label,
-    )
-    target_status, target_text, _ = stable_text_readback(target_path)
-    if (
-        target_status != "read"
-        or target_text != expected_target_text
-        or not receipt_store_snapshot_matches_current(
-            storage_root=storage_root,
-            project_root=project_root,
-            snapshot=receipt_store_snapshot,
-        )
-    ):
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="target_and_state_written_receipt_not_stored",
-        )
-    try:
-        atomic_write_and_verify_if_unchanged(
-            state_path,
-            expected_text=expected_state_text,
-            new_text=expected_state_json_text(downgraded_state),
-        )
-    except LockBusyError:
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="target_and_state_written_receipt_not_stored",
-        )
-    except (OSError, UnicodeDecodeError):
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Receipt finalization failed and provenance downgrade was not verified.",
-            reason="damaged_sidecar",
-            details={
-                "reason_code": "receipt_failure_provenance_restore_failed",
-                "side_effect": "target_and_state_written_receipt_not_stored",
-            },
-        )
-
-
-def receipt_failure_reason(reason_code: str) -> str:
-    if reason_code in {
-        "prohibited_field",
-        "value_requires_redaction",
-        "non_string_key",
-        "unsupported_value_type",
-    }:
-        return "privacy_security_failure"
-    return "damaged_sidecar"
-
-
-def exit_receipt_finalization_failure(
-    parser,
-    *,
-    json_mode: bool,
-    message: str,
-    reason_code: str,
-    side_effect: str,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-    extra: dict | None = None,
-) -> None:
-    details = {
-        "reason_code": reason_code,
-        "side_effect": side_effect,
-        "file_key": "daily_log",
-        "target_entry_seq": target_entry_seq,
-        "new_workspace_revision": new_workspace_revision,
-        "receipt_finalization_status": "failed",
-        "receipt_store_file": "derived/helper-receipts.json",
-        **(extra or {}),
-    }
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=2,
-        message=message,
-        reason=receipt_failure_reason(reason_code),
-        details=details,
-    )
-
-
-def prevalidate_receipt_store_before_append(
-    parser,
-    *,
-    json_mode: bool,
-    storage_root: Path,
-    project_root: Path,
-    preflight_binding: dict | None,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-) -> ReceiptStoreSnapshot | None:
-    if preflight_binding is None:
-        return None
-    try:
-        return capture_receipt_store_snapshot(
-            storage_root=storage_root,
-            project_root=project_root,
-        )
-    except ReceiptStoreError as exc:
-        exit_receipt_finalization_failure(
-            parser,
-            json_mode=json_mode,
-            message=str(exc),
-            reason_code=exc.reason_code,
-            side_effect="none",
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            extra={
-                **exc.details,
-                "side_effect": "none",
-                "receipt_finalization_status": "blocked_before_write",
-                "receipt_precheck": True,
-            },
-        )
-    raise AssertionError("unreachable")
-
-
-def verify_post_append_hashes(
-    parser,
-    *,
-    json_mode: bool,
-    project_root: Path,
-    storage_root: Path,
-    target_path: Path,
-    state_path: Path,
-    expected_target_text: str,
-    expected_state_text: str,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-    target_date: str,
-    state: dict,
-    previous_state_label: str,
-    preflight_binding_digest: str,
-    receipt_store_snapshot: ReceiptStoreSnapshot,
-) -> tuple[str, str]:
-    target_status, post_target_text, target_error_class = stable_text_readback(target_path)
-    state_status, post_state_text, _ = stable_text_readback(state_path)
-    if target_status == "changed" or state_status == "changed":
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="target_and_state_written_receipt_not_stored",
-        )
-    if state_status != "read" or post_state_text is None:
-        exit_receipt_finalization_failure(
-            parser,
-            json_mode=json_mode,
-            message="Could not stably re-read post-append state for receipt finalization.",
-            reason_code="post_hash_read_failed",
-            side_effect="target_and_state_written_receipt_not_stored",
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-        )
-    state_digest = sha256_text_digest(post_state_text)
-    expected_state_digest = sha256_text_digest(expected_state_text)
-    if post_state_text != expected_state_text:
-        mismatch_details = {
-            "state_digest": state_digest,
-            "expected_state_digest": expected_state_digest,
-        }
-        if target_status == "read" and post_target_text is not None:
-            mismatch_details.update(
-                {
-                    "target_digest": sha256_text_digest(post_target_text),
-                    "expected_target_digest": sha256_text_digest(expected_target_text),
-                }
-            )
-        exit_receipt_finalization_failure(
-            parser,
-            json_mode=json_mode,
-            message="Post-append state no longer matches the expected helper-written state.",
-            reason_code="post_hash_mismatch",
-            side_effect="target_and_state_written_receipt_not_stored",
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            extra=mismatch_details,
-        )
-    if target_status == "read" and post_target_text == expected_target_text:
-        return sha256_text_digest(post_target_text), state_digest
-
-    if not receipt_store_snapshot_matches_current(
-        storage_root=storage_root,
-        project_root=project_root,
-        snapshot=receipt_store_snapshot,
-    ):
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="target_and_state_written_receipt_not_stored",
-        )
-
-    reason_code = (
-        "post_hash_read_failed" if target_status == "read_failed" else "post_hash_mismatch"
-    )
-    observed_target_digest = (
-        sha256_text_digest(post_target_text)
-        if target_status == "read" and post_target_text is not None
-        else None
-    )
-    target_failure_details = None
-    if observed_target_digest is not None:
-        target_failure_details = {
-            "target_digest": observed_target_digest,
-            "state_digest": state_digest,
-            "expected_target_digest": sha256_text_digest(expected_target_text),
-            "expected_state_digest": expected_state_digest,
-        }
-    try:
-        failure_evidence = build_inconsistent_review_evidence(
-            reason_code=reason_code,
-            operation_class="daily_log_append",
-            target_file_key="daily_log",
-            target_date=target_date,
-            target_verification=(
-                "read_failed" if target_status == "read_failed" else "mismatch"
-            ),
-            target_error_class=(
-                target_error_class if target_status == "read_failed" else None
-            ),
-            expected_target_digest=sha256_text_digest(expected_target_text),
-            observed_target_digest=observed_target_digest,
-            expected_state_digest=expected_state_digest,
-            observed_state_digest=state_digest,
-            expected_workspace_revision=new_workspace_revision - 1,
-            result_workspace_revision=new_workspace_revision,
-            expected_file_revision=target_entry_seq - 1,
-            result_file_revision=target_entry_seq,
-            preflight_binding_digest=preflight_binding_digest,
-            receipt_store_snapshot=receipt_store_snapshot,
-            previous_state_label=previous_state_label,
-        )
-    except InconsistentReviewContractError:
-        exit_receipt_finalization_failure(
-            parser,
-            json_mode=json_mode,
-            message="Post-append target verification failed and recovery evidence was ineligible.",
-            reason_code=reason_code,
-            side_effect="target_and_state_written_receipt_not_stored",
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            extra=target_failure_details,
-        )
-
-    failure_metadata = inconsistent_evidence_metadata(
-        timestamp=now_iso_timestamp(),
-        reason_code=reason_code,
-        previous_state_label=previous_state_label,
-    )
-    failure_metadata["inconsistent_review_evidence"] = failure_evidence
-    failure_state = dict(state)
-    failure_state["provenance"] = failure_metadata
-    try:
-        atomic_write_and_verify_if_unchanged(
-            state_path,
-            expected_text=expected_state_text,
-            new_text=expected_state_json_text(failure_state),
-        )
-    except LockBusyError:
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="target_and_state_written_receipt_not_stored",
-        )
-    except (OSError, UnicodeDecodeError):
-        exit_receipt_finalization_failure(
-            parser,
-            json_mode=json_mode,
-            message="Post-append target verification failed and recovery metadata was not verified.",
-            reason_code=reason_code,
-            side_effect="target_and_state_written_receipt_not_stored",
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            extra=target_failure_details,
-        )
-    exit_receipt_finalization_failure(
-        parser,
-        json_mode=json_mode,
-        message="Post-append target verification failed; bounded recovery evidence was recorded.",
-        reason_code=reason_code,
-        side_effect="target_and_state_written_receipt_not_stored",
-        new_workspace_revision=new_workspace_revision,
-        target_entry_seq=target_entry_seq,
-        extra=target_failure_details,
-    )
-    raise AssertionError("unreachable")
-
-
-def verify_finalized_append_evidence(
-    parser,
-    *,
-    json_mode: bool,
-    project_root: Path,
-    storage_root: Path,
-    target_path: Path,
-    state_path: Path,
-    expected_target_text: str,
-    expected_state_text: str,
-    receipt_store_snapshot: ReceiptStoreSnapshot,
-    new_workspace_revision: int,
-    target_entry_seq: int,
-) -> None:
-    target_status, target_text, _ = stable_text_readback(target_path)
-    state_status, state_text, _ = stable_text_readback(state_path)
-    if (
-        target_status != "read"
-        or target_text != expected_target_text
-        or state_status != "read"
-        or state_text != expected_state_text
-        or not receipt_store_snapshot_matches_current(
-            storage_root=storage_root,
-            project_root=project_root,
-            snapshot=receipt_store_snapshot,
-        )
-    ):
-        exit_concurrent_external_modification(
-            parser,
-            json_mode=json_mode,
-            new_workspace_revision=new_workspace_revision,
-            target_entry_seq=target_entry_seq,
-            side_effect="target_state_and_receipt_store_written_review_required",
-        )
-
-
-def build_append_receipt_seed(
-    *,
-    preflight_binding: dict,
-    timestamp: str,
-    target_digest: str,
-    state_digest: str,
-    previous_entry_seq: int,
-    next_entry_seq: int,
-    new_workspace_revision: int,
-) -> dict:
-    return {
-        "schema_version": RECEIPT_SCHEMA_VERSION,
-        "receipt_type": "helper_write",
-        "helper_name": "append_daily_log_entry.py",
-        "helper_version": PACKAGE_VERSION,
-        "operation": "milestone_evidence",
-        "operation_class": "daily_log_append",
-        "side_effect": "target_and_state_written",
-        "result": "ok",
-        "state_label_before": preflight_binding.get("provenance_state") or "structurally_valid",
-        "state_label_after": "helper_evidenced",
-        "target_file_key": "daily_log",
-        "target_digest": target_digest,
-        "state_digest": state_digest,
-        "preflight_contract_identity": preflight_binding["preflight_contract_identity"],
-        "expected_workspace_revision": preflight_binding["expected_workspace_revision"],
-        "result_workspace_revision": new_workspace_revision,
-        "expected_file_revision": previous_entry_seq,
-        "result_file_revision": next_entry_seq,
-        "created_at": timestamp,
-    }
 
 
 def normalize_preflight_binding(
@@ -1126,109 +470,6 @@ def normalize_preflight_binding(
     return payload
 
 
-def enforce_provenance_write_gate(
-    parser,
-    *,
-    json_mode: bool,
-    state: dict,
-    preflight_binding: dict | None,
-    strict_gate: dict | None = None,
-) -> dict:
-    receipts_verified = (
-        strict_gate_current_receipts_verified(strict_gate)
-        if isinstance(strict_gate, dict)
-        else False
-    )
-    gate = helper_write_gate_from_state(
-        state,
-        helper_name="append_daily_log_entry.py",
-        operation_class="daily_log_append",
-        preflight_binding_present=preflight_binding is not None,
-        require_preflight_for_review_imported_baseline=True,
-        receipt_chain_verified=receipts_verified,
-        receipt_store_available=receipts_verified,
-    )
-    if preflight_binding is not None:
-        binding_state = preflight_binding.get("provenance_state")
-        if isinstance(binding_state, str) and binding_state != gate["provenance_state"]:
-            preflight_binding_failure(
-                parser,
-                json_mode=json_mode,
-                message="Preflight binding provenance_state does not match current sidecar provenance.",
-                reason_code="preflight_binding_provenance_state_mismatch",
-                field_path="$.provenance_state",
-                extra={
-                    "current_provenance_state": gate["provenance_state"],
-                    "binding_provenance_state": binding_state,
-                },
-            )
-        readiness_label = preflight_binding.get("write_readiness_label")
-        if readiness_label not in PREFLIGHT_WRITE_READINESS_LABELS:
-            preflight_binding_failure(
-                parser,
-                json_mode=json_mode,
-                message="Preflight binding does not authorize a revision-checked daily-log append.",
-                reason_code="preflight_binding_write_readiness_not_authorized",
-                field_path="$.write_readiness_label",
-                extra={
-                    "write_readiness_label": readiness_label,
-                    "allowed_write_readiness_labels": sorted(PREFLIGHT_WRITE_READINESS_LABELS),
-                },
-            )
-        if gate["provenance_state"] == "review_imported_baseline":
-            if preflight_binding.get("ux_gate") != "ask":
-                preflight_binding_failure(
-                    parser,
-                    json_mode=json_mode,
-                    message="Review-imported baseline appends require an ask UX gate.",
-                    reason_code="preflight_binding_ux_gate_mismatch",
-                    field_path="$.ux_gate",
-                    extra={"required_ux_gate": "ask"},
-                )
-            if preflight_binding.get("ux_gate_requires_confirmation") is not True:
-                preflight_binding_failure(
-                    parser,
-                    json_mode=json_mode,
-                    message="Review-imported baseline appends require explicit confirmation.",
-                    reason_code="preflight_binding_confirmation_required",
-                    field_path="$.ux_gate_requires_confirmation",
-                )
-            if preflight_binding.get("ux_gate_confirmation") != REVIEW_IMPORTED_BASELINE_CONFIRMATION:
-                preflight_binding_failure(
-                    parser,
-                    json_mode=json_mode,
-                    message="Review-imported baseline append confirmation is missing.",
-                    reason_code="preflight_binding_confirmation_missing",
-                    field_path="$.ux_gate_confirmation",
-                    extra={"required_confirmation": REVIEW_IMPORTED_BASELINE_CONFIRMATION},
-                )
-    if gate["allowed"]:
-        return gate
-    reason = helper_write_gate_failure_reason(gate)
-    message = (
-        "Refusing to append because this RecallLoom sidecar requires provenance review "
-        "or a fresh preflight binding before any mutating helper write "
-        f"(reason_code: {gate['blocked_reason_code']})."
-    )
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=3,
-        message=message,
-        reason=reason,
-        details={
-            "reason_code": gate["blocked_reason_code"],
-            "helper_name": gate["helper_name"],
-            "operation_class": gate["operation_class"],
-            "provenance_state": gate["provenance_state"],
-            "provenance_metadata_status": gate["provenance_metadata_status"],
-            "write_readiness": gate["write_readiness"],
-            "preflight_binding_present": gate["preflight_binding_present"],
-            "side_effect": "none",
-        },
-    )
-
-
 def preflight_cursor_is_no_log(cursor: dict[str, object]) -> bool:
     return (
         cursor.get("latest_file") is None
@@ -1377,641 +618,6 @@ def enforce_preflight_daily_log_cursor(
         )
 
 
-def enforce_preflight_binding_lease(
-    parser,
-    *,
-    json_mode: bool,
-    storage_root: Path,
-    project_root: Path,
-    preflight_binding: dict | None,
-) -> None:
-    if preflight_binding is None:
-        return
-    try:
-        verify_preflight_binding_lease(
-            storage_root=storage_root,
-            project_root=project_root,
-            binding=preflight_binding,
-        )
-    except PreflightBindingLeaseError as exc:
-        preflight_binding_failure(
-            parser,
-            json_mode=json_mode,
-            message=str(exc),
-            reason_code=exc.reason_code,
-            field_path=exc.field_path,
-            extra={
-                "lease_store": "derived/preflight-bindings.json",
-                "side_effect": "none",
-            },
-        )
-
-
-def read_limited_stdin(parser, *, json_mode: bool, max_input_bytes: int) -> bytes:
-    try:
-        raw = sys.stdin.buffer.read(max_input_bytes + 1)
-    except OSError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=f"Failed to read stdin: {exc}",
-            reason="invalid_prepared_input",
-        )
-    if len(raw) > max_input_bytes:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=f"Stdin input exceeds --max-input-bytes ({len(raw)} > {max_input_bytes}).",
-            reason="invalid_prepared_input",
-            details={"size": len(raw), "max_input_bytes": max_input_bytes},
-        )
-    return raw
-
-
-def load_entry_source(
-    parser,
-    *,
-    json_mode: bool,
-    entry_json: str | None,
-    entry_file: str | None,
-    use_stdin: bool,
-    max_input_bytes: int,
-    project_root: Path | None = None,
-    storage_root: Path | None = None,
-) -> tuple[str, str, Path | None]:
-    selected_sources = int(entry_json is not None) + int(entry_file is not None) + int(use_stdin)
-    if selected_sources != 1:
-        input_mode = "ambiguous" if selected_sources > 1 else "missing"
-        details = {
-            "command": "append",
-            "operation": "daily_log_append",
-            "input_mode": input_mode,
-            "input_contract": "entry-json_xor_entry-file_xor_stdin",
-            "entry_json_present": entry_json is not None,
-            "entry_file_present": entry_file is not None,
-            "stdin_present": bool(use_stdin),
-            "side_effect": "none",
-            "trust_effect": "none",
-            "reason_code": (
-                "both_input_sources" if selected_sources > 1 else "missing_input_source"
-            ),
-        }
-        if selected_sources > 1:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message="Use exactly one prepared-entry input: --entry-json, --entry-file, or --stdin.",
-                reason="invalid_prepared_input",
-                details=details,
-            )
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Provide prepared entry content with exactly one of --entry-json, --entry-file, or --stdin.",
-            reason="invalid_prepared_input",
-            details=details,
-        )
-
-    if entry_json is not None:
-        entry_json_size = len(entry_json.encode("utf-8"))
-        if entry_json_size > max_input_bytes:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message=f"Entry JSON input exceeds --max-input-bytes ({entry_json_size} > {max_input_bytes}).",
-                reason="invalid_prepared_input",
-                details={"size": entry_json_size, "max_input_bytes": max_input_bytes},
-            )
-        return entry_json, "entry-json", None
-
-    if entry_file:
-        if project_root is None or storage_root is None:
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message="Internal error: project root is required before reading --entry-file.",
-                reason="invalid_prepared_input",
-                details={"input_mode": "file", "reason_code": "prepared_input_context_missing"},
-            )
-        try:
-            entry_source = validate_prepared_input_source_path(
-                entry_file,
-                project_root=project_root,
-                storage_root=storage_root,
-                input_role="entry-file",
-                label="entry",
-            )
-        except PreparedInputSafetyError as exc:
-            exit_prepared_input_safety_error(
-                parser,
-                json_mode=json_mode,
-                error=exc,
-                input_mode="file",
-            )
-        return (
-            read_limited_file_text(
-                parser,
-                json_mode=json_mode,
-                entry_source=entry_source,
-                max_input_bytes=max_input_bytes,
-            ),
-            "file",
-            entry_source.path,
-        )
-
-    if sys.stdin.isatty():
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Stdin input is empty. Pipe or redirect UTF-8 prepared content when using --stdin.",
-            reason="invalid_prepared_input",
-        )
-    raw = read_limited_stdin(parser, json_mode=json_mode, max_input_bytes=max_input_bytes)
-    if raw == b"":
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Stdin input is empty. Pipe or redirect UTF-8 prepared content when using --stdin.",
-            reason="invalid_prepared_input",
-        )
-    try:
-        return raw.decode("utf-8"), "stdin", None
-    except UnicodeDecodeError:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Stdin input must be valid UTF-8.",
-            reason="invalid_prepared_input",
-        )
-    raise AssertionError("unreachable")
-
-
-def daily_log_json_failure_details(
-    recovery_details: dict | None = None,
-    *,
-    field_path: str = "$",
-    expected_type: str = "daily_log_json_object",
-    reason_code: str,
-    section_key: str | None = None,
-    extra: dict | None = None,
-) -> dict:
-    details = {
-        **(recovery_details or {}),
-        "prepared_input_builder": "daily_log_entry_json",
-        "field_path": field_path,
-        "expected_type": expected_type,
-        "accepted_shapes": list(DAILY_LOG_ENTRY_JSON_ACCEPTED_SHAPES),
-        "retry_payload_shape": dict(DAILY_LOG_ENTRY_JSON_RETRY_PAYLOAD_SHAPE),
-        "allowed_section_keys": list(SECTION_KEYS["daily_log"]),
-        "reason_code": reason_code,
-        "side_effect": "none",
-    }
-    if section_key is not None:
-        details["section_key"] = section_key
-    if extra:
-        details.update(extra)
-    return details
-
-
-def invalid_json_section_value(
-    parser,
-    *,
-    json_mode: bool,
-    section_key: str,
-    message: str,
-    recovery_details: dict | None = None,
-    field_path: str | None = None,
-    expected_type: str = "string_or_string_array",
-    reason_code: str = "invalid_section_value_type",
-) -> None:
-    details = daily_log_json_failure_details(
-        recovery_details,
-        field_path=field_path or f"$.{section_key}",
-        expected_type=expected_type,
-        reason_code=reason_code,
-        section_key=section_key,
-    )
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=2,
-        message=message,
-        reason="invalid_prepared_input",
-        details=details,
-    )
-
-
-def reserved_marker_failure_details(
-    recovery_details: dict | None = None,
-    *,
-    line_number: int,
-    marker_family: str,
-    section_key: str | None = None,
-) -> dict:
-    details: dict[str, object] = {}
-    input_mode = (recovery_details or {}).get("input_mode")
-    if isinstance(input_mode, str) and input_mode.strip():
-        details["input_mode"] = input_mode
-    details.update(
-        {
-            "reason_code": "reserved_marker_injection",
-            "line_number": line_number,
-            "marker_family": marker_family,
-            "side_effect": "none",
-        }
-    )
-    if section_key is not None:
-        details["section_key"] = section_key
-        details["field_path"] = f"$.{section_key}"
-    return details
-
-
-def reject_json_reserved_markers(
-    parser,
-    *,
-    json_mode: bool,
-    section_key: str,
-    text: str,
-    recovery_details: dict | None = None,
-) -> None:
-    reserved = reserved_marker_lines(text, match_embedded=True)
-    if not reserved:
-        return
-    hit = reserved[0]
-    line_number = int(hit["line_number"])
-    exit_with_failure_contract(
-        parser,
-        json_mode=json_mode,
-        exit_code=2,
-        message=(
-            "Refusing to append because prepared entry JSON section "
-            f"'{section_key}' contains a reserved RecallLoom marker on line {line_number}."
-        ),
-        reason="invalid_prepared_input",
-        details=reserved_marker_failure_details(
-            recovery_details,
-            line_number=line_number,
-            marker_family=str(hit["marker_family"]),
-            section_key=section_key,
-        ),
-    )
-
-
-def render_json_list_item(text: str) -> str:
-    lines = text.splitlines()
-    if not lines:
-        return "- "
-    rendered = [f"- {lines[0]}"]
-    rendered.extend(f"  {line}" if line else "  " for line in lines[1:])
-    return "\n".join(rendered)
-
-
-def normalize_json_section_value(
-    parser,
-    *,
-    json_mode: bool,
-    section_key: str,
-    value: object,
-    recovery_details: dict | None = None,
-) -> str:
-    if isinstance(value, str):
-        normalized = canonicalize_managed_text_newlines(value.strip())
-        if normalized:
-            reject_json_reserved_markers(
-                parser,
-                json_mode=json_mode,
-                section_key=section_key,
-                text=normalized,
-                recovery_details=recovery_details,
-            )
-            return normalized
-        invalid_json_section_value(
-            parser,
-            json_mode=json_mode,
-            section_key=section_key,
-            message=(
-                f"Prepared entry JSON section '{section_key}' must be a non-empty string "
-                "or a non-empty list of strings."
-            ),
-            recovery_details=recovery_details,
-            reason_code="empty_section_string",
-        )
-
-    if isinstance(value, list):
-        if not value:
-            invalid_json_section_value(
-                parser,
-                json_mode=json_mode,
-                section_key=section_key,
-                message=(
-                    f"Prepared entry JSON section '{section_key}' must be a non-empty string "
-                    "or a non-empty list of strings."
-                ),
-                recovery_details=recovery_details,
-                reason_code="empty_section_list",
-            )
-        rendered_items: list[str] = []
-        for item in value:
-            if not isinstance(item, str):
-                invalid_json_section_value(
-                    parser,
-                    json_mode=json_mode,
-                    section_key=section_key,
-                    message=(
-                        f"Prepared entry JSON section '{section_key}' list items must be non-empty strings."
-                    ),
-                    recovery_details=recovery_details,
-                    field_path=f"$.{section_key}[]",
-                    expected_type="non_empty_string",
-                    reason_code="invalid_section_list_item_type",
-                )
-            normalized_item = canonicalize_managed_text_newlines(item.strip())
-            if not normalized_item:
-                invalid_json_section_value(
-                    parser,
-                    json_mode=json_mode,
-                    section_key=section_key,
-                    message=(
-                        f"Prepared entry JSON section '{section_key}' list items must be non-empty strings."
-                    ),
-                    recovery_details=recovery_details,
-                    field_path=f"$.{section_key}[]",
-                    expected_type="non_empty_string",
-                    reason_code="empty_section_list_item",
-                )
-            reject_json_reserved_markers(
-                parser,
-                json_mode=json_mode,
-                section_key=section_key,
-                text=normalized_item,
-                recovery_details=recovery_details,
-            )
-            rendered_items.append(render_json_list_item(normalized_item))
-        return "\n".join(rendered_items)
-
-    invalid_json_section_value(
-        parser,
-        json_mode=json_mode,
-        section_key=section_key,
-        message=(
-            f"Prepared entry JSON section '{section_key}' must be a non-empty string "
-            "or a non-empty list of strings."
-        ),
-        recovery_details=recovery_details,
-    )
-    raise AssertionError("unreachable")
-
-
-def normalize_json_entry_text(
-    parser,
-    *,
-    json_mode: bool,
-    raw_text: str,
-    recovery_details: dict | None = None,
-) -> str:
-    try:
-        payload = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=(
-                "Prepared entry JSON must be a valid JSON object: "
-                f"{exc.msg} at line {exc.lineno} column {exc.colno}."
-            ),
-            reason="invalid_prepared_input",
-            details=daily_log_json_failure_details(
-                recovery_details,
-                field_path="$",
-                expected_type="valid_json_object",
-                reason_code="malformed_json",
-                extra={"json_error_line": exc.lineno, "json_error_column": exc.colno},
-            ),
-        )
-
-    if not isinstance(payload, dict):
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Prepared entry JSON must be an object keyed by daily-log section names.",
-            reason="invalid_prepared_input",
-            details=daily_log_json_failure_details(
-                recovery_details,
-                field_path="$",
-                expected_type="object",
-                reason_code="top_level_not_object",
-            ),
-        )
-
-    required_keys = list(SECTION_KEYS["daily_log"])
-    unknown_keys = sorted(key for key in payload if key not in required_keys)
-    if unknown_keys:
-        details = daily_log_json_failure_details(
-            recovery_details,
-            field_path="$.<section_key>",
-            expected_type="allowed_section_key",
-            reason_code="unknown_section_key",
-            extra={
-                "unknown_section_key_count": len(unknown_keys),
-                "unknown_key_values_public_safe": False,
-            },
-        )
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message="Prepared entry JSON contains unknown daily-log section keys.",
-            reason="invalid_prepared_input",
-            details=details,
-        )
-
-    missing_keys = [key for key in required_keys if key not in payload]
-    if missing_keys:
-        details = daily_log_json_failure_details(
-            recovery_details,
-            field_path="$",
-            expected_type="object_with_all_required_sections",
-            reason_code="missing_section_key",
-            extra={"missing_section_keys": missing_keys},
-        )
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=(
-                "Prepared entry JSON is missing required daily-log section keys: "
-                + ", ".join(missing_keys)
-            ),
-            reason="invalid_prepared_input",
-            details=details,
-        )
-
-    sections: list[str] = []
-    for section_key in required_keys:
-        sections.append(
-            section_marker(section_key)
-            + "\n"
-            + normalize_json_section_value(
-                parser,
-                json_mode=json_mode,
-                section_key=section_key,
-                value=payload[section_key],
-                recovery_details=recovery_details,
-            )
-        )
-    return "\n\n".join(sections) + "\n"
-
-
-def prepare_entry_text(
-    parser,
-    *,
-    json_mode: bool,
-    source_kind: str,
-    raw_text: str,
-    input_format: str,
-    entry_path: Path | None,
-    project_root: Path | None = None,
-) -> tuple[str, str]:
-    if source_kind == "entry-json":
-        recovery_details = {"input_mode": "json-string"}
-        if input_format == "markdown":
-            exit_with_failure_contract(
-                parser,
-                json_mode=json_mode,
-                exit_code=2,
-                message="--entry-json only supports JSON input. Use --input-format auto or --input-format json.",
-                reason="invalid_prepared_input",
-                details=recovery_details,
-            )
-        return (
-            normalize_json_entry_text(
-                parser,
-                json_mode=json_mode,
-                raw_text=raw_text,
-                recovery_details=recovery_details,
-            ),
-            "json-string",
-        )
-
-    effective_input_format = "markdown" if input_format == "auto" else input_format
-    if effective_input_format == "json":
-        input_mode = "json-file" if source_kind == "file" else "json-stdin"
-        recovery_details: dict[str, object] = {"input_mode": input_mode}
-        if entry_path is not None:
-            recovery_details["entry_path"] = str(entry_path)
-        if project_root is not None:
-            recovery_details["project_root"] = str(project_root)
-        return (
-            normalize_json_entry_text(
-                parser,
-                json_mode=json_mode,
-                raw_text=raw_text,
-                recovery_details=recovery_details,
-            ),
-            input_mode,
-        )
-
-    return canonicalize_managed_text_newlines(raw_text), source_kind
-
-
-def build_entry_block(body_text: str, *, writer_id: str, entry_seq: int) -> str:
-    marker = daily_log_entry_marker(
-        entry_id=f"entry-{entry_seq}",
-        created_at=now_iso_timestamp(),
-        writer_id=writer_id,
-        entry_seq=entry_seq,
-    )
-    body = canonicalize_managed_text_newlines(body_text).strip("\n")
-    return marker if not body else marker + "\n\n" + body
-
-
-def existing_entry_sequences(text: str) -> list[int]:
-    sequences: list[int] = []
-    for line in text.splitlines():
-        entry = parse_daily_log_entry_line(line)
-        if entry is not None:
-            sequences.append(entry.entry_seq)
-    return sequences
-
-
-def reserved_marker_lines(text: str, *, match_embedded: bool = False) -> list[dict[str, object]]:
-    results = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        candidate = line.strip()
-        for prefix, marker_family in RESERVED_MARKER_FAMILIES:
-            if candidate.startswith(prefix) or (match_embedded and prefix in candidate):
-                results.append(
-                    {
-                        "line_number": line_number,
-                        "marker_family": marker_family,
-                    }
-                )
-                break
-    return results
-
-
-def validate_entry_body(
-    parser,
-    *,
-    json_mode: bool,
-    body_text: str,
-    recovery_details: dict | None = None,
-) -> None:
-    reserved = reserved_marker_lines(body_text, match_embedded=True)
-    if reserved:
-        hit = reserved[0]
-        line_number = int(hit["line_number"])
-        exit_with_failure_contract(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=(
-                "Refusing to append because the prepared entry contains a reserved RecallLoom marker "
-                f"on line {line_number}."
-            ),
-            reason="invalid_prepared_input",
-            details=reserved_marker_failure_details(
-                recovery_details,
-                line_number=line_number,
-                marker_family=str(hit["marker_family"]),
-            ),
-        )
-    attach_scan = scan_auto_attached_context_text(body_text)
-    if attach_scan["blocked"]:
-        exit_with_cli_error(
-            parser,
-            json_mode=json_mode,
-            exit_code=2,
-            message=(
-                "Refusing to append because the prepared entry failed the attached-text safety scan: "
-                + ", ".join(attach_scan["hard_block_reasons"])
-            ),
-            payload=failure_payload(
-                "attach_scan_blocked",
-                language=preferred_failure_language(os.environ),
-                error=(
-                    "Refusing to append because the prepared entry failed the attached-text safety scan: "
-                    + ", ".join(attach_scan["hard_block_reasons"])
-                ),
-                details={
-                    **(recovery_details or {}),
-                    "hard_block_reasons": attach_scan["hard_block_reasons"],
-                },
-            ),
-        )
-
-
 def build_append_failure_details(
     *,
     project_root: Path,
@@ -2036,18 +642,26 @@ def build_append_failure_details(
     return details
 
 
+def legacy_append_input_mode(*, acquired_mode: str, input_format: str) -> str:
+    """Map the transport vocabulary onto the frozen append CLI vocabulary."""
+    if acquired_mode == "entry-json":
+        return "json-string"
+    if input_format == "json":
+        return "json-file" if acquired_mode == "file" else "json-stdin"
+    return acquired_mode
+
+
 def resolve_target_date(
     *,
     explicit_date: str | None,
     latest_existing: Path | None,
     logical_workday: date,
 ) -> tuple[date, date | None, str]:
-    latest_existing_date = parse_iso_date(latest_existing.stem) if latest_existing is not None else None
-    if explicit_date is not None:
-        return parse_iso_date(explicit_date), latest_existing_date, "explicit"
-    if latest_existing_date is not None and latest_existing_date == logical_workday:
-        return latest_existing_date, latest_existing_date, "auto_same_day_active"
-    return logical_workday, latest_existing_date, "auto_logical_workday"
+    return daily_log_append.resolve_target_date(
+        explicit_date=explicit_date,
+        latest_existing=latest_existing,
+        logical_workday=logical_workday,
+    )
 
 
 def exit_with_append_date_guard(
@@ -2144,723 +758,219 @@ def enforce_logical_workday_append_guards(
 
 
 def main() -> None:
+    """CLI/input/legacy-output adapter; transaction owns every mutation stage."""
     parser = build_parser()
     args = parser.parse_args()
+    exit_with_failure_contract(
+        parser, json_mode=args.json, exit_code=3,
+        message=("Direct mutation helper invocation is not authorized. "
+                 "Use the RecallLoom dispatcher for this transaction."),
+        reason="invalid_transaction_authority",
+        details={"side_effect": "none"},
+    )
+    raise AssertionError("unreachable")
+
+
+def run_from_dispatcher(argv: list[str], *, authority) -> None:
+    """Trusted in-process adapter entry; the dispatcher owns authority."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
     try:
         ensure_supported_python_version()
     except EnvironmentContractError as exc:
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=str(exc),
-            payload=cli_failure_payload("python_runtime_unavailable", error=str(exc)),
-        )
-    enforce_package_support_gate(parser, json_mode=args.json)
-
+        exit_with_cli_error(parser, json_mode=args.json, exit_code=2, message=str(exc),
+                            payload=cli_failure_payload("python_runtime_unavailable", error=str(exc)))
+    support = enforce_package_support_gate(parser, json_mode=args.json)
     try:
         wrapper_metadata = normalize_wrapper_metadata_json(args.wrapper_metadata_json)
-    except WrapperMetadataSecurityError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=4,
-            message=str(exc),
-            reason="privacy_security_failure",
-            details=exc.details,
-        )
-
-    if args.date is not None and not validate_iso_date(args.date):
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=f"Invalid --date value: {args.date}",
-            reason="invalid_date",
-            details={"date": args.date},
-        )
-    try:
-        attribution = resolve_writer_attribution(
-            explicit_writer_id=args.writer_id,
-            invocation_surface="append_daily_log_entry.py",
-            wrapper_metadata=wrapper_metadata,
-        )
-        writer_id = attribution.writer_id
-    except ConfigContractError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=str(exc),
-            reason="invalid_tool_name",
-            details={"writer_id_source": "explicit_cli"},
-        )
-
-    try:
+        if args.date is not None and not validate_iso_date(args.date):
+            exit_with_failure_contract(parser, json_mode=args.json, exit_code=2,
+                                       message=f"Invalid --date value: {args.date}", reason="invalid_date", details={"date": args.date})
+        attribution = resolve_writer_attribution(explicit_writer_id=args.writer_id,
+                                                 invocation_surface="append_daily_log_entry.py",
+                                                 wrapper_metadata=wrapper_metadata)
         workspace = find_recallloom_root(args.path)
-    except (StorageResolutionError, ConfigContractError) as exc:
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
-        )
+    except WrapperMetadataSecurityError as exc:
+        exit_with_failure_contract(parser, json_mode=args.json, exit_code=4, message=str(exc),
+                                   reason="privacy_security_failure", details=exc.details)
+    except ConfigContractError as exc:
+        exit_with_failure_contract(parser, json_mode=args.json, exit_code=2, message=str(exc),
+                                   reason="invalid_tool_name", details={"writer_id_source": "explicit_cli"})
+    except StorageResolutionError as exc:
+        exit_with_cli_error(parser, json_mode=args.json, exit_code=2, message=str(exc),
+                            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"))
     if workspace is None:
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=1,
-            message="No RecallLoom project root found.",
-            reason="no_project_root",
-        )
+        exit_with_failure_contract(parser, json_mode=args.json, exit_code=1,
+                                   message="No RecallLoom project root found.", reason="no_project_root")
     startup_residue_report = exit_if_startup_scratch_residue_for_sources(
-        parser,
-        json_mode=args.json,
-        project_root=workspace.project_root,
-        storage_root=workspace.storage_root,
-        source_paths=[args.entry_file],
-    )
-
-    raw_entry_text, source_kind, entry_path = load_entry_source(
-        parser,
-        json_mode=args.json,
-        entry_json=args.entry_json,
-        entry_file=args.entry_file,
-        use_stdin=args.stdin,
-        max_input_bytes=args.max_input_bytes,
-        project_root=workspace.project_root,
-        storage_root=workspace.storage_root,
-    )
-    body_text, input_mode = prepare_entry_text(
-        parser,
-        json_mode=args.json,
-        source_kind=source_kind,
-        raw_text=raw_entry_text,
-        input_format=args.input_format,
-        entry_path=entry_path,
-        project_root=workspace.project_root,
-    )
-    if args.no_auto_detect and (
-        args.date is None or args.expected_workspace_revision is None
-    ):
-        missing_fields = []
-        if args.date is None:
-            missing_fields.append("date")
-        if args.expected_workspace_revision is None:
-            missing_fields.append("expected_workspace_revision")
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=(
-                "--no-auto-detect requires explicit --date and --expected-workspace-revision. "
-                f"Missing: {', '.join(missing_fields)}."
-            ),
-            reason="invalid_prepared_input",
-                details={
-                    "project_root": str(workspace.project_root),
-                    "input_mode": input_mode,
-                    "missing_fields": missing_fields,
-                "no_auto_detect": True,
-                },
-            )
-
-    receipt_finalization = None
+        parser, json_mode=args.json, project_root=workspace.project_root,
+        storage_root=workspace.storage_root, source_paths=[args.entry_file])
+    state_path = workspace.storage_root / FILE_KEYS["state"]
+    state = load_workspace_state(state_path)
+    latest_existing = latest_active_daily_log(workspace.storage_root / DAILY_LOGS_DIRNAME)
+    logical_workday = logical_workday_for(datetime.now().astimezone(), DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR)
+    cues_path = workspace.storage_root / FILE_KEYS["update_protocol"]
+    cues = detect_update_protocol_time_policy_cues(read_text(cues_path)) if cues_path.is_file() else []
+    if args.date is None and cues:
+        exit_with_append_date_guard(parser, json_mode=args.json, workspace_language=workspace.workspace_language,
+            exit_code=2, reason="project_time_policy_review_required",
+            message="Project-local time-policy cues were detected in update_protocol.md. Append requires an explicit --date before writing when date auto-detect would otherwise apply.",
+            details={"logical_workday": logical_workday.isoformat(), "project_time_policy_cues": cues})
+    target_date, latest_existing_date, date_resolution_source = resolve_target_date(
+        explicit_date=args.date, latest_existing=latest_existing, logical_workday=logical_workday)
+    target_path = workspace.storage_root / DAILY_LOGS_DIRNAME / f"{target_date.isoformat()}.md"
+    expected_workspace_revision = state["workspace_revision"] if args.expected_workspace_revision is None else args.expected_workspace_revision
+    details = build_append_failure_details(project_root=workspace.project_root, target_path=target_path,
+        target_date=target_date.isoformat(), current_workspace_revision=state["workspace_revision"],
+        entry_path=Path(args.entry_file) if args.entry_file else None, input_mode=None, extra={})
+    latest_existing_date = enforce_logical_workday_append_guards(parser, json_mode=args.json,
+        workspace_language=workspace.workspace_language, target_path=target_path, target_date=target_date,
+        latest_existing=latest_existing, logical_workday=logical_workday, recovery_details=details)
+    historical = latest_existing_date is not None and target_date < latest_existing_date
+    if historical and not args.allow_historical:
+        historical_input_mode = (
+            "json-string" if args.entry_json is not None
+            else "file" if args.entry_file is not None
+            else "stdin"
+        )
+        historical_details = build_append_failure_details(
+            project_root=workspace.project_root, target_path=target_path,
+            target_date=target_date.isoformat(),
+            current_workspace_revision=state["workspace_revision"],
+            entry_path=Path(args.entry_file) if args.entry_file else None,
+            input_mode=historical_input_mode, extra={
+                "auto_detected_date": args.date is None,
+                "auto_detected_workspace_revision": args.expected_workspace_revision is None,
+                "date_resolution_source": date_resolution_source,
+                "workspace_revision_source": "state_current" if args.expected_workspace_revision is None else "explicit",
+                "logical_workday": logical_workday.isoformat(),
+                "latest_active_daily_log": str(latest_existing),
+                "latest_active_day": latest_existing_date.isoformat(),
+            })
+        message = (
+            f"Refusing to append to non-latest daily log {target_path}. "
+            f"The latest active ISO-dated daily log is {latest_existing}. "
+            "Re-run with --allow-historical only when you intentionally need a historical append."
+        )
+        exit_with_cli_error(parser, json_mode=args.json, exit_code=2,
+            message=message,
+            payload=failure_payload("historical_append_requires_confirmation", language=workspace.workspace_language, error=message, details=historical_details))
+    binding = normalize_preflight_binding(parser, json_mode=args.json, raw=args.preflight_binding_json,
+        project_root=workspace.project_root, expected_workspace_revision=expected_workspace_revision)
+    if binding is not None and historical:
+        exit_with_cli_error(parser, json_mode=args.json, exit_code=3,
+            message="Refusing receipt-backed append to a historical daily log. v0.4.2 provenance receipts only bind the current latest daily-log cursor.",
+            payload=failure_payload("historical_append_not_receipt_backed", language=workspace.workspace_language, error="Historical append is not receipt backed.", details=details))
+    enforce_preflight_daily_log_cursor(parser, json_mode=args.json, workspace=workspace, state=state,
+        preflight_binding=binding, target_date=target_date, latest_existing=latest_existing)
     try:
-        with workspace_write_lock(workspace.project_root, "append_daily_log_entry.py"):
-            strict_gate = enforce_strict_sidecar_integrity_gate(
-                parser,
-                json_mode=args.json,
+        acquired = recording_transaction.acquire_preview_input(operation=OPERATION_DAILY_LOG_APPEND,
+            entry_json=args.entry_json, entry_file=args.entry_file, use_stdin=args.stdin,
+            max_input_bytes=args.max_input_bytes, project_root=workspace.project_root, storage_root=workspace.storage_root)
+    except input_transport.InputTransportError as exc:
+        _exit_input_transport_error(parser, json_mode=args.json, error=exc)
+        raise AssertionError("unreachable")
+    output_input_mode = legacy_append_input_mode(
+        acquired_mode=acquired.input_mode,
+        input_format=args.input_format,
+    )
+    if args.entry_json is not None:
+        try:
+            daily_log_append.prepare_entry_text(
+                acquired, input_format=args.input_format, entry_path=None,
                 project_root=workspace.project_root,
-                storage_root=workspace.storage_root,
             )
-            state_path = workspace.storage_root / FILE_KEYS["state"]
-            state = load_workspace_state(state_path)
-            current_state_text = read_text(state_path)
-            binding_expected_workspace_revision = (
-                state["workspace_revision"]
-                if args.expected_workspace_revision is None
-                else args.expected_workspace_revision
-            )
-            preflight_binding = normalize_preflight_binding(
-                parser,
-                json_mode=args.json,
-                raw=args.preflight_binding_json,
-                project_root=workspace.project_root,
-                expected_workspace_revision=binding_expected_workspace_revision,
-            )
-            enforce_preflight_binding_lease(
-                parser,
-                json_mode=args.json,
-                storage_root=workspace.storage_root,
-                project_root=workspace.project_root,
-                preflight_binding=preflight_binding,
-            )
-            write_gate = enforce_provenance_write_gate(
-                parser,
-                json_mode=args.json,
-                state=state,
-                preflight_binding=preflight_binding,
-                strict_gate=strict_gate,
-            )
-            logs_dir = workspace.storage_root / DAILY_LOGS_DIRNAME
-            latest_existing = latest_active_daily_log(logs_dir)
-            logical_workday = logical_workday_for(
-                datetime.now().astimezone(),
-                DEFAULT_LOGICAL_WORKDAY_ROLLOVER_HOUR,
-            )
-            update_protocol_path = workspace.storage_root / FILE_KEYS["update_protocol"]
-            project_time_policy_cues = (
-                detect_update_protocol_time_policy_cues(read_text(update_protocol_path))
-                if update_protocol_path.is_file()
-                else []
-            )
-            if args.date is None and project_time_policy_cues:
-                suggested_target_path = workspace.storage_root / DAILY_LOGS_DIRNAME / f"{logical_workday.isoformat()}.md"
-                append_failure_details = build_append_failure_details(
-                    project_root=workspace.project_root,
-                    target_path=suggested_target_path,
-                    target_date=logical_workday.isoformat(),
-                    current_workspace_revision=state["workspace_revision"],
-                    entry_path=entry_path,
-                    input_mode=input_mode,
-                    extra={
-                        "auto_detected_date": True,
-                        "auto_detected_workspace_revision": args.expected_workspace_revision is None,
-                        "date_resolution_source": "project_local_review_required",
-                        "workspace_revision_source": (
-                            "state_current" if args.expected_workspace_revision is None else "explicit"
-                        ),
-                        "logical_workday": logical_workday.isoformat(),
-                        "latest_active_daily_log": str(latest_existing) if latest_existing is not None else None,
-                        "latest_active_day": latest_existing.stem if latest_existing is not None else None,
-                        "project_time_policy_cues": project_time_policy_cues,
-                    },
-                )
-                message = (
-                    "Project-local time-policy cues were detected in update_protocol.md. "
-                    "Append requires an explicit --date before writing when date auto-detect would otherwise apply."
-                )
-                exit_with_append_date_guard(
-                    parser,
-                    json_mode=args.json,
-                    workspace_language=workspace.workspace_language,
-                    exit_code=2,
-                    reason="project_time_policy_review_required",
-                    message=message,
-                    details=append_failure_details,
-                )
-            target_date, latest_existing_date, date_resolution_source = resolve_target_date(
-                explicit_date=args.date,
-                latest_existing=latest_existing,
-                logical_workday=logical_workday,
-            )
-            target_date_iso = target_date.isoformat()
-            target_path = workspace.storage_root / DAILY_LOGS_DIRNAME / f"{target_date_iso}.md"
-            resolved_workspace_revision = (
-                state["workspace_revision"]
-                if args.expected_workspace_revision is None
-                else args.expected_workspace_revision
-            )
-            workspace_revision_source = (
+        except daily_log_append.DailyLogAppendPlannerError as exc:
+            _exit_daily_log_append_planner_error(parser, json_mode=args.json, error=exc)
+    planner_failure_details = build_append_failure_details(
+        project_root=workspace.project_root,
+        target_path=target_path,
+        target_date=target_date.isoformat(),
+        current_workspace_revision=state["workspace_revision"],
+        entry_path=Path(args.entry_file) if args.entry_file else None,
+        input_mode=output_input_mode,
+        extra={
+            "auto_detected_date": args.date is None,
+            "auto_detected_workspace_revision": args.expected_workspace_revision is None,
+            "date_resolution_source": date_resolution_source,
+            "workspace_revision_source": (
                 "state_current"
                 if args.expected_workspace_revision is None
                 else "explicit"
-            )
-            workspace_revision_guard_mode = (
-                "lock_snapshot_current"
-                if args.expected_workspace_revision is None
-                else "explicit_mismatch_check"
-            )
-            append_failure_details = build_append_failure_details(
-                project_root=workspace.project_root,
-                target_path=target_path,
-                target_date=target_date_iso,
-                current_workspace_revision=state["workspace_revision"],
-                entry_path=entry_path,
-                input_mode=input_mode,
-                extra={
-                    "auto_detected_date": args.date is None,
-                    "auto_detected_workspace_revision": args.expected_workspace_revision is None,
-                    "date_resolution_source": date_resolution_source,
-                    "workspace_revision_source": workspace_revision_source,
-                    "logical_workday": logical_workday.isoformat(),
-                    "latest_active_daily_log": str(latest_existing) if latest_existing is not None else None,
-                    "latest_active_day": (
-                        latest_existing_date.isoformat() if latest_existing_date is not None else None
-                    ),
-                },
-            )
-            if (
-                args.expected_workspace_revision is not None
-                and state["workspace_revision"] != args.expected_workspace_revision
-            ):
-                exit_with_cli_error(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=3,
-                    message=(
-                        f"Workspace revision changed from {args.expected_workspace_revision} to "
-                        f"{state['workspace_revision']}. Rerun preflight before appending."
-                    ),
-                    payload=failure_payload(
-                        "stale_write_context",
-                        language=workspace.workspace_language,
-                        error=(
-                            f"Workspace revision changed from {args.expected_workspace_revision} to "
-                            f"{state['workspace_revision']}. Rerun preflight before appending."
-                        ),
-                        details={
-                            "expected_workspace_revision": args.expected_workspace_revision,
-                            **append_failure_details,
-                        },
-                    ),
-                )
-
-            latest_existing_date = enforce_logical_workday_append_guards(
-                parser,
-                json_mode=args.json,
-                workspace_language=workspace.workspace_language,
-                target_path=target_path,
-                target_date=target_date,
-                latest_existing=latest_existing,
-                logical_workday=logical_workday,
-                recovery_details=append_failure_details,
-            )
-            if (
-                latest_existing_date is not None
-                and target_date < latest_existing_date
-                and not args.allow_historical
-            ):
-                exit_with_cli_error(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=2,
-                    message=(
-                        f"Refusing to append to non-latest daily log {target_path}. "
-                        f"The latest active ISO-dated daily log is {latest_existing}. "
-                        "Re-run with --allow-historical only when you intentionally need a historical append."
-                    ),
-                    payload=failure_payload(
-                        "historical_append_requires_confirmation",
-                        language=workspace.workspace_language,
-                        error=(
-                            f"Refusing to append to non-latest daily log {target_path}. "
-                            f"The latest active ISO-dated daily log is {latest_existing}. "
-                            "Re-run with --allow-historical only when you intentionally need a historical append."
-                        ),
-                        details={
-                            **append_failure_details,
-                            "latest_active_daily_log": str(latest_existing),
-                        },
-                    ),
-                )
-            if (
-                preflight_binding is not None
-                and latest_existing_date is not None
-                and target_date < latest_existing_date
-            ):
-                message = (
-                    "Refusing receipt-backed append to a historical daily log. "
-                    "v0.4.2 provenance receipts only bind the current latest daily-log cursor."
-                )
-                exit_with_cli_error(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=3,
-                    message=message,
-                    payload=failure_payload(
-                        "historical_append_not_receipt_backed",
-                        language=workspace.workspace_language,
-                        error=message,
-                        details={
-                            **append_failure_details,
-                            "latest_active_daily_log": str(latest_existing),
-                            "reason_code": "historical_append_not_receipt_backed",
-                            "side_effect": "none",
-                        },
-                    ),
-                )
-            enforce_preflight_daily_log_cursor(
-                parser,
-                json_mode=args.json,
-                workspace=workspace,
-                state=state,
-                preflight_binding=preflight_binding,
-                target_date=target_date,
-                latest_existing=latest_existing,
-            )
-
-            missing_keys = missing_section_keys(body_text, SECTION_KEYS["daily_log"])
-            validate_entry_body(
-                parser,
-                json_mode=args.json,
-                body_text=body_text,
-                recovery_details=append_failure_details,
-            )
-            if missing_keys:
-                exit_with_failure_contract(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=2,
-                    message=(
-                        "Refusing to append a daily-log entry because the prepared entry file is missing required "
-                        "section markers: " + ", ".join(missing_keys)
-                    ),
-                    reason="invalid_prepared_input",
-                    details={
-                        **append_failure_details,
-                        "missing_section_keys": missing_keys,
-                    },
-                )
-            duplicate_keys = duplicate_section_keys(body_text)
-            if duplicate_keys:
-                exit_with_failure_contract(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=2,
-                    message=(
-                        "Refusing to append a daily-log entry because the prepared entry file contains duplicate "
-                        "section markers: " + ", ".join(duplicate_keys)
-                    ),
-                    reason="invalid_prepared_input",
-                    details={
-                        **append_failure_details,
-                        "duplicate_section_keys": duplicate_keys,
-                    },
-                )
-            unknown_keys = unknown_section_keys(body_text, SECTION_KEYS["daily_log"])
-            if unknown_keys:
-                exit_with_failure_contract(
-                    parser,
-                    json_mode=args.json,
-                    exit_code=2,
-                    message=(
-                        "Refusing to append a daily-log entry because the prepared entry file contains unknown "
-                        "section markers: " + ", ".join(unknown_keys)
-                    ),
-                    reason="invalid_prepared_input",
-                    details={
-                        **append_failure_details,
-                        "unknown_section_keys": unknown_keys,
-                    },
-                )
-            next_seq = 1
-            try:
-                current_text = read_text(target_path)
-                target_existed = True
-            except FileNotFoundError:
-                if not stable_path_absent(target_path):
-                    exit_concurrent_external_modification(
-                        parser,
-                        json_mode=args.json,
-                        new_workspace_revision=state["workspace_revision"] + 1,
-                        target_entry_seq=next_seq,
-                        side_effect="external_target_modification_preserved",
-                    )
-                current_text = ""
-                target_existed = False
-            if target_existed:
-                marker = parse_file_marker(current_text)
-                if marker is None or marker.file_key != "daily_log":
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=f"Target daily log is missing a valid daily_log file marker: {target_path}",
-                        reason="malformed_managed_file",
-                        details={"path": str(target_path)},
-                    )
-                if marker.language != workspace.workspace_language:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=(
-                            f"Target daily log language marker '{marker.language}' does not match workspace_language "
-                            f"'{workspace.workspace_language}'. Repair the target file before appending."
-                        ),
-                        reason="malformed_managed_file",
-                        details={"path": str(target_path)},
-                    )
-                target_latest_file = target_path.relative_to(workspace.storage_root).as_posix()
-                try:
-                    target_cursor = daily_log_cursor_from_text(
-                        current_text,
-                        path=target_path,
-                        latest_file=target_latest_file,
-                    )
-                except DailyLogCursorError as exc:
-                    exit_with_failure_contract(
-                        parser,
-                        json_mode=args.json,
-                        exit_code=2,
-                        message=f"Refusing to append to damaged daily log {target_path}: {exc}",
-                        reason="malformed_managed_file",
-                        details=exc.details,
-                    )
-                next_seq = target_cursor.entry_count + 1
-                managed_current_text = canonicalize_managed_text_newlines(current_text)
-                scaffold = parse_daily_log_scaffold_marker(managed_current_text)
-                if scaffold and target_cursor.entry_count == 0:
-                    header = file_marker("daily_log", workspace.workspace_language)
-                    updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
-                else:
-                    updated_text = (
-                        managed_current_text.rstrip("\n")
-                        + "\n\n"
-                        + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq)
-                        + "\n"
-                    )
-            else:
-                header = file_marker("daily_log", workspace.workspace_language)
-                updated_text = header + "\n" + build_entry_block(body_text, writer_id=writer_id, entry_seq=next_seq) + "\n"
-
-            confirmed_state = load_workspace_state(state_path)
-            if confirmed_state != state or read_text(state_path) != current_state_text:
-                exit_concurrent_external_modification(
-                    parser,
-                    json_mode=args.json,
-                    new_workspace_revision=state["workspace_revision"] + 1,
-                    target_entry_seq=next_seq,
-                    side_effect="external_state_modification_preserved",
-                )
-            new_workspace_revision = state["workspace_revision"] + 1
-            receipt_store_snapshot = prevalidate_receipt_store_before_append(
-                parser,
-                json_mode=args.json,
-                storage_root=workspace.storage_root,
-                project_root=workspace.project_root,
-                preflight_binding=preflight_binding,
-                new_workspace_revision=new_workspace_revision,
-                target_entry_seq=next_seq,
-            )
-            try:
-                if target_existed:
-                    atomic_write_and_verify_if_unchanged(
-                        target_path,
-                        expected_text=current_text,
-                        new_text=updated_text,
-                    )
-                else:
-                    write_text_create_only(target_path, updated_text)
-            except (LockBusyError, OSError, UnicodeDecodeError) as exc:
-                handle_target_write_failure(
-                    parser,
-                    json_mode=args.json,
-                    failure=exc,
-                    target_path=target_path,
-                    previous_target_existed=target_existed,
-                    previous_target_text=current_text if target_existed else None,
-                    expected_target_text=updated_text,
-                    new_workspace_revision=new_workspace_revision,
-                    target_entry_seq=next_seq,
-                )
-
-            previous_state_label = str(write_gate["provenance_state"])
-            previous_entry_seq = next_seq - 1
-            state["workspace_revision"] = new_workspace_revision
-            target_is_latest_after_write = (
-                latest_existing_date is None or target_date >= latest_existing_date
-            )
-            if target_is_latest_after_write:
-                state["daily_logs"]["latest_file"] = target_path.relative_to(workspace.storage_root).as_posix()
-                state["daily_logs"]["latest_entry_id"] = f"entry-{next_seq}"
-                state["daily_logs"]["latest_entry_seq"] = next_seq
-                state["daily_logs"]["entry_count"] = next_seq
-                refreshed_at = now_iso_timestamp()
-                if refreshed_at == state["daily_logs"].get("updated_at"):
-                    refreshed_at = datetime.now().astimezone().isoformat(timespec="microseconds")
-                state["daily_logs"]["updated_at"] = refreshed_at
-            receipt_timestamp = now_iso_timestamp()
-            if preflight_binding is not None and target_is_latest_after_write:
-                state["provenance"] = helper_evidenced_metadata(
-                    timestamp=receipt_timestamp,
-                    previous_state_label=(
-                        previous_state_label if isinstance(previous_state_label, str) else None
-                    ),
-                )
-            expected_state_text = expected_state_json_text(state)
-            try:
-                atomic_write_and_verify_if_unchanged(
-                    state_path,
-                    expected_text=current_state_text,
-                    new_text=expected_state_text,
-                )
-            except (LockBusyError, OSError, UnicodeDecodeError):
-                handle_state_write_failure(
-                    parser,
-                    json_mode=args.json,
-                    target_path=target_path,
-                    state_path=state_path,
-                    expected_target_text=updated_text,
-                    previous_state_text=current_state_text,
-                    expected_state_text=expected_state_text,
-                    new_workspace_revision=new_workspace_revision,
-                    target_entry_seq=next_seq,
-                )
-            if preflight_binding is not None and target_is_latest_after_write:
-                if not isinstance(receipt_store_snapshot, ReceiptStoreSnapshot):
-                    raise AssertionError("Receipt-backed appends require a frozen store snapshot.")
-                target_digest, state_digest = verify_post_append_hashes(
-                    parser,
-                    json_mode=args.json,
-                    project_root=workspace.project_root,
-                    storage_root=workspace.storage_root,
-                    target_path=target_path,
-                    state_path=state_path,
-                    expected_target_text=updated_text,
-                    expected_state_text=expected_state_text,
-                    new_workspace_revision=new_workspace_revision,
-                    target_entry_seq=next_seq,
-                    target_date=target_date_iso,
-                    state=state,
-                    previous_state_label=previous_state_label,
-                    preflight_binding_digest=str(
-                        preflight_binding["preflight_contract_hash"]
-                    ),
-                    receipt_store_snapshot=receipt_store_snapshot,
-                )
-                receipt_seed = build_append_receipt_seed(
-                    preflight_binding=preflight_binding,
-                    timestamp=receipt_timestamp,
-                    target_digest=target_digest,
-                    state_digest=state_digest,
-                    previous_entry_seq=previous_entry_seq,
-                    next_entry_seq=next_seq,
-                    new_workspace_revision=new_workspace_revision,
-                )
-                try:
-                    receipt_finalization = finalize_receipt_in_store(
-                        storage_root=workspace.storage_root,
-                        receipt=receipt_seed,
-                        project_root=workspace.project_root,
-                        expected_snapshot=receipt_store_snapshot,
-                    )
-                except ReceiptStoreError as exc:
-                    if exc.reason_code == RECEIPT_STORE_NOT_WRITTEN_VERIFIED:
-                        downgrade_after_verified_receipt_not_written(
-                            parser,
-                            json_mode=args.json,
-                            project_root=workspace.project_root,
-                            storage_root=workspace.storage_root,
-                            target_path=target_path,
-                            state_path=state_path,
-                            state=state,
-                            expected_target_text=updated_text,
-                            expected_state_text=expected_state_text,
-                            receipt_store_snapshot=receipt_store_snapshot,
-                            previous_state_label=previous_state_label,
-                            new_workspace_revision=new_workspace_revision,
-                            target_entry_seq=next_seq,
-                        )
-                    exit_receipt_finalization_failure(
-                        parser,
-                        json_mode=args.json,
-                        message=str(exc),
-                        reason_code=exc.reason_code,
-                        side_effect=exc.side_effect,
-                        new_workspace_revision=new_workspace_revision,
-                        target_entry_seq=next_seq,
-                        extra=exc.details,
-                    )
-                finalized_store_snapshot = receipt_finalization.get("store_snapshot")
-                if not isinstance(finalized_store_snapshot, ReceiptStoreSnapshot):
-                    raise AssertionError("Finalized append receipts require a verified store snapshot.")
-                verify_finalized_append_evidence(
-                    parser,
-                    json_mode=args.json,
-                    project_root=workspace.project_root,
-                    storage_root=workspace.storage_root,
-                    target_path=target_path,
-                    state_path=state_path,
-                    expected_target_text=updated_text,
-                    expected_state_text=expected_state_text,
-                    receipt_store_snapshot=finalized_store_snapshot,
-                    new_workspace_revision=new_workspace_revision,
-                    target_entry_seq=next_seq,
-                )
-    except LockBusyError as exc:
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=3,
-            message=str(exc),
-            reason="write_lock_busy",
-        )
-    except ConfigContractError as exc:
-        exit_with_cli_error(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=str(exc),
-            payload=cli_failure_payload_for_exception(exc, default_reason="damaged_sidecar"),
-        )
-    except (OSError, UnicodeDecodeError) as exc:
-        message = f"Filesystem error: {exc}"
-        exit_with_failure_contract(
-            parser,
-            json_mode=args.json,
-            exit_code=2,
-            message=message,
-            reason="damaged_sidecar",
-        )
-
-    payload = {
-        "ok": True,
-        "input_mode": input_mode,
-        "target_path": str(target_path),
-        "entry_seq": next_seq,
-        "new_workspace_revision": state["workspace_revision"],
-        "allow_historical": args.allow_historical,
-        "state_cursor_updated": target_is_latest_after_write,
-        **attribution.public_fields(),
-        "auto_detect": {
-            "date_used": args.date is None,
-            "workspace_revision_used": args.expected_workspace_revision is None,
-            "logical_workday": logical_workday.isoformat(),
-            "latest_active_daily_log": str(latest_existing) if latest_existing is not None else None,
-            "latest_active_day": (
-                latest_existing_date.isoformat() if latest_existing_date is not None else None
             ),
-            "resolved_date": target_date.isoformat(),
-            "resolved_workspace_revision": resolved_workspace_revision,
-            "date_resolution_source": date_resolution_source,
-            "workspace_revision_source": workspace_revision_source,
-            "workspace_revision_guard_mode": workspace_revision_guard_mode,
+            "logical_workday": logical_workday.isoformat(),
+            "latest_active_daily_log": (
+                str(latest_existing) if latest_existing else None
+            ),
+            "latest_active_day": (
+                latest_existing_date.isoformat() if latest_existing_date else None
+            ),
         },
-    }
-    if wrapper_metadata is not None:
-        payload["wrapper_metadata"] = wrapper_metadata
+    )
+    if args.no_auto_detect and (args.date is None or args.expected_workspace_revision is None):
+        missing = [name for name, value in (("date", args.date), ("expected_workspace_revision", args.expected_workspace_revision)) if value is None]
+        exit_with_failure_contract(parser, json_mode=args.json, exit_code=2,
+            message="--no-auto-detect requires explicit --date and --expected-workspace-revision. Missing: " + ", ".join(missing) + ".",
+            reason="invalid_prepared_input", details={
+                "project_root": str(workspace.project_root),
+                "input_mode": output_input_mode,
+                "missing_fields": missing, "no_auto_detect": True,
+            })
+    if state["workspace_revision"] != expected_workspace_revision:
+        message = (
+            f"Workspace revision changed from {expected_workspace_revision} to "
+            f"{state['workspace_revision']}. Rerun preflight before appending."
+        )
+        exit_with_cli_error(parser, json_mode=args.json, exit_code=3, message=message,
+            payload=failure_payload("stale_write_context", language=workspace.workspace_language,
+                error=message, details={
+                    "expected_workspace_revision": expected_workspace_revision,
+                    **planner_failure_details,
+                }))
+    cursor = daily_log_cursor_state_fields(state.get("daily_logs", {}))
+    cursor["target_path"] = str(target_path)
+    cursor["target_is_latest_after_write"] = not historical
+    expected_file_revision = 0
+    if target_path.is_file():
+        expected_file_revision = daily_log_cursor_from_text(read_text(target_path), path=target_path, latest_file=target_path.relative_to(workspace.storage_root).as_posix()).entry_count
+    request = recording_transaction.TransactionRequest(context=OperationContext(command=COMMAND_APPEND, operation=OPERATION_DAILY_LOG_APPEND, write_type="milestone_evidence", input_mode=acquired.input_mode, stage=STAGE_PREFLIGHT),
+        mode=recording_transaction.MODE_APPLY, workspace_root=workspace.project_root, storage_root=workspace.storage_root,
+        acquired_input=acquired, file_key="daily_log", write_type="milestone_evidence",
+        expected_file_revision=expected_file_revision, expected_workspace_revision=expected_workspace_revision,
+        expected_cursor=cursor, expected_input_digest=None, preview_binding=None, confirmation=None, writer_attribution=attribution)
+    outcome = recording_transaction.run_transaction(request, support=support, preflight_binding=binding, authority=authority,
+        package_version=PACKAGE_VERSION, input_format=args.input_format, source_file=args.entry_file)
+    if isinstance(outcome, recording_transaction.TransactionFailure):
+        cause = outcome.cause
+        if isinstance(cause, daily_log_append.DailyLogAppendPlannerError):
+            _exit_daily_log_append_planner_error(
+                parser,
+                json_mode=args.json,
+                error=cause,
+                legacy_details=planner_failure_details,
+            )
+        if isinstance(cause, recording_transaction.TransactionStageError):
+            exit_with_failure_contract(parser, json_mode=args.json, exit_code=cause.exit_code, message=cause.message, reason=cause.reason, details=cause.details, findings=cause.findings, extra=cause.extra)
+        raise AssertionError(f"untyped transaction failure: {cause!r}")
+    result, receipt_finalization = outcome
+    payload = {"ok": True, "input_mode": output_input_mode, "target_path": str(target_path),
+        "entry_seq": result.revisions["new_file_revision"], "new_workspace_revision": result.revisions["new_workspace_revision"],
+        "allow_historical": args.allow_historical, "state_cursor_updated": not historical, **attribution.public_fields(),
+        "auto_detect": {"date_used": args.date is None, "workspace_revision_used": args.expected_workspace_revision is None,
+            "logical_workday": logical_workday.isoformat(), "latest_active_daily_log": str(latest_existing) if latest_existing else None,
+            "latest_active_day": latest_existing_date.isoformat() if latest_existing_date else None, "resolved_date": target_date.isoformat(),
+            "resolved_workspace_revision": expected_workspace_revision, "date_resolution_source": date_resolution_source,
+            "workspace_revision_source": "state_current" if args.expected_workspace_revision is None else "explicit",
+            "workspace_revision_guard_mode": "lock_snapshot_current" if args.expected_workspace_revision is None else "explicit_mismatch_check"}}
+    if wrapper_metadata is not None: payload["wrapper_metadata"] = wrapper_metadata
     if receipt_finalization is not None:
         receipt = receipt_finalization["receipt"]
-        payload.update(
-            {
-                "provenance_state": "helper_evidenced",
-                "provenance_result": {
-                    "state_label": "helper_evidenced",
-                    "receipt_backed": True,
-                    "receipt_finalization_status": "finalized",
-                    "receipt_store_available": True,
-                    "receipt_digest": receipt_finalization["receipt_digest"],
-                    "store_binding": receipt_finalization["store_binding"],
-                    "redaction_policy_version": receipt.get("redaction_policy_version"),
-                },
-                "public_receipt_claim": public_receipt_claim(
-                    receipt,
-                    project_root=str(workspace.project_root),
-                ),
-            }
-        )
+        payload.update({"provenance_state": "helper_evidenced", "provenance_result": {"state_label": "helper_evidenced", "receipt_backed": True, "receipt_finalization_status": "finalized", "receipt_store_available": True, "receipt_digest": receipt_finalization["receipt_digest"], "store_binding": receipt_finalization["store_binding"], "redaction_policy_version": receipt.get("redaction_policy_version")}, "public_receipt_claim": public_receipt_claim(receipt, project_root=str(workspace.project_root))})
     if args.json:
-        if startup_residue_report is not None:
-            payload["startup_residue_report"] = startup_residue_report
-        public_payload = publicize_json_value(payload, project_root=workspace.project_root)
-        print(json.dumps(public_payload, ensure_ascii=False, indent=2))
+        if startup_residue_report is not None: payload["startup_residue_report"] = startup_residue_report
+        print(json.dumps(publicize_json_value(payload, project_root=workspace.project_root), ensure_ascii=False, indent=2))
     else:
-        public_target = public_project_path(target_path, project_root=workspace.project_root)
-        print(f"Appended daily log entry to {public_target or 'daily log'}")
+        print(f"Appended daily log entry to {public_project_path(target_path, project_root=workspace.project_root) or 'daily log'}")
 
 
 if __name__ == "__main__":

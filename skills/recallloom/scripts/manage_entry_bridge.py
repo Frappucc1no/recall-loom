@@ -18,6 +18,7 @@ from core.bridge.blocks import (
 from core.protocol.contracts import FILE_KEYS, ROOT_ENTRY_CANDIDATES
 from core.provenance.state import helper_write_gate_from_state
 from core.safety.attached_text import scan_auto_attached_context_text
+from core.workspace.atomic_io import atomic_write_if_unchanged
 
 from _common import (
     ConfigContractError,
@@ -27,7 +28,6 @@ from _common import (
     cli_failure_payload_for_exception,
     enforce_package_support_gate,
     exit_with_cli_error,
-    atomic_write_if_unchanged,
     LockBusyError,
     load_workspace_state,
     dump_json,

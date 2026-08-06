@@ -41,7 +41,7 @@ For package inventory, protocol details, and helper-script behavior, rely on the
 ## Package Facts
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.8.3`
+- package version: `0.5.0`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`
@@ -156,6 +156,10 @@ The others are operator-facing stable action names that can be interpreted by th
 Natural language remains the default public phrasing for these actions.
 
 The dispatcher command surface also includes `quick-summary`, `record --suggest`, `record --plan`, `append`, `write`, `sync-current-state-after-append`, and `repair-daily-log-cursor`.
+For `append`, `write`, and `sync-current-state-after-append` only, use
+`--compact-json` when a bounded transaction result is needed: it emits
+`recallloom.transaction.compact/1.0`, remains below 2048 UTF-8 bytes, and is
+mutually exclusive with the legacy schema-1.1 `--json` output.
 Use `quick-summary` for current-state snapshots, `record --suggest` to produce a side-effect-free candidate recording prompt after a durable milestone/decision/validation signal, `record --plan` to classify a recording intent and get the next safe helper step, `append --entry-json` for milestone logging, `write --type ... --source-file <prepared-file> --dry-run` or `write --type ... --stdin --dry-run` before typed managed-file writes, and `sync-current-state-after-append --reuse-current-summary --semantic-unchanged-assertion-json <json>` only after preflight allows metadata-only `post_append_summary_sync`; see `references/recording-workflow.md` for the bound assertion JSON skeleton.
 `record --suggest` never writes, never watches in the background, and never turns sensitive or attached raw material into a write path; it only returns a sanitized candidate summary and suggested `record --plan` path when a prompt is appropriate.
 Use `repair-daily-log-cursor` in preview mode first when `state.json.daily_logs` no longer matches the parsed latest active daily log. Preview returns a public-safe repair classification, `preview_digest`, expected workspace revision, confirmation material, and post-repair validation step. Apply mode requires `--apply --yes` plus a fresh preview binding through `--expected-workspace-revision` or `--preview-digest`, is support-gated as mutating, and repairs cursor fields without writing helper receipts or rewriting daily-log content.

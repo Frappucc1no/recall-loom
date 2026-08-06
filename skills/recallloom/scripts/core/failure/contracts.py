@@ -8,6 +8,13 @@ import shutil
 import shlex
 import sys
 
+from core.failure.context import (
+    OPERATION_DAILY_LOG_APPEND,
+    OPERATION_MANAGED_WRITE,
+    OPERATION_POST_APPEND_SUMMARY_SYNC,
+    legacy_command_for,
+    legacy_operation_for,
+)
 from core.output.privacy import (
     private_json_paths_enabled,
     publicize_json_value,
@@ -53,6 +60,21 @@ FAILURE_REASON_ALIASES = {
 
 
 FAILURE_REASON_REGISTRY = {
+    "invalid_transaction_authority": {
+        "blocked": True,
+        "recoverability": "user_input_required",
+        "surface_level": "operator",
+        "trust_effect": "none",
+        "next_actions": ["use_recallloom_dispatcher"],
+        "user_message": {
+            "en": "This direct helper invocation has no valid in-process transaction authority.",
+            "zh-CN": "此次直接 helper 调用没有有效的进程内事务授权。",
+        },
+        "operator_note": {
+            "en": "Run the mutation through recallloom.py; persisted leases never authorize final writes.",
+            "zh-CN": "请通过 recallloom.py 执行写入；持久化 lease 永远不能授权最终写入。",
+        },
+    },
     "python_runtime_unavailable": {
         "blocked": True,
         "recoverability": "retryable",
@@ -1238,7 +1260,9 @@ def _invalid_prepared_input_suggestion(language: str, details: dict | None) -> s
                 "--require-provenance 时必须且只能选择 --changed-only 或 --full。"
             ),
         )
-    if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
+    if command == legacy_command_for(
+        OPERATION_POST_APPEND_SUMMARY_SYNC
+    ) or operation == legacy_operation_for(OPERATION_POST_APPEND_SUMMARY_SYNC):
         return _localized_text(
             language,
             en=(
@@ -1256,7 +1280,9 @@ def _invalid_prepared_input_suggestion(language: str, details: dict | None) -> s
             en="Fix the archive arguments, then rerun archive preview or status.",
             zh_cn="请先修正 archive 参数，再重新运行 archive preview 或 status。",
         )
-    if command == "write" or operation == "managed_file_commit":
+    if command == legacy_command_for(OPERATION_MANAGED_WRITE) or operation == legacy_operation_for(
+        OPERATION_MANAGED_WRITE
+    ):
         return _localized_text(
             language,
             en=(
@@ -1961,7 +1987,9 @@ def _failure_recovery_command(
     if reason == "invalid_prepared_input":
         command = details.get("command") if details else None
         operation = details.get("operation") if details else None
-        if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
+        if command == legacy_command_for(
+            OPERATION_POST_APPEND_SUMMARY_SYNC
+        ) or operation == legacy_operation_for(OPERATION_POST_APPEND_SUMMARY_SYNC):
             return (
                 "Fix the reviewed rolling-summary JSON payload on stdin, then rerun "
                 "recallloom.py sync-current-state-after-append <project-path> "
@@ -1977,7 +2005,9 @@ def _failure_recovery_command(
                 "Fix the archive arguments, then rerun archive_logs.py <project-path> "
                 "--max-active <non-negative-count> --json."
             )
-        if command == "write" or operation == "managed_file_commit":
+        if command == legacy_command_for(OPERATION_MANAGED_WRITE) or operation == legacy_operation_for(
+            OPERATION_MANAGED_WRITE
+        ):
             write_type = details.get("write_type") if details else None
             if not isinstance(write_type, str) or not write_type.strip():
                 write_type = "current-state"
@@ -2055,7 +2085,7 @@ def _dispatcher_project_arg(details: dict | None) -> str:
 
 
 _SAFE_ROUTING_COMMANDS = {
-    "append",
+    legacy_command_for(OPERATION_DAILY_LOG_APPEND),
     "archive",
     "bridge",
     "init",
@@ -2063,16 +2093,16 @@ _SAFE_ROUTING_COMMANDS = {
     "repair-daily-log-cursor",
     "resume",
     "status",
-    "sync-current-state-after-append",
+    legacy_command_for(OPERATION_POST_APPEND_SUMMARY_SYNC),
     "validate",
-    "write",
+    legacy_command_for(OPERATION_MANAGED_WRITE),
 }
 _SAFE_ROUTING_OPERATIONS = {
-    "daily_log_append",
+    legacy_operation_for(OPERATION_DAILY_LOG_APPEND),
     "daily_log_archive",
-    "managed_file_commit",
+    legacy_operation_for(OPERATION_MANAGED_WRITE),
     "package_support_gate",
-    "post_append_summary_sync",
+    legacy_operation_for(OPERATION_POST_APPEND_SUMMARY_SYNC),
     "repair_daily_log_cursor",
 }
 _SAFE_ROUTING_INPUT_MODES = {
@@ -2217,7 +2247,9 @@ def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
         return f"recallloom.py validate {project_arg} --json"
     if command == "repair-daily-log-cursor" or operation == "repair_daily_log_cursor":
         return f"recallloom.py repair-daily-log-cursor {project_arg} --json"
-    if command == "sync-current-state-after-append" or operation == "post_append_summary_sync":
+    if command == legacy_command_for(
+        OPERATION_POST_APPEND_SUMMARY_SYNC
+    ) or operation == legacy_operation_for(OPERATION_POST_APPEND_SUMMARY_SYNC):
         return (
             f"recallloom.py sync-current-state-after-append {project_arg} "
             "--stdin --input-format json --json"
@@ -2249,7 +2281,7 @@ def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
             f"--source-file {source_placeholder} --dry-run --json"
         )
     command = details.get("command") if isinstance(details, dict) else None
-    if command == "write":
+    if command == legacy_command_for(OPERATION_MANAGED_WRITE):
         write_type = details.get("write_type") if isinstance(details, dict) else None
         if not isinstance(write_type, str) or not write_type.strip():
             write_type = "current-state"
@@ -2257,7 +2289,7 @@ def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
             f"recallloom.py write {project_arg} --type {write_type} "
             "--source-file <prepared-file> --dry-run --json"
         )
-    if command == "append":
+    if command == legacy_command_for(OPERATION_DAILY_LOG_APPEND):
         return (
             f"recallloom.py append {project_arg} "
             + " ".join(_append_placeholder_args(details))
@@ -2282,14 +2314,14 @@ def _single_next_for_invalid_prepared_input(details: dict | None) -> str:
 def _single_next_for_confirmation_required(details: dict | None) -> str:
     project_arg = _dispatcher_project_arg(details)
     command = details.get("command") if isinstance(details, dict) else None
-    if command == "append":
+    if command == legacy_command_for(OPERATION_DAILY_LOG_APPEND):
         return (
             f"recallloom.py append {project_arg} "
             + " ".join(_append_placeholder_args(details))
             + " "
             "--confirm-review-imported-baseline --json"
         )
-    if command == "sync-current-state-after-append":
+    if command == legacy_command_for(OPERATION_POST_APPEND_SUMMARY_SYNC):
         return (
             f"recallloom.py sync-current-state-after-append {project_arg} "
             "--stdin --input-format json --confirm-review-imported-baseline --json"

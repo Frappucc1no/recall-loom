@@ -141,6 +141,12 @@ inside the dispatcher/integration path.
 The existing `sync-current-state-after-append` lane also accepts the confirmation
 when its own post-append contract requires it; it still delegates through the
 same internal binding/lease boundary.
+
+The three dispatcher mutation commands (`append`, `write`, and
+`sync-current-state-after-append`) also accept `--compact-json` for the bounded
+`recallloom.transaction.compact/1.0` result. It is mutually exclusive with
+legacy `--json`, preserves the exit code, contains exactly one safe next action,
+and must remain below 2048 UTF-8 bytes.
 If the binding is omitted, stale, malformed, missing its lease or confirmation,
 or has a mismatched hash, stop and return the helper failure contract rather
 than attempting a write.

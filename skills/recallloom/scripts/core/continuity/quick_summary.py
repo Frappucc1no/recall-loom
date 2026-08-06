@@ -16,7 +16,7 @@ from core.continuity.freshness import (
 from core.output.privacy import public_project_root_label, redact_public_text
 from core.protocol.sections import extract_section_text
 
-from _common import validate_state_entry_bearing_latest_daily_log
+from core.continuity.daily_log import validate_state_entry_bearing_latest_daily_log
 
 
 PROJECT_VERSION_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_-]*)\s+v?\d+\.\d+(?:\.\d+)?\b")

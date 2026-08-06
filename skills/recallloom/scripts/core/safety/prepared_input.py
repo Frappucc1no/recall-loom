@@ -1,4 +1,11 @@
-"""Prepared file-input containment for mutating helper inputs."""
+"""Prepared file-input containment for mutating helper inputs.
+
+Single owner of the file-level token/path/link/identity safety checks. The
+v0.5.0 §7.3 scratch orchestrator (core/safety/input_transport.py, T050-01C)
+reuses the additive ``RegularFileIdentity`` / ``lstat_regular_file_identity`` /
+``read_stable_regular_file_bytes`` primitives below; the pre-existing helper
+validators above are byte-for-byte unchanged and keep their exact behavior.
+"""
 
 from __future__ import annotations
 
@@ -589,3 +596,208 @@ def read_prepared_input_source_text(
             path_ref=source.path_ref,
             label=label,
         )
+
+
+# --- additive stable-read primitives (v0.5.0 §7.3 scratch orchestration) ----
+#
+# Exposed for the single scratch orchestrator core/safety/input_transport.py
+# (T050-01C) so the capability manifest/content reads reuse this module's
+# token/path/link/identity checks instead of growing a second safety owner.
+# The rejection vocabulary is exactly the pre-existing source_path_* family.
+
+
+@dataclass(frozen=True)
+class RegularFileIdentity:
+    """lstat/fstat identity tuple of one regular file."""
+
+    st_dev: int
+    st_ino: int
+    st_mode: int
+    st_nlink: int
+    st_size: int
+
+
+def _identity_from_stat(result: os.stat_result) -> RegularFileIdentity:
+    return RegularFileIdentity(
+        st_dev=result.st_dev,
+        st_ino=result.st_ino,
+        st_mode=result.st_mode,
+        st_nlink=result.st_nlink,
+        st_size=result.st_size,
+    )
+
+
+def lstat_regular_file_identity(
+    path: Path,
+    *,
+    label: str,
+    path_category: str,
+    path_ref: str,
+) -> RegularFileIdentity:
+    """lstat one candidate and reject symlink/hardlink/non-regular shapes."""
+    try:
+        candidate_lstat = path.lstat()
+    except FileNotFoundError:
+        raise _fail(
+            reason_code="source_path_missing",
+            path_category="missing",
+            path_ref=path_ref,
+            label=label,
+        )
+    except OSError as exc:
+        raise _fail(
+            reason_code="source_path_inspect_failed",
+            path_category="unknown",
+            path_ref=path_ref,
+            label=label,
+            extra={"errno": exc.errno if exc.errno is not None else errno.EIO},
+        )
+    if stat.S_ISLNK(candidate_lstat.st_mode):
+        raise _fail(
+            reason_code="source_path_symlink",
+            path_category="symlink",
+            path_ref=path_ref,
+            label=label,
+        )
+    if not stat.S_ISREG(candidate_lstat.st_mode):
+        raise _fail(
+            reason_code="source_path_not_regular_file",
+            path_category="not_regular_file",
+            path_ref=path_ref,
+            label=label,
+        )
+    if candidate_lstat.st_nlink != 1:
+        raise _fail(
+            reason_code="source_path_hardlink",
+            path_category="hardlink",
+            path_ref=path_ref,
+            label=label,
+        )
+    return _identity_from_stat(candidate_lstat)
+
+
+def _read_verified_regular_file_once(
+    path: Path,
+    *,
+    max_input_bytes: int,
+    label: str,
+    path_category: str,
+    path_ref: str,
+) -> tuple[bytes, RegularFileIdentity]:
+    """One lstat -> no-follow open -> fstat identity -> bounded read pass."""
+    lstat_identity = lstat_regular_file_identity(
+        path,
+        label=label,
+        path_category=path_category,
+        path_ref=path_ref,
+    )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        reason_code = (
+            "source_path_symlink" if exc.errno == errno.ELOOP else "source_path_open_failed"
+        )
+        raise _fail(
+            reason_code=reason_code,
+            path_category=path_category,
+            path_ref=path_ref,
+            label=label,
+            extra={"errno": exc.errno if exc.errno is not None else errno.EIO},
+        )
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            opened_identity = _identity_from_stat(os.fstat(handle.fileno()))
+            if not stat.S_ISREG(opened_identity.st_mode):
+                raise _fail(
+                    reason_code="source_path_not_regular_file",
+                    path_category="not_regular_file",
+                    path_ref=path_ref,
+                    label=label,
+                )
+            if opened_identity != lstat_identity:
+                raise _fail(
+                    reason_code="source_path_changed_after_validation",
+                    path_category=path_category,
+                    path_ref=path_ref,
+                    label=label,
+                )
+            if opened_identity.st_size > max_input_bytes:
+                raise _fail(
+                    reason_code="source_path_size_limit",
+                    path_category=path_category,
+                    path_ref=path_ref,
+                    label=label,
+                    extra={"size": opened_identity.st_size, "max_input_bytes": max_input_bytes},
+                )
+            raw = handle.read(max_input_bytes + 1)
+            closing_identity = _identity_from_stat(os.fstat(handle.fileno()))
+            if closing_identity != opened_identity:
+                raise _fail(
+                    reason_code="source_path_changed_after_validation",
+                    path_category=path_category,
+                    path_ref=path_ref,
+                    label=label,
+                )
+    except PreparedInputSafetyError:
+        raise
+    except OSError as exc:
+        raise _fail(
+            reason_code="source_path_read_failed",
+            path_category=path_category,
+            path_ref=path_ref,
+            label=label,
+            extra={"errno": exc.errno if exc.errno is not None else errno.EIO},
+        )
+    if len(raw) > max_input_bytes:
+        raise _fail(
+            reason_code="source_path_size_limit",
+            path_category=path_category,
+            path_ref=path_ref,
+            label=label,
+            extra={"size": len(raw), "max_input_bytes": max_input_bytes},
+        )
+    return raw, lstat_identity
+
+
+def read_stable_regular_file_bytes(
+    path: Path,
+    *,
+    max_input_bytes: int,
+    label: str,
+    path_category: str,
+    path_ref: str,
+) -> tuple[bytes, RegularFileIdentity]:
+    """Read one regular file with two consecutive identity-verified passes.
+
+    Both passes run lstat -> no-follow open -> fstat identity -> bounded read;
+    the file is accepted only when the identity tuples and the exact bytes of
+    the two passes agree, so a source replaced or mutated mid-read is rejected
+    with ``source_path_changed_after_validation`` instead of being acquired.
+    """
+    first_bytes, first_identity = _read_verified_regular_file_once(
+        path,
+        max_input_bytes=max_input_bytes,
+        label=label,
+        path_category=path_category,
+        path_ref=path_ref,
+    )
+    second_bytes, second_identity = _read_verified_regular_file_once(
+        path,
+        max_input_bytes=max_input_bytes,
+        label=label,
+        path_category=path_category,
+        path_ref=path_ref,
+    )
+    if second_identity != first_identity or second_bytes != first_bytes:
+        raise _fail(
+            reason_code="source_path_changed_after_validation",
+            path_category=path_category,
+            path_ref=path_ref,
+            label=label,
+        )
+    return first_bytes, first_identity

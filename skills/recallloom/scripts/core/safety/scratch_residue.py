@@ -145,6 +145,16 @@ def _path_ref_for(path: Path) -> str:
     return _path_ref(_safe_path_for_ref(path))
 
 
+def public_scratch_path_ref(path: str | Path) -> str:
+    """Public-safe sha256:<16 hex> path ref for residue reports.
+
+    Additive exposure for the v0.5.0 §7.3 scratch orchestrator
+    (core/safety/input_transport.py, T050-01C); the ref derivation itself is
+    unchanged and stays owned here.
+    """
+    return _path_ref_for(Path(path))
+
+
 def _same_path(left: Path, right: Path) -> bool:
     return _safe_resolve(left) == _safe_resolve(right)
 

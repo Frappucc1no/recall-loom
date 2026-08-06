@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import stat
-import tempfile
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -25,6 +24,7 @@ from core.support.policy import (
     support_state_from_advisory,
     user_message_for_state,
 )
+from core.workspace.atomic_io import atomic_write_bytes
 
 
 SUPPORT_STATE_ENV = "RECALLLOOM_SUPPORT_STATE_JSON"
@@ -190,28 +190,14 @@ def load_cached_support(path: Path, *, package_root: Path) -> SupportCacheLoad:
 
 
 def write_cached_support(path: Path, payload: dict) -> str | None:
-    temp_path: Path | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        # The staged temp + fsync + os.replace mechanism is owned by
+        # core.workspace.atomic_io.
+        atomic_write_bytes(
+            path,
+            (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
     except OSError:
-        if temp_path is not None:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         return CACHE_REASON_WRITE_FAILED
     return None
 
@@ -433,9 +419,26 @@ def package_support_result(
     cache_path = cache_path_for_package(package_root, env)
     cache_load = load_cached_support(cache_path, package_root=package_root)
 
+    # A cache is a network freshness shortcut only when it is for this exact
+    # package version and logical day and passed the full cache contract.  The
+    # resulting advisory is still projected per invocation below, so `allowed`
+    # is never inherited from an earlier action.  SUPPORT_DISABLE_ENV remains
+    # an explicit diagnostic escape hatch that forces a fresh advisory check.
+    has_explicit_local_advisory = bool(env.get(SUPPORT_ADVISORY_FILE_ENV))
+    same_day_cache = (
+        None
+        if disable_shortcuts or has_explicit_local_advisory
+        else trusted_cached_support(
+            package_root=package_root,
+            package_version=package_version,
+            checked_date=checked_date,
+            env=env,
+        )
+    )
+
     inherited = (
         None
-        if disable_shortcuts
+        if disable_shortcuts or same_day_cache is not None
         else inherited_support_state(
             package_root=package_root,
             package_version=package_version,
@@ -443,7 +446,9 @@ def package_support_result(
             env=env,
         )
     )
-    if inherited is not None:
+    if same_day_cache is not None:
+        result = same_day_cache
+    elif inherited is not None:
         result = inherited
     else:
         advisory, source, fetch_error, advisory_invalid = read_advisory(env, default_url=advisory_url)

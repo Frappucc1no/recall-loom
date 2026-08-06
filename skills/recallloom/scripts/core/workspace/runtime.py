@@ -6,10 +6,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
+import stat
 import sys
 import tempfile
 
@@ -21,6 +24,7 @@ from core.errors import (
 from core.bridge import blocks as bridge_blocks
 from core.provenance.state import initial_provenance_metadata
 from core.protocol import contracts as protocol_contracts
+from core.workspace import atomic_io
 
 PROTOCOL_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)*$")
 DATE_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
@@ -65,29 +69,11 @@ def read_text(path: Path) -> str:
 
 
 def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "wb",
-        dir=path.parent,
-        prefix=f".{path.name}.tmp-",
-        delete=False,
-    ) as handle:
-        handle.write(text.encode("utf-8"))
-        handle.flush()
-        os.fsync(handle.fileno())
-        temp_path = Path(handle.name)
-    os.replace(temp_path, path)
+    atomic_io.atomic_write_text(path, text)
 
 
 def load_json(path: Path) -> dict:
     return json.loads(read_text(path))
-
-
-def atomic_write_if_unchanged(path: Path, *, expected_text: str, new_text: str) -> None:
-    current_text = read_text(path) if path.exists() else ""
-    if current_text != expected_text:
-        raise LockBusyError(f"Refusing to write {path} because the file changed after it was read.")
-    write_text(path, new_text)
 
 
 def validate_storage_mode(value: str) -> str:
@@ -524,64 +510,411 @@ def pid_is_alive(pid: int) -> bool:
         return True
 
 
-def reclaim_stale_workspace_lock(lock_path: Path) -> bool:
-    if not lock_path.exists():
-        return False
+# ---------------------------------------------------------------------------
+# Guard-serialized token-file identity lock (v0.5.0 unique construction plan
+# §7.7). The public workspace lock is still ``.recallloom.write.lock`` at the
+# project root with the v0.4.8.3 payload plus an additive random 256-bit
+# ``instance_token``. Every acquire / stale reclaim / finalizer / manual
+# unlock path first holds an internal per-user guard (POSIX ``fcntl.flock``,
+# Windows ``msvcrt.locking``) named by sha256 of the canonical workspace
+# identity inside a per-user system-temp safe directory, then re-verifies the
+# lock file (lstat -> no-follow open -> fstat -> payload/token/identity)
+# before any unlink. A lock is unlinked only when the pid is dead or an
+# explicit unlock is legitimate AND the final identity+token still equals the
+# acquiring handle's snapshot, so a new lock instance is never deleted by an
+# old owner's finalizer or reclaimer. The guard only serializes RecallLoom
+# product instances; it never replaces the token lock and never appears in
+# public output. Unsupported backends and guard-identity anomalies fail
+# closed (LockBusyError, with no guard detail in the message).
+# ---------------------------------------------------------------------------
 
-    payload = load_lock_payload(lock_path)
-    pid = payload.get("pid")
+_GUARD_BACKEND_FCNTL = "fcntl"
+_GUARD_BACKEND_MSVCRT = "msvcrt"
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+@dataclass(frozen=True)
+class WorkspaceLockHandle:
+    """Frozen identity snapshot of one acquired workspace write lock."""
+
+    lock_path: Path
+    lock_identity: tuple[int, int]
+    instance_token: str
+    guard_path: Path
+    guard_handle: int
+    backend: str
+
+
+@dataclass(frozen=True)
+class WorkspaceLockObservation:
+    """One no-follow observation of the workspace token lock.
+
+    ``identity`` is the (st_dev, st_ino) pair proven identical between the
+    lstat'd directory entry and the no-follow opened handle. It is None when
+    the path is absent or when an anomaly forced a fail-closed observation.
+    """
+
+    exists: bool
+    identity: tuple[int, int] | None
+    payload: dict
+    anomaly: str | None
+
+
+def _guard_backend_for_platform() -> str | None:
+    if os.name == "posix":
+        return _GUARD_BACKEND_FCNTL
+    if os.name == "nt":
+        return _GUARD_BACKEND_MSVCRT
+    return None
+
+
+def _lock_guard_msvcrt(fd: int, msvcrt_module=None) -> None:
+    """Take the guard through msvcrt.locking; fail closed when unavailable.
+
+    Residual W3 (Gate P freeze record): real Windows locking behaviour is
+    proven on the Gate R Windows matrix; on other hosts this branch is
+    exercised only through the injectable ``msvcrt_module`` seam.
+    """
+    if msvcrt_module is None:
+        try:
+            import msvcrt as msvcrt_module
+        except ImportError as exc:
+            raise LockBusyError(
+                "Refusing to continue because the RecallLoom write-lock guard backend "
+                "msvcrt is unavailable on this platform; failing closed."
+            ) from exc
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        msvcrt_module.locking(fd, msvcrt_module.LK_NBLCK, 1)
+    except OSError as exc:
+        raise LockBusyError(
+            "Refusing to continue because another RecallLoom operation holds the "
+            "write-lock guard for this workspace."
+        ) from exc
+
+
+def _unlock_guard_msvcrt(fd: int, msvcrt_module=None) -> None:
+    if msvcrt_module is None:
+        import msvcrt as msvcrt_module
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt_module.locking(fd, msvcrt_module.LK_UNLCK, 1)
+
+
+def _lock_guard_fd(fd: int, backend: str) -> None:
+    if backend == _GUARD_BACKEND_FCNTL:
+        try:
+            import fcntl
+        except ImportError as exc:
+            raise LockBusyError(
+                "Refusing to continue because the RecallLoom write-lock guard backend "
+                "fcntl is unavailable on this platform; failing closed."
+            ) from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise LockBusyError(
+                "Refusing to continue because another RecallLoom operation holds the "
+                "write-lock guard for this workspace."
+            ) from exc
+        return
+    if backend == _GUARD_BACKEND_MSVCRT:
+        _lock_guard_msvcrt(fd)
+        return
+    raise LockBusyError(
+        "Refusing to continue because the RecallLoom write-lock guard has no supported "
+        "backend on this platform; failing closed."
+    )
+
+
+def _guard_dir() -> Path:
+    base = Path(tempfile.gettempdir())
+    if os.name == "posix":
+        return base / f"recallloom-lock-guards-{os.getuid()}"
+    return base / "recallloom-lock-guards"
+
+
+def _ensure_guard_dir() -> Path:
+    guard_dir = _guard_dir()
+    try:
+        dir_stat = os.lstat(guard_dir)
+    except FileNotFoundError:
+        try:
+            os.mkdir(guard_dir, 0o700)
+        except FileExistsError:
+            pass
+        dir_stat = os.lstat(guard_dir)
+    if not stat.S_ISDIR(dir_stat.st_mode):
+        raise LockBusyError(
+            "Refusing to continue because the RecallLoom write-lock guard location "
+            "is not a directory; failing closed."
+        )
+    if os.name == "posix" and (
+        dir_stat.st_uid != os.getuid() or stat.S_IMODE(dir_stat.st_mode) & 0o077
+    ):
+        raise LockBusyError(
+            "Refusing to continue because the RecallLoom write-lock guard directory "
+            "is not private to the current user; failing closed."
+        )
+    return guard_dir
+
+
+def _workspace_guard_path(project_root: Path) -> Path:
+    canonical_identity = str(Path(project_root).resolve())
+    digest = hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()
+    return _ensure_guard_dir() / f"write-lock-{digest}.guard"
+
+
+def _acquire_guard(project_root: Path) -> tuple[Path, int, str]:
+    """Open and lock the internal guard; fail closed on any guard anomaly."""
+    backend = _guard_backend_for_platform()
+    if backend is None:
+        raise LockBusyError(
+            "Refusing to continue because the RecallLoom write-lock guard has no supported "
+            "backend on this platform; failing closed."
+        )
+    guard_path = _workspace_guard_path(project_root)
+    fd = os.open(guard_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        _lock_guard_fd(fd, backend)
+        handle_stat = os.fstat(fd)
+        try:
+            path_stat = os.lstat(guard_path)
+        except FileNotFoundError as exc:
+            raise LockBusyError(
+                "Refusing to continue because the RecallLoom write-lock guard identity "
+                "changed while it was being acquired; failing closed."
+            ) from exc
+        if not stat.S_ISREG(path_stat.st_mode) or (
+            (path_stat.st_dev, path_stat.st_ino) != (handle_stat.st_dev, handle_stat.st_ino)
+        ):
+            raise LockBusyError(
+                "Refusing to continue because the RecallLoom write-lock guard identity "
+                "changed while it was being acquired; failing closed."
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return guard_path, fd, backend
+
+
+def _release_guard(guard_handle: int, backend: str) -> None:
+    """Best-effort unlock then close; closing always releases OS-level locks."""
+    try:
+        if backend == _GUARD_BACKEND_FCNTL:
+            try:
+                import fcntl
+            except ImportError:
+                fcntl = None
+            if fcntl is not None:
+                fcntl.flock(guard_handle, fcntl.LOCK_UN)
+        elif backend == _GUARD_BACKEND_MSVCRT:
+            _unlock_guard_msvcrt(guard_handle)
+    except Exception:
+        pass
+    finally:
+        os.close(guard_handle)
+
+
+@contextmanager
+def workspace_lock_guard(project_root: Path):
+    """Hold the internal write-lock guard for one workspace.
+
+    Every acquire/reclaim/finalizer/manual-unlock path holds this guard before
+    inspecting or unlinking the token lock. The guard only serializes product
+    instances and never appears in public output.
+    """
+    guard_path, guard_handle, backend = _acquire_guard(project_root)
+    try:
+        yield guard_path
+    finally:
+        _release_guard(guard_handle, backend)
+
+
+def observe_workspace_lock(lock_path: Path) -> WorkspaceLockObservation:
+    """lstat -> no-follow open -> fstat -> payload; fail closed on anomalies."""
+    try:
+        path_stat = os.lstat(lock_path)
+    except FileNotFoundError:
+        return WorkspaceLockObservation(False, None, {}, None)
+    except OSError as exc:
+        return WorkspaceLockObservation(False, None, {}, f"lstat_failed:{exc.errno}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        return WorkspaceLockObservation(True, None, {}, "not_regular_file")
+    try:
+        fd = os.open(lock_path, os.O_RDONLY | _O_NOFOLLOW)
+    except FileNotFoundError:
+        return WorkspaceLockObservation(False, None, {}, None)
+    except OSError as exc:
+        return WorkspaceLockObservation(True, None, {}, f"open_failed:{exc.errno}")
+    try:
+        try:
+            handle_stat = os.fstat(fd)
+        except OSError as exc:
+            return WorkspaceLockObservation(True, None, {}, f"fstat_failed:{exc.errno}")
+        if (handle_stat.st_dev, handle_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            return WorkspaceLockObservation(True, None, {}, "identity_mismatch")
+        try:
+            raw = os.read(fd, 65536)
+        except OSError as exc:
+            return WorkspaceLockObservation(True, None, {}, f"read_failed:{exc.errno}")
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    payload = data if isinstance(data, dict) else {}
+    return WorkspaceLockObservation(
+        True, (handle_stat.st_dev, handle_stat.st_ino), payload, None
+    )
+
+
+def remove_workspace_lock_if_unchanged(
+    lock_path: Path,
+    *,
+    expected_identity: tuple[int, int] | None,
+    expected_token: str | None,
+) -> bool:
+    """Unlink the token lock only while the expected identity+token hold.
+
+    The caller must already hold the workspace guard. The final identity and
+    instance token are re-observed immediately before the unlink; a replaced
+    or foreign lock instance is never removed.
+    """
+    final = observe_workspace_lock(lock_path)
+    if not final.exists or final.anomaly is not None:
+        return False
+    if final.identity != expected_identity:
+        return False
+    if final.payload.get("instance_token") != expected_token:
+        return False
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _reclaim_observed_stale_lock(lock_path: Path, observation: WorkspaceLockObservation) -> bool:
+    """Unlink a verified-stale observed lock; the guard must already be held."""
+    pid = observation.payload.get("pid")
     if not isinstance(pid, int):
         return False
     if pid_is_alive(pid):
         return False
-    try:
-        lock_path.unlink()
-        return True
-    except FileNotFoundError:
+    return remove_workspace_lock_if_unchanged(
+        lock_path,
+        expected_identity=observation.identity,
+        expected_token=observation.payload.get("instance_token"),
+    )
+
+
+def reclaim_stale_workspace_lock(lock_path: Path) -> bool:
+    if not lock_path.exists():
         return False
-    except PermissionError:
-        # A sharing violation or denied delete means the lock file may still be
-        # held open; treat the lock as busy and let LockBusyError surface.
-        if _WINDOWS_PLATFORM:
+    with workspace_lock_guard(lock_path.parent):
+        observation = observe_workspace_lock(lock_path)
+        if not observation.exists or observation.anomaly is not None:
             return False
+        try:
+            return _reclaim_observed_stale_lock(lock_path, observation)
+        except PermissionError:
+            # A sharing violation or denied delete means the lock file may still be
+            # held open; treat the lock as busy and let LockBusyError surface.
+            if _WINDOWS_PLATFORM:
+                return False
+            raise
+
+
+def _acquire_workspace_lock(project_root: Path, owner: str) -> WorkspaceLockHandle:
+    lock_path = project_lock_path(project_root)
+    guard_path, guard_handle, backend = _acquire_guard(project_root)
+    try:
+        fd: int | None = None
+        instance_token = ""
+        for _ in range(2):
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _O_NOFOLLOW)
+            except FileExistsError:
+                observation = observe_workspace_lock(lock_path)
+                reclaimed = False
+                if observation.exists and observation.anomaly is None:
+                    try:
+                        reclaimed = _reclaim_observed_stale_lock(lock_path, observation)
+                    except PermissionError:
+                        # v0.4.8.3 semantics: a denied delete is "busy" on
+                        # Windows and propagates on POSIX.
+                        if _WINDOWS_PLATFORM:
+                            reclaimed = False
+                        else:
+                            raise
+                if not reclaimed:
+                    lock_payload = load_lock_payload(lock_path)
+                    lock_owner = lock_payload.get("owner", "unknown")
+                    lock_pid = lock_payload.get("pid", "unknown")
+                    lock_created_at = lock_payload.get("created_at", "unknown")
+                    raise LockBusyError(
+                        "Refusing to continue because another RecallLoom mutating operation appears to be running for "
+                        f"{project_root} (owner={lock_owner}, pid={lock_pid}, created_at={lock_created_at}). "
+                        "If this lock is stale or malformed, inspect or remove it explicitly with unlock_write_lock.py."
+                    )
+                continue
+            instance_token = secrets.token_hex(32)
+            payload = json.dumps(
+                {
+                    "owner": owner,
+                    "pid": os.getpid(),
+                    "created_at": now_iso_timestamp(),
+                    "instance_token": instance_token,
+                }
+            )
+            try:
+                os.write(fd, payload.encode("utf-8"))
+                os.fsync(fd)
+            except BaseException:
+                os.close(fd)
+                raise
+            break
+        else:
+            raise LockBusyError(
+                f"Refusing to continue because a stale RecallLoom lock could not be reclaimed for {project_root}."
+            )
+        try:
+            handle_stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+        return WorkspaceLockHandle(
+            lock_path=lock_path,
+            lock_identity=(handle_stat.st_dev, handle_stat.st_ino),
+            instance_token=instance_token,
+            guard_path=guard_path,
+            guard_handle=guard_handle,
+            backend=backend,
+        )
+    except BaseException:
+        _release_guard(guard_handle, backend)
         raise
+
+
+def _finalize_workspace_lock(handle: WorkspaceLockHandle) -> None:
+    """Delete ONLY this handle's own lock instance, then release the guard."""
+    try:
+        remove_workspace_lock_if_unchanged(
+            handle.lock_path,
+            expected_identity=handle.lock_identity,
+            expected_token=handle.instance_token,
+        )
+    finally:
+        _release_guard(handle.guard_handle, handle.backend)
 
 
 @contextmanager
 def workspace_write_lock(project_root: Path, owner: str):
-    lock_path = project_lock_path(project_root)
-    fd: int | None = None
-    for _ in range(2):
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            payload = json.dumps({"owner": owner, "pid": os.getpid(), "created_at": now_iso_timestamp()})
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
-            break
-        except FileExistsError:
-            if not reclaim_stale_workspace_lock(lock_path):
-                lock_payload = load_lock_payload(lock_path)
-                lock_owner = lock_payload.get("owner", "unknown")
-                lock_pid = lock_payload.get("pid", "unknown")
-                lock_created_at = lock_payload.get("created_at", "unknown")
-                raise LockBusyError(
-                    "Refusing to continue because another RecallLoom mutating operation appears to be running for "
-                    f"{project_root} (owner={lock_owner}, pid={lock_pid}, created_at={lock_created_at}). "
-                    "If this lock is stale or malformed, inspect or remove it explicitly with unlock_write_lock.py."
-                )
-    else:
-        raise LockBusyError(
-            f"Refusing to continue because a stale RecallLoom lock could not be reclaimed for {project_root}."
-        )
+    handle = _acquire_workspace_lock(project_root, owner)
     try:
-        yield lock_path
+        yield handle.lock_path
     finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        _finalize_workspace_lock(handle)
 
 
 def hidden_storage_root(project_root: Path) -> Path:
@@ -930,7 +1263,7 @@ def ensure_git_exclude_entry(project_root: Path, entry: str = f"{CONTEXT_DIRNAME
         if managed_block is not None and entry in managed_block:
             return True
         text = current.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
-        atomic_write_if_unchanged(exclude_path, expected_text=current, new_text=text)
+        atomic_io.atomic_write_if_unchanged(exclude_path, expected_text=current, new_text=text)
     else:
         text = "\n".join(block) + "\n"
         write_text(exclude_path, text)
@@ -969,7 +1302,7 @@ def remove_git_exclude_block(project_root: Path) -> bool:
     end_idx = lines.index(end_marker, start_idx)
     new_lines = lines[:start_idx] + lines[end_idx + 1 :]
     text = "\n".join(new_lines).strip("\n")
-    atomic_write_if_unchanged(exclude_path, expected_text=current, new_text=((text + "\n") if text else ""))
+    atomic_io.atomic_write_if_unchanged(exclude_path, expected_text=current, new_text=((text + "\n") if text else ""))
     return True
 
 

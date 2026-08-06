@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Marker rendering and parsing helpers for RecallLoom protocol files."""
+"""Marker rendering/parsing and managed-text primitives for RecallLoom protocol files."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.errors import ConfigContractError
 from core.protocol.contracts import (
     CURRENT_PROTOCOL_VERSION,
     DAILY_LOG_ENTRY_MARKER_TEMPLATE,
@@ -89,6 +90,30 @@ def rolling_summary_header(tool_name: str, day: str) -> str:
     return LAST_WRITER_MARKER_TEMPLATE.format(tool=tool_name, date=day)
 
 
+def canonicalize_managed_text_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def validate_tool_name(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigContractError("tool_name must be a non-empty string")
+    if any(ch in value for ch in {"|", "]", "\n", "\r"}):
+        raise ConfigContractError(
+            "tool_name may not contain '|', ']', or line-break characters because it is embedded in machine-readable markers"
+        )
+    return value.strip()
+
+
+def validate_writer_id(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigContractError("writer_id must be a non-empty string")
+    if any(ch in value for ch in {"|", "]", "\n", "\r"}):
+        raise ConfigContractError(
+            "writer_id may not contain '|', ']', or line-break characters because it is embedded in machine-readable markers"
+        )
+    return value.strip()
+
+
 def parse_file_marker(text: str) -> FileMarkerInfo | None:
     first_line = text.splitlines()[0].strip() if text.splitlines() else ""
     match = FILE_MARKER_RE.match(first_line)
@@ -135,6 +160,7 @@ __all__ = [
     "DailyLogEntryInfo",
     "FileMarkerInfo",
     "FileStateInfo",
+    "canonicalize_managed_text_newlines",
     "daily_log_entry_marker",
     "daily_log_scaffold_marker",
     "file_marker",
@@ -145,5 +171,7 @@ __all__ = [
     "parse_file_state_marker",
     "rolling_summary_header",
     "section_marker",
+    "validate_tool_name",
+    "validate_writer_id",
     "SECTION_MARKER_RE",
 ]

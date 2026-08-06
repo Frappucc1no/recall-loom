@@ -1,16 +1,25 @@
-"""Dispatcher-issued preflight write binding leases."""
+"""Dispatcher-issued preflight write binding leases.
+
+T050-07C final phase: persisted lease helpers remain only for historical
+read-only diagnosis. Final mutation authority is process-local and is never
+serialized, persisted, or derived from a lease.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
+import secrets
+import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from core.failure.context import LEGACY_OPERATION_BY_OPERATION, OPERATION_DOMAIN
 from core.provenance.receipts import assert_public_safe_json
+from core.workspace.atomic_io import atomic_write_bytes
+from core.workspace.runtime import WorkspaceLockHandle, observe_workspace_lock
 
 
 PREFLIGHT_BINDING_STORE_RELATIVE_PATH = "derived/preflight-bindings.json"
@@ -85,27 +94,10 @@ def _load_store(path: Path) -> dict:
 
 
 def _write_store(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "wb",
-            dir=path.parent,
-            prefix=f".{path.name}.tmp-",
-            delete=False,
-        ) as handle:
-            temp_path = Path(handle.name)
-            handle.write((json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    except BaseException:
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
-        raise
+    data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    # The staged temp + fsync + os.replace mechanism is owned by
+    # core.workspace.atomic_io.
+    atomic_write_bytes(path, data)
 
 
 def _lease_digest_payload(record: Mapping[str, Any]) -> dict:
@@ -253,3 +245,122 @@ def verify_preflight_binding_lease(
                 field_path=f"$.{field}",
             )
     return record
+
+
+# --- S3–S5 transitional lease authority (frozen §7.4; deleted by T050-07C) -----
+
+TRANSITIONAL_AUTHORITY_REASON = "invalid_transaction_authority"
+
+
+class TransactionAuthorityError(ValueError):
+    """Raised when final in-memory transaction authority is invalid."""
+
+    def __init__(self, message: str, *, field_path: str = "$") -> None:
+        super().__init__(message)
+        self.reason_code = TRANSITIONAL_AUTHORITY_REASON
+        self.field_path = field_path
+        self.details = {
+            "reason_code": TRANSITIONAL_AUTHORITY_REASON,
+            "field_path": field_path,
+        }
+
+
+class TransactionAuthority:
+    """Opaque, single-use authority for one dispatcher invocation."""
+
+    __slots__ = ()
+
+    def __new__(cls):
+        raise TypeError("TransactionAuthority can only be issued in-process")
+
+    def __reduce__(self):
+        raise TypeError("TransactionAuthority is not serializable")
+
+    def __copy__(self):
+        raise TypeError("TransactionAuthority cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("TransactionAuthority cannot be copied")
+
+
+_FINAL_AUTHORITY_REGISTRY: dict[
+    int, tuple[TransactionAuthority, str, str, str]
+] = {}
+_FINAL_AUTHORITY_REGISTRY_LOCK = threading.Lock()
+
+
+def issue_transaction_authority(
+    *, operation: str, workspace_root: str | Path
+) -> TransactionAuthority:
+    """Issue final authority without consulting or persisting a lease."""
+    if operation not in OPERATION_DOMAIN:
+        raise TransactionAuthorityError(
+            "Transaction authority operation is not a typed mutation operation.",
+            field_path="$.operation",
+        )
+    authority = object.__new__(TransactionAuthority)
+    with _FINAL_AUTHORITY_REGISTRY_LOCK:
+        _FINAL_AUTHORITY_REGISTRY[id(authority)] = (
+            authority,
+            secrets.token_hex(32),
+            operation,
+            str(Path(workspace_root).resolve()),
+        )
+    return authority
+
+
+def consume_transaction_authority(
+    authority: Any,
+    *,
+    operation: str,
+    workspace_root: str | Path,
+    lock_handle: Any,
+) -> None:
+    """Single-consume an issued authority inside the live identity lock."""
+    if not isinstance(authority, TransactionAuthority):
+        raise TransactionAuthorityError(
+            "Transaction authority is not an issued in-process capability."
+        )
+    # Every consume attempt is destructive. A capability presented with the
+    # wrong invocation or lock must not remain replayable.
+    with _FINAL_AUTHORITY_REGISTRY_LOCK:
+        record = _FINAL_AUTHORITY_REGISTRY.pop(id(authority), None)
+    if record is None or record[0] is not authority:
+        raise TransactionAuthorityError(
+            "Transaction authority is unknown, forged, or already consumed."
+        )
+    _, nonce, issued_operation, issued_root = record
+    if not nonce or issued_operation != operation:
+        raise TransactionAuthorityError(
+            "Transaction authority operation does not match this invocation.",
+            field_path="$.operation",
+        )
+    if issued_root != str(Path(workspace_root).resolve()):
+        raise TransactionAuthorityError(
+            "Transaction authority workspace does not match this invocation.",
+            field_path="$.workspace_root",
+        )
+    if not isinstance(lock_handle, WorkspaceLockHandle):
+        raise TransactionAuthorityError(
+            "Transaction authority requires the live WorkspaceLockHandle.",
+            field_path="$.lock_handle",
+        )
+    observation = observe_workspace_lock(lock_handle.lock_path)
+    if (
+        not observation.exists
+        or observation.anomaly is not None
+        or observation.identity != lock_handle.lock_identity
+        or observation.payload.get("instance_token") != lock_handle.instance_token
+    ):
+        raise TransactionAuthorityError(
+            "Transaction authority is outside the live identity-lock scope.",
+            field_path="$.lock_handle",
+        )
+
+
+def discard_transaction_authority(authority: Any) -> None:
+    """Forget an unconsumed authority when its transaction invocation ends."""
+    with _FINAL_AUTHORITY_REGISTRY_LOCK:
+        record = _FINAL_AUTHORITY_REGISTRY.get(id(authority))
+        if record is not None and record[0] is authority:
+            del _FINAL_AUTHORITY_REGISTRY[id(authority)]

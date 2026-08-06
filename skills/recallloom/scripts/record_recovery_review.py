@@ -42,9 +42,9 @@ from core.safety.prepared_input import (
     read_prepared_input_source_text,
     validate_prepared_input_source_path,
 )
+from core.workspace.atomic_io import atomic_write_and_verify_if_unchanged
 
 from _common import (
-    atomic_write_and_verify_if_unchanged,
     cli_failure_payload,
     cli_failure_payload_for_exception,
     ConfigContractError,

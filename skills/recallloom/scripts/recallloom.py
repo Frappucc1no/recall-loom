@@ -20,6 +20,8 @@ _RECORD_PLAN_OUTPUT_ID_RE = re.compile(r"^record-plan-output:sha256:[0-9a-f]{64}
 _EXPLICIT_OPERATOR_CONFIRMATION_ID_RE = re.compile(
     r"^explicit-operator-confirmation:sha256:[0-9a-f]{64}$"
 )
+COMPACT_TRANSACTION_SCHEMA_VERSION = "recallloom.transaction.compact/1.0"
+COMPACT_TRANSACTION_MAX_BYTES = 2048
 
 
 def _bootstrap_failure_language() -> str:
@@ -125,6 +127,17 @@ from core.continuity.workday import (
     RECOMMENDATION_TYPES,
     describe_workday_guidance,
 )
+from core.failure.context import (
+    COMMAND_APPEND,
+    COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+    COMMAND_WRITE,
+    OPERATION_DAILY_LOG_APPEND,
+    OPERATION_MANAGED_WRITE,
+    OPERATION_POST_APPEND_SUMMARY_SYNC,
+    STAGE_INPUT,
+    STAGE_PREFLIGHT,
+    OperationContext,
+)
 from core.failure.contracts import failure_payload, preferred_failure_language
 from core.output.confirmation_material import (
     print_confirmation_material,
@@ -134,8 +147,7 @@ from core.output.confirmation_material import (
 from core.output.privacy import redact_public_text
 from core.output.user_status import print_user_summary, read_surface_user_summary
 from core.provenance.bindings import (
-    PreflightBindingLeaseError,
-    write_preflight_binding_lease,
+    issue_transaction_authority,
 )
 from core.provenance.evidence import (
     strict_gate_current_receipts_verified,
@@ -163,6 +175,22 @@ from core.recording import (
     plan_record,
     build_recording_suggestion,
     validate_record_plan_output,
+)
+from core.safety.input_transport import (
+    DEFAULT_STDIN_MAX_INPUT_BYTES,
+    EXPECTED_INPUT_DIGEST_RE,
+    InputTransportError,
+    PreparedInputHandoff,
+    REASON_BOTH_INPUT_SOURCES,
+    REASON_HOST_HANDOFF_UNAVAILABLE,
+    REASON_INPUT_MODE_NOT_AVAILABLE,
+    REASON_INVALID_EXPECTED_INPUT_DIGEST,
+    REASON_MISSING_EXPECTED_INPUT_DIGEST,
+    REASON_PREPARED_INPUT_REF_INVALID,
+    acquire_stdin_text,
+    decode_input_capsule,
+    provision_prepared_input_capability,
+    validate_prepared_input_ref_shape,
 )
 from core.support.policy import action_level_for_dispatcher
 from core.trust.state import evaluate_trust_state
@@ -525,6 +553,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read prepared entry content from UTF-8 stdin instead of a file.",
     )
     append_parser.add_argument(
+        "--input-capsule",
+        help=(
+            "Additive v0.5.0 input mode: provide the entry input as one RLCP1 ASCII "
+            "capsule. Currently fails closed before mutation execution."
+        ),
+    )
+    append_parser.add_argument(
+        "--prepare-input",
+        action="store_true",
+        help=(
+            "Additive v0.5.0 non-mutating mode: provision an external prepared-input "
+            "capability for this operation. Requires a trusted host integration."
+        ),
+    )
+    append_parser.add_argument(
+        "--prepared-input-ref",
+        help=(
+            "Additive v0.5.0 input mode: commit the entry input from an "
+            "RLS1.<token> prepared-input reference (requires --expected-input-digest). "
+            "Currently fails closed before mutation execution."
+        ),
+    )
+    append_parser.add_argument(
+        "--expected-input-digest",
+        help=(
+            "Expected raw-input SHA-256 as 64 lowercase hex characters; optional binding "
+            "with legacy input, required with --prepared-input-ref."
+        ),
+    )
+    append_parser.add_argument(
         "--input-format",
         choices=("auto", "markdown", "json"),
         help="Interpret prepared entry input as markdown or JSON.",
@@ -563,7 +621,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
         ),
     )
-    append_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+    append_output = append_parser.add_mutually_exclusive_group()
+    append_output.add_argument("--json", action="store_true", help="Print legacy structured JSON output.")
+    append_output.add_argument(
+        "--compact-json", action="store_true",
+        help="Print the compact transaction JSON result (under 2 KB).",
+    )
 
     write_parser = subparsers.add_parser(
         "write",
@@ -588,6 +651,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin",
         action="store_true",
         help="Read prepared managed-file markdown content from UTF-8 stdin instead of a file.",
+    )
+    write_parser.add_argument(
+        "--input-capsule",
+        help=(
+            "Additive v0.5.0 input mode: provide the managed-file input as one RLCP1 "
+            "ASCII capsule. Currently fails closed before mutation execution."
+        ),
+    )
+    write_parser.add_argument(
+        "--prepare-input",
+        action="store_true",
+        help=(
+            "Additive v0.5.0 non-mutating mode: provision an external prepared-input "
+            "capability for this operation. Requires a trusted host integration."
+        ),
+    )
+    write_parser.add_argument(
+        "--prepared-input-ref",
+        help=(
+            "Additive v0.5.0 input mode: commit the managed-file input from an "
+            "RLS1.<token> prepared-input reference (requires --expected-input-digest). "
+            "Currently fails closed before mutation execution."
+        ),
+    )
+    write_parser.add_argument(
+        "--expected-input-digest",
+        help=(
+            "Expected raw-input SHA-256 as 64 lowercase hex characters; optional binding "
+            "with legacy input, required with --prepared-input-ref."
+        ),
     )
     write_parser.add_argument(
         "--input-format",
@@ -627,7 +720,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
         ),
     )
-    write_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+    write_output = write_parser.add_mutually_exclusive_group()
+    write_output.add_argument("--json", action="store_true", help="Print legacy structured JSON output.")
+    write_output.add_argument(
+        "--compact-json", action="store_true",
+        help="Print the compact transaction JSON result (under 2 KB).",
+    )
 
     post_append_sync_parser = subparsers.add_parser(
         "sync-current-state-after-append",
@@ -651,6 +749,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--stdin",
         action="store_true",
         help="Read reviewed rolling-summary JSON from UTF-8 stdin.",
+    )
+    post_append_sync_parser.add_argument(
+        "--input-capsule",
+        help=(
+            "Additive v0.5.0 input mode: provide the reviewed summary input as one RLCP1 "
+            "ASCII capsule. Currently fails closed before mutation execution."
+        ),
+    )
+    post_append_sync_parser.add_argument(
+        "--prepare-input",
+        action="store_true",
+        help=(
+            "Additive v0.5.0 non-mutating mode: provision an external prepared-input "
+            "capability for this operation. Requires a trusted host integration."
+        ),
+    )
+    post_append_sync_parser.add_argument(
+        "--prepared-input-ref",
+        help=(
+            "Additive v0.5.0 input mode: commit the reviewed summary input from an "
+            "RLS1.<token> prepared-input reference (requires --expected-input-digest). "
+            "Currently fails closed before mutation execution."
+        ),
+    )
+    post_append_sync_parser.add_argument(
+        "--expected-input-digest",
+        help=(
+            "Expected raw-input SHA-256 as 64 lowercase hex characters; optional binding "
+            "with legacy input, required with --prepared-input-ref."
+        ),
     )
     post_append_sync_parser.add_argument(
         "--reuse-current-summary",
@@ -697,7 +825,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Only public-safe host/surface keys and version-like local_wrapper_version values are accepted."
         ),
     )
-    post_append_sync_parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
+    post_append_sync_output = post_append_sync_parser.add_mutually_exclusive_group()
+    post_append_sync_output.add_argument("--json", action="store_true", help="Print legacy structured JSON output.")
+    post_append_sync_output.add_argument(
+        "--compact-json", action="store_true",
+        help="Print the compact transaction JSON result (under 2 KB).",
+    )
 
     repair_parser = subparsers.add_parser(
         "repair-daily-log-cursor",
@@ -779,6 +912,87 @@ def _with_package_support(payload: dict | None, support: dict | None) -> dict | 
     if payload is None or support is None:
         return payload
     return {**payload, "package_support": public_package_support_payload(support)}
+
+
+def _compact_single_next_action(payload: dict) -> dict:
+    # Non-retryable typed failures must remain inspect-first even if legacy
+    # output happens to retain a stale retry command.
+    if payload.get("ok") is not True and not bool(payload.get("safe_to_retry", False)):
+        return {"kind": "inspect", "value": "Review the typed failure before retrying."}
+    command = payload.get("single_next_command")
+    readonly_prefixes = (
+        "recallloom.py status ",
+        "recallloom.py validate ",
+        "recallloom.py quick-summary ",
+    )
+    if isinstance(command, str) and command.startswith(readonly_prefixes):
+        return {"kind": "command", "value": command}
+    if payload.get("ok") is True:
+        return {"kind": "none"}
+    return {"kind": "inspect", "value": "Review the typed failure before retrying."}
+
+
+def _compact_transaction_payload(payload: dict, *, command: str, operation: str) -> dict:
+    """Project the frozen transaction result without changing legacy JSON."""
+    ok = payload.get("ok") is True
+    revisions = {
+        key: payload[key]
+        for key in ("expected_file_revision", "expected_workspace_revision")
+        if payload.get(key) is not None
+    }
+    if ok:
+        compact = {
+            "ok": True,
+            "schema_version": COMPACT_TRANSACTION_SCHEMA_VERSION,
+            "command": command,
+            "operation": operation,
+            "result_code": payload.get("result_code") or "ok",
+            "revisions": revisions,
+            "input_digest": payload.get("input_digest") or "not_available",
+            "target_digest": payload.get("target_digest") or "not_available",
+            "receipt_evidence_ref": payload.get("receipt_evidence_ref") or "not_available",
+            "single_next_action": _compact_single_next_action(payload),
+        }
+    else:
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        compact = {
+            "ok": False,
+            "schema_version": COMPACT_TRANSACTION_SCHEMA_VERSION,
+            "command": command,
+            "operation": operation,
+            "stage": details.get("stage") or payload.get("failure_stage") or "preflight",
+            "reason_code": details.get("reason_code") or payload.get("blocked_reason") or "internal_error",
+            "reason_family": details.get("reason_family") or (
+                "input" if (details.get("reason_code") or payload.get("blocked_reason"))
+                in {"missing_section_key", "missing_section_keys", "malformed_input"}
+                else "internal"
+            ),
+            "side_effect": details.get("side_effect") or "none",
+            "trust_effect": details.get("trust_effect") or payload.get("trust_effect") or "none",
+            "safe_to_retry": bool(payload.get("safe_to_retry", False)),
+            "revisions": revisions,
+            "receipt_evidence_ref": details.get("receipt_evidence_ref") or "not_available",
+            "single_next_action": _compact_single_next_action(payload),
+        }
+        if details.get("scratch_disposition") is not None:
+            compact["scratch_disposition"] = details["scratch_disposition"]
+    encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) >= COMPACT_TRANSACTION_MAX_BYTES:
+        raise ConfigContractError("Compact transaction output exceeded the 2 KB contract.")
+    return compact
+
+
+def _print_transaction_payload(
+    args: argparse.Namespace,
+    payload: dict,
+    *,
+    command: str,
+    operation: str,
+) -> None:
+    if getattr(args, "compact_json", False):
+        print(json.dumps(_compact_transaction_payload(payload, command=command, operation=operation), ensure_ascii=False, separators=(",", ":")))
+    elif args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _exit_with_support(
@@ -1202,6 +1416,288 @@ def _validate_provenance_scope_args(parser, args: argparse.Namespace) -> None:
         )
 
 
+# --- frozen additive input-mode matrix (v0.5.0 construction plan §7.2/§7.3) --
+#
+# The additive flags --input-capsule / --prepare-input / --prepared-input-ref /
+# --expected-input-digest are enforced here, at dispatcher validation time,
+# before any preflight or mutation: the three new modes are mutually exclusive
+# and exclusive with each command's legacy input flags; --expected-input-digest
+# must be 64 lowercase hex and is required with --prepared-input-ref. Capsule
+# and scratch mutation execution is wired by T050-04+, so a valid new-mode
+# invocation fails closed (typed no-write) today. --prepare-input provisions a
+# §7.3 capability only when a trusted in-process host integration is plugged
+# into _PREPARED_INPUT_HOST_INTEGRATION; none exists on any host yet, so bare
+# CLI --prepare-input keeps returning the frozen host_handoff_unavailable
+# no-write and never degrades to printing the handoff path.
+
+_ADDITIVE_INPUT_MODE_FLAGS = ("input-capsule", "prepare-input", "prepared-input-ref")
+
+# Trusted in-process host integration hook (§7.3, T050-01C): the only point a
+# future host file API plugs into --prepare-input. It must be a callable that
+# receives the frozen, non-serializable PreparedInputHandoff and performs the
+# host-side binary write of handoff.write_target itself. No such integration
+# exists on any host today, so every bare CLI --prepare-input keeps returning
+# the frozen host_handoff_unavailable no-write; the constants below are the
+# derived (not contract-frozen) provisioning parameters for that unreachable
+# path, flagged for the review record (V050-09 may tighten them, never loosen
+# without re-review).
+_PREPARED_INPUT_HOST_INTEGRATION = None
+_PREPARED_INPUT_TTL_SECONDS = 900
+_PREPARED_INPUT_MAX_RAW_BYTES = 4 * 1024 * 1024
+
+_PREPARED_INPUT_SUCCESS_SCHEMA_VERSION = "recallloom.prepared-input/1.0"
+
+
+def _prepare_input_success_payload(
+    *,
+    command: str,
+    operation: str,
+    target: str,
+    handoff: PreparedInputHandoff,
+) -> dict:
+    """The frozen §7.3 public success payload: exactly these keys, no raw path."""
+    return {
+        "ok": True,
+        "schema_version": _PREPARED_INPUT_SUCCESS_SCHEMA_VERSION,
+        "operation": operation,
+        "prepared_input_ref": handoff.ref,
+        "expires_at": handoff.expires_at,
+        "max_raw_bytes": handoff.max_raw_bytes,
+        "single_next_action": {
+            "kind": "command",
+            "value": (
+                f"recallloom.py {command} {target} "
+                f"--prepared-input-ref {handoff.ref} "
+                "--expected-input-digest <64-hex-sha256-of-written-content>"
+            ),
+        },
+    }
+
+
+def _complete_prepare_input_handoff(
+    args: argparse.Namespace,
+    *,
+    command: str,
+    operation: str,
+) -> None:
+    """Provision the §7.3 capability and hand it to the trusted host integration.
+
+    Reached only when ``_PREPARED_INPUT_HOST_INTEGRATION`` is present. The
+    handoff object (which carries the host write-target path) goes only to
+    that integration; the public payload never contains a raw path. This is
+    the non-mutating --prepare-input mode: it returns right after the
+    handoff and never enters transaction mutation stages.
+    """
+    handoff = provision_prepared_input_capability(
+        role=operation,
+        max_raw_bytes=_PREPARED_INPUT_MAX_RAW_BYTES,
+        ttl_seconds=_PREPARED_INPUT_TTL_SECONDS,
+    )
+    _PREPARED_INPUT_HOST_INTEGRATION(handoff)
+    payload = _prepare_input_success_payload(
+        command=command,
+        operation=operation,
+        target=str(args.target),
+        handoff=handoff,
+    )
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"Prepared input capability {payload['prepared_input_ref']} ready "
+            f"(expires {payload['expires_at']}, max {payload['max_raw_bytes']} bytes)."
+        )
+        print(f"Next: {payload['single_next_action']['value']}")
+    raise SystemExit(0)
+
+
+def _additive_input_mode_selection(args: argparse.Namespace) -> list[str]:
+    selected: list[str] = []
+    if getattr(args, "input_capsule", None) is not None:
+        selected.append("input-capsule")
+    if getattr(args, "prepare_input", False):
+        selected.append("prepare-input")
+    if getattr(args, "prepared_input_ref", None) is not None:
+        selected.append("prepared-input-ref")
+    return selected
+
+
+def _exit_additive_input_mode_failure(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+    command: str,
+    operation: str,
+    write_type: str | None,
+    input_mode: str | None,
+    message: str,
+    reason_code: str,
+    extra_details: dict | None = None,
+) -> None:
+    _exit_with_support(
+        parser,
+        json_mode=args.json,
+        exit_code=2,
+        message=message,
+        payload=cli_failure_payload(
+            "invalid_prepared_input",
+            error=message,
+            details={
+                **OperationContext(
+                    command=command,
+                    operation=operation,
+                    write_type=write_type,
+                    input_mode=input_mode,
+                    stage=STAGE_INPUT,
+                ).legacy_details_fields(),
+                "reason_code": reason_code,
+                "side_effect": "none",
+                **(extra_details or {}),
+            },
+        ),
+        support=support,
+    )
+
+
+def _enforce_additive_input_mode_matrix(
+    parser,
+    args: argparse.Namespace,
+    *,
+    support: dict,
+    command: str,
+    operation: str,
+    write_type: str | None = None,
+    legacy_input_flags: dict[str, bool],
+) -> None:
+    """Enforce the frozen §7.2 public CLI x input-mode matrix for one command.
+
+    Pure-legacy invocations (no new mode) keep flowing to the existing
+    command/helper validation unchanged; only the additive surface is gated
+    here. Any new-mode usage that passes mutex and shape checks still fails
+    closed no-write until T050-04+ wires mutation execution.
+    """
+    selected = _additive_input_mode_selection(args)
+    legacy_present = [name for name, present in legacy_input_flags.items() if present]
+    expected_digest = getattr(args, "expected_input_digest", None)
+
+    def fail(
+        *,
+        message: str,
+        reason_code: str,
+        input_mode: str | None = None,
+        extra_details: dict | None = None,
+    ) -> None:
+        _exit_additive_input_mode_failure(
+            parser,
+            args,
+            support=support,
+            command=command,
+            operation=operation,
+            write_type=write_type,
+            input_mode=input_mode,
+            message=message,
+            reason_code=reason_code,
+            extra_details=extra_details,
+        )
+
+    if selected and len(selected) + len(legacy_present) > 1:
+        fail(
+            message=(
+                "Use exactly one input mode: --input-capsule, --prepare-input, and "
+                "--prepared-input-ref are mutually exclusive and cannot be combined "
+                "with this command's legacy input flags."
+            ),
+            reason_code=REASON_BOTH_INPUT_SOURCES,
+            input_mode="ambiguous",
+            extra_details={
+                "input_contract": "_xor_".join(
+                    [*legacy_input_flags, *_ADDITIVE_INPUT_MODE_FLAGS]
+                ),
+                "legacy_input_flags_present": legacy_present,
+                "additive_input_modes_present": selected,
+            },
+        )
+
+    if expected_digest is not None and not EXPECTED_INPUT_DIGEST_RE.match(expected_digest):
+        fail(
+            message="--expected-input-digest must be a 64-character lowercase SHA-256 hex digest.",
+            reason_code=REASON_INVALID_EXPECTED_INPUT_DIGEST,
+        )
+
+    if not selected:
+        return
+
+    mode = selected[0]
+    if mode == "prepare-input":
+        if _PREPARED_INPUT_HOST_INTEGRATION is None:
+            fail(
+                message=(
+                    "--prepare-input requires a trusted in-process host integration; this bare "
+                    "CLI invocation provides none, so no prepared-input capability was "
+                    "provisioned and nothing was written."
+                ),
+                reason_code=REASON_HOST_HANDOFF_UNAVAILABLE,
+                input_mode="prepare-input",
+            )
+        _complete_prepare_input_handoff(args, command=command, operation=operation)
+
+    if mode == "input-capsule":
+        try:
+            decode_input_capsule(
+                args.input_capsule,
+                expected_role=operation,
+                expected_digest=expected_digest,
+            )
+        except InputTransportError as exc:
+            fail(
+                message=exc.message,
+                reason_code=exc.reason_code or REASON_INPUT_MODE_NOT_AVAILABLE,
+                input_mode="capsule",
+                extra_details={
+                    key: value
+                    for key, value in (exc.details or {}).items()
+                    if key not in {"reason_code", "side_effect"}
+                },
+            )
+        fail(
+            message=(
+                "--input-capsule decoded and verified, but capsule mutation execution is "
+                "not wired in this build (it lands with the v0.5.0 transaction cutover); "
+                "nothing was written."
+            ),
+            reason_code=REASON_INPUT_MODE_NOT_AVAILABLE,
+            input_mode="capsule",
+        )
+
+    if expected_digest is None:
+        fail(
+            message=(
+                "--prepared-input-ref requires --expected-input-digest (64 lowercase hex) "
+                "for scratch commit."
+            ),
+            reason_code=REASON_MISSING_EXPECTED_INPUT_DIGEST,
+            input_mode="prepared-input-ref",
+        )
+    try:
+        validate_prepared_input_ref_shape(args.prepared_input_ref)
+    except InputTransportError as exc:
+        fail(
+            message=exc.message,
+            reason_code=exc.reason_code or REASON_PREPARED_INPUT_REF_INVALID,
+            input_mode="prepared-input-ref",
+        )
+    fail(
+        message=(
+            "--prepared-input-ref is shape-valid, but scratch commit execution is not "
+            "wired in this build (T050-01C/T050-04+); nothing was written and the "
+            "prepared input was not claimed or consumed."
+        ),
+        reason_code=REASON_INPUT_MODE_NOT_AVAILABLE,
+        input_mode="prepared-input-ref",
+    )
+
+
 def _append_helper_args(
     parser,
     args: argparse.Namespace,
@@ -1395,8 +1891,13 @@ def _write_argument_failure_details(
     extra: dict | None = None,
 ) -> dict:
     details = {
-        "command": "write",
-        "operation": "managed_file_commit",
+        **OperationContext(
+            command=COMMAND_WRITE,
+            operation=OPERATION_MANAGED_WRITE,
+            write_type=None,
+            input_mode=None,
+            stage=STAGE_INPUT,
+        ).legacy_details_fields(),
         "reason_code": reason_code,
         "side_effect": "none",
         **(extra or {}),
@@ -1484,6 +1985,18 @@ def _validate_write_args(parser, args: argparse.Namespace, *, support: dict) -> 
                 },
             ),
         )
+    _enforce_additive_input_mode_matrix(
+        parser,
+        args,
+        support=support,
+        command=COMMAND_WRITE,
+        operation=OPERATION_MANAGED_WRITE,
+        write_type=args.write_type,
+        legacy_input_flags={
+            "source-file": args.source_file is not None,
+            "stdin": bool(args.stdin),
+        },
+    )
     input_mode = _write_input_mode(args)
     if input_mode is None:
         if args.source_file is not None and args.stdin:
@@ -1636,32 +2149,6 @@ def _issue_preflight_binding_json(
                     continuity_confidence="broken",
                     include_recovery_actions=False,
                 ),
-            ),
-            support=support,
-        )
-    try:
-        write_preflight_binding_lease(
-            storage_root=workspace.storage_root,
-            project_root=workspace.project_root,
-            binding=binding,
-            preflight_payload=preflight_payload,
-            issued_by="recallloom.py",
-        )
-    except PreflightBindingLeaseError as exc:
-        message = str(exc)
-        _exit_with_support(
-            parser,
-            json_mode=getattr(args, "json", False),
-            exit_code=2,
-            message=message,
-            payload=cli_failure_payload(
-                "damaged_sidecar",
-                error=message,
-                details={
-                    **exc.details,
-                    "side_effect": "none",
-                    "lease_store": "derived/preflight-bindings.json",
-                },
             ),
             support=support,
         )
@@ -1882,9 +2369,16 @@ def _confirmation_target_for_file_key(file_key: str) -> str:
 
 def _write_confirmation_material(*, file_key: str) -> dict:
     target_layer = _confirmation_target_for_file_key(file_key)
+    context = OperationContext(
+        command=COMMAND_WRITE,
+        operation=OPERATION_MANAGED_WRITE,
+        write_type=None,
+        input_mode=None,
+        stage=STAGE_PREFLIGHT,
+    )
     return review_imported_baseline_confirmation_material(
-        command="write",
-        operation="managed_file_commit",
+        command=context.command,
+        operation=context.legacy_operation,
         target_layer_or_surface=target_layer,
         expected_side_effect="managed_file_write",
         files_or_keys_summary=f"{file_key} {target_layer} key",
@@ -1957,8 +2451,13 @@ def _enforce_write_preflight_gate(
             args,
             preflight_payload=preflight_payload,
             support=support,
-            command="write",
-            operation="managed_file_commit",
+            **OperationContext(
+                command=COMMAND_WRITE,
+                operation=OPERATION_MANAGED_WRITE,
+                write_type=None,
+                input_mode=None,
+                stage=STAGE_PREFLIGHT,
+            ).legacy_details_fields(),
             file_key=file_key,
             extra_details={"input_mode": input_mode},
         )
@@ -2047,8 +2546,13 @@ def _enforce_append_preflight_gate(
             args,
             preflight_payload=preflight_payload,
             support=support,
-            command="append",
-            operation="daily_log_append",
+            **OperationContext(
+                command=COMMAND_APPEND,
+                operation=OPERATION_DAILY_LOG_APPEND,
+                write_type=None,
+                input_mode=None,
+                stage=STAGE_PREFLIGHT,
+            ).legacy_details_fields(),
             file_key="daily_log",
         )
     provenance_state = preflight_payload.get("provenance_state")
@@ -2066,7 +2570,13 @@ def _enforce_append_preflight_gate(
                 details={
                     **_preflight_gate_details(preflight_payload),
                     "reason_code": "review_imported_baseline_append_not_authorized",
-                    "command": "append",
+                    "command": OperationContext(
+                        command=COMMAND_APPEND,
+                        operation=OPERATION_DAILY_LOG_APPEND,
+                        write_type=None,
+                        input_mode=None,
+                        stage=STAGE_PREFLIGHT,
+                    ).command,
                     "side_effect": "none",
                 },
             )
@@ -2086,9 +2596,16 @@ def _enforce_append_preflight_gate(
             )
             input_mode = _append_dispatcher_input_mode(args)
             input_format = args.input_format or "auto"
+            append_context = OperationContext(
+                command=COMMAND_APPEND,
+                operation=OPERATION_DAILY_LOG_APPEND,
+                write_type=None,
+                input_mode=None,
+                stage=STAGE_PREFLIGHT,
+            )
             confirmation_material = review_imported_baseline_confirmation_material(
-                command="append",
-                operation="daily_log_append",
+                command=append_context.command,
+                operation=append_context.legacy_operation,
                 target_layer_or_surface="daily_log",
                 expected_side_effect="single_append",
                 files_or_keys_summary="latest daily_log cursor",
@@ -2104,8 +2621,7 @@ def _enforce_append_preflight_gate(
                 details={
                     **_preflight_gate_details(preflight_payload),
                     "reason_code": "review_imported_baseline_confirmation_required",
-                    "command": "append",
-                    "operation": "daily_log_append",
+                    **append_context.legacy_details_fields(),
                     **({"input_mode": input_mode} if input_mode is not None else {}),
                     "input_format": input_format,
                     "side_effect": "none",
@@ -2148,7 +2664,13 @@ def _enforce_append_preflight_gate(
             details={
                 **_preflight_gate_details(preflight_payload),
                 "reason_code": "append_write_readiness_not_authorized",
-                "command": "append",
+                "command": OperationContext(
+                    command=COMMAND_APPEND,
+                    operation=OPERATION_DAILY_LOG_APPEND,
+                    write_type=None,
+                    input_mode=None,
+                    stage=STAGE_PREFLIGHT,
+                ).command,
                 "side_effect": "none",
             },
         )
@@ -2171,7 +2693,13 @@ def _enforce_append_preflight_gate(
         error=message,
         details={
             **_preflight_gate_details(preflight_payload),
-            "command": "append",
+            "command": OperationContext(
+                command=COMMAND_APPEND,
+                operation=OPERATION_DAILY_LOG_APPEND,
+                write_type=None,
+                input_mode=None,
+                stage=STAGE_PREFLIGHT,
+            ).command,
             "side_effect": "none",
             "next_actions": [
                 "stage_recovery_proposal.py",
@@ -2563,6 +3091,69 @@ def _commit_context_file_args(
     return helper_args
 
 
+def _commit_context_file_preview_args(
+    args: argparse.Namespace,
+    *,
+    file_key: str,
+    write_context: dict,
+    preflight_payload: dict,
+) -> list[str]:
+    """Helper args for the real dry-run preview (T050-04A, S3–S5 topology).
+
+    Mirrors the apply helper args, but the preflight binding is passed only in
+    memory: §7.3 forbids binding/lease store writes in dry-run, so the
+    dispatcher must NOT persist a lease for a preview. The helper validates
+    the binding exactly and the transaction builds the transitional authority
+    in-process, inside the identity lock.
+    """
+    helper_args = [
+        args.target,
+        "--file-key",
+        file_key,
+        "--expected-file-revision",
+        str(write_context["expected_file_revision"]),
+        "--expected-workspace-revision",
+        str(write_context["expected_workspace_revision"]),
+    ]
+    if args.source_file is not None:
+        helper_args.extend(["--source-file", args.source_file])
+    if args.stdin:
+        helper_args.append("--stdin")
+    if args.input_format != "markdown":
+        helper_args.extend(["--input-format", args.input_format])
+    if args.max_input_bytes is not None:
+        helper_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+    if args.writer_id is not None:
+        helper_args.extend(["--writer-id", args.writer_id])
+    if args.wrapper_metadata_json is not None:
+        helper_args.extend(["--wrapper-metadata-json", args.wrapper_metadata_json])
+    helper_args.extend(
+        [
+            "--preflight-binding-json",
+            _preflight_write_binding_json(
+                file_key=file_key,
+                write_type=args.write_type,
+                operation_class="managed_file_commit",
+                expected_file_revision=write_context["expected_file_revision"],
+                expected_workspace_revision=write_context["expected_workspace_revision"],
+                preflight_payload=preflight_payload,
+                confirm_review_imported_baseline=getattr(
+                    args, "confirm_review_imported_baseline", False
+                ),
+                write_readiness_label=_binding_write_readiness_label(
+                    file_key=file_key,
+                    write_type=args.write_type,
+                    preflight_payload=preflight_payload,
+                ),
+            ),
+        ]
+    )
+    if getattr(args, "expected_input_digest", None) is not None:
+        helper_args.extend(["--expected-input-digest", args.expected_input_digest])
+    helper_args.append("--dry-run")
+    return helper_args
+
+
 POST_APPEND_SYNC_COMMAND = "sync-current-state-after-append"
 POST_APPEND_SYNC_CONTRACT_TYPE = "post_append_summary_sync"
 POST_APPEND_SYNC_NOOP_REASONS = frozenset(
@@ -2783,6 +3374,13 @@ def _post_append_sync_failure_payload(
     append_cursor = contract.get("append_cursor") if isinstance(contract, dict) else None
     ordinary_write_gate = contract.get("ordinary_write_gate") if isinstance(contract, dict) else None
     user_summary = _post_append_sync_review_summary(reason_code=reason_code)
+    context = OperationContext(
+        command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+        operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+        write_type="current-state",
+        input_mode=input_mode,
+        stage=STAGE_PREFLIGHT,
+    )
     return {
         "ok": False,
         "schema_version": "1.1",
@@ -2791,7 +3389,7 @@ def _post_append_sync_failure_payload(
         "recoverability": "retryable",
         "surface_level": "operator",
         "trust_effect": "review_required",
-        "command": POST_APPEND_SYNC_COMMAND,
+        "command": context.command,
         "side_effect": "none",
         "write_effect": "none",
         "contract_type": (
@@ -2799,9 +3397,9 @@ def _post_append_sync_failure_payload(
             if isinstance(contract, dict) and isinstance(contract.get("contract_type"), str)
             else POST_APPEND_SYNC_CONTRACT_TYPE
         ),
-        "write_type": "current-state",
+        "write_type": context.write_type,
         "file_key": "rolling_summary",
-        "input_mode": input_mode,
+        "input_mode": context.input_mode,
         "input_format": _post_append_sync_input_format(args),
         "reason_code": reason_code,
         "error": message,
@@ -2884,9 +3482,16 @@ def _post_append_sync_confirmation_payload(
         insert_at = len(argv_template) - 1 if argv_template and argv_template[-1] == "--json" else len(argv_template)
         argv_template.insert(insert_at, "--confirm-review-imported-baseline")
     retry_payload["requires_repair_command_first"] = False
+    sync_context = OperationContext(
+        command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+        operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+        write_type=None,
+        input_mode=None,
+        stage=STAGE_PREFLIGHT,
+    )
     confirmation_material = review_imported_baseline_confirmation_material(
-        command=POST_APPEND_SYNC_COMMAND,
-        operation="post_append_summary_sync",
+        command=sync_context.command,
+        operation=sync_context.legacy_operation,
         target_layer_or_surface="metadata",
         expected_side_effect="metadata_only_sync",
         files_or_keys_summary="rolling_summary metadata and latest daily_log cursor",
@@ -2906,7 +3511,7 @@ def _post_append_sync_confirmation_payload(
         details={
             **_preflight_gate_details(preflight_payload),
             "reason_code": "review_imported_baseline_confirmation_required",
-            "command": POST_APPEND_SYNC_COMMAND,
+            "command": sync_context.command,
             "side_effect": "none",
             "required_flag": "--confirm-review-imported-baseline",
         },
@@ -2925,12 +3530,19 @@ def _post_append_sync_invalid_input_payload(
     if args.max_input_bytes is not None:
         input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
     reason_code = "source_file_not_supported" if source_file_present else "stdin_required"
+    context = OperationContext(
+        command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+        operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+        write_type="current-state",
+        input_mode=None,
+        stage=STAGE_INPUT,
+    )
     return cli_failure_payload(
         "invalid_prepared_input",
         error=message,
         details={
-            "command": POST_APPEND_SYNC_COMMAND,
-            "operation": "post_append_summary_sync",
+            "command": context.command,
+            "operation": context.legacy_operation,
             "reason_code": reason_code,
             "side_effect": "none",
             "input_contract": "stdin_only_json",
@@ -2940,8 +3552,8 @@ def _post_append_sync_invalid_input_payload(
             "input_format": "json",
         },
         extra={
-            "command": POST_APPEND_SYNC_COMMAND,
-            "write_type": "current-state",
+            "command": context.command,
+            "write_type": context.write_type,
             "file_key": "rolling_summary",
             "input_format": "json",
             "retry_payload": {
@@ -3204,6 +3816,19 @@ def _post_append_sync_assertion_fields(
 
 
 def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support: dict) -> None:
+    _enforce_additive_input_mode_matrix(
+        parser,
+        args,
+        support=support,
+        command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+        operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+        write_type="current-state",
+        legacy_input_flags={
+            "source-file": args.source_file is not None,
+            "stdin": bool(args.stdin),
+            "reuse-current-summary": bool(getattr(args, "reuse_current_summary", False)),
+        },
+    )
     source_file_present = args.source_file is not None
     stdin_present = bool(args.stdin)
     reuse_current_summary = bool(getattr(args, "reuse_current_summary", False))
@@ -3276,6 +3901,13 @@ def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support
         input_args = ["--stdin", "--input-format", "json"]
         if args.max_input_bytes is not None:
             input_args.extend(["--max-input-bytes", str(args.max_input_bytes)])
+        context = OperationContext(
+            command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+            operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+            write_type="current-state",
+            input_mode="json-stdin",
+            stage=STAGE_INPUT,
+        )
         _exit_with_support(
             parser,
             json_mode=args.json,
@@ -3286,18 +3918,18 @@ def _validate_post_append_sync_args(parser, args: argparse.Namespace, *, support
                 error=message,
                 details={
                     "field": "writer_id",
-                    "command": POST_APPEND_SYNC_COMMAND,
-                    "operation": "post_append_summary_sync",
+                    "command": context.command,
+                    "operation": context.legacy_operation,
                     "reason_code": "unsafe_explicit_writer_id",
                     "side_effect": "none",
                     "writer_id_source": "explicit_cli",
                     "writer_id_public_safe": False,
                 },
                 extra={
-                    "command": POST_APPEND_SYNC_COMMAND,
-                    "write_type": "current-state",
+                    "command": context.command,
+                    "write_type": context.write_type,
                     "file_key": "rolling_summary",
-                    "input_mode": "json-stdin",
+                    "input_mode": context.input_mode,
                     "input_format": "json",
                     "retry_payload": {
                         "command": f"recallloom.py {POST_APPEND_SYNC_COMMAND}",
@@ -3367,9 +3999,13 @@ def _current_rolling_summary_text_for_reuse(
                 "damaged_sidecar",
                 error=message,
                 details={
-                    "command": POST_APPEND_SYNC_COMMAND,
-                    "operation": "post_append_summary_sync",
-                    "input_mode": "reuse-current-summary",
+                    **OperationContext(
+                        command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+                        operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+                        write_type=None,
+                        input_mode="reuse-current-summary",
+                        stage=STAGE_INPUT,
+                    ).legacy_details_fields(),
                     "side_effect": "none",
                 },
             ),
@@ -3541,8 +4177,13 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
             args,
             preflight_payload=preflight_payload,
             support=support,
-            command=POST_APPEND_SYNC_COMMAND,
-            operation="post_append_summary_sync",
+            **OperationContext(
+                command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+                operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+                write_type=None,
+                input_mode=None,
+                stage=STAGE_PREFLIGHT,
+            ).legacy_details_fields(),
             file_key="rolling_summary",
             extra_details={"input_mode": input_mode},
         )
@@ -3626,10 +4267,13 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
             ),
             support=support,
         )
-    payload = _run_helper_json(
+    workspace = find_recallloom_root(args.target)
+    if workspace is None:
+        raise ConfigContractError("Post-append sync workspace detached before transaction.")
+    payload = _run_mutation_adapter(
         parser,
-        helper_name="commit_context_file.py",
-        helper_args=_post_append_sync_commit_args(
+        adapter=__import__("commit_context_file").run_from_dispatcher,
+        adapter_args=_post_append_sync_commit_args(
             parser,
             args,
             contract=contract,
@@ -3638,10 +4282,12 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
             input_format=input_format,
             extra_binding_fields=extra_binding_fields,
         ),
-        json_mode_on_failure=args.json,
-        support=support,
-        package_support_on_failure=True,
+        operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+        workspace_root=workspace.project_root,
         stdin_text=stdin_text,
+        support=support,
+        compact_json=args.compact_json,
+        compact_command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
     )
     result = {
         **payload,
@@ -3667,8 +4313,13 @@ def _handle_post_append_summary_sync(parser, args: argparse.Namespace, *, suppor
     result["single_next_command"] = None
     if wrapper_metadata is not None:
         result["wrapper_metadata"] = wrapper_metadata
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.json or args.compact_json:
+        _print_transaction_payload(
+            args,
+            result,
+            command=COMMAND_SYNC_CURRENT_STATE_AFTER_APPEND,
+            operation=OPERATION_POST_APPEND_SUMMARY_SYNC,
+        )
     else:
         _print_post_append_sync_summary(user_summary)
 
@@ -4091,6 +4742,79 @@ def _record_json_object(
             message=f"{field_name} must be a JSON object.",
             reason_code=f"{field_name}_not_object",
         )
+    return payload
+
+
+def _run_mutation_adapter(
+    parser,
+    *,
+    adapter,
+    adapter_args: list[str],
+    operation: str,
+    workspace_root: str | Path,
+    stdin_text: str | None = None,
+    support: dict | None = None,
+    compact_json: bool = False,
+    compact_command: str | None = None,
+) -> dict:
+    """Run the sole S6 mutation topology in this dispatcher process."""
+    from contextlib import redirect_stdout, redirect_stderr
+    from io import BytesIO, StringIO, TextIOWrapper
+
+    if "--json" not in adapter_args:
+        adapter_args = [*adapter_args, "--json"]
+    authority = issue_transaction_authority(
+        operation=operation, workspace_root=workspace_root
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    try:
+        previous_stdin = sys.stdin
+        previous_argv = sys.argv
+        if stdin_text is not None:
+            sys.stdin = TextIOWrapper(BytesIO(stdin_text.encode("utf-8")), encoding="utf-8")
+        adapter_script = SCRIPT_DIR / (adapter.__module__.split(".")[-1] + ".py")
+        sys.argv = [str(adapter_script), *adapter_args]
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                adapter(adapter_args, authority=authority)
+        finally:
+            sys.stdin = previous_stdin
+            sys.argv = previous_argv
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        if code != 0:
+            rendered = stdout.getvalue()
+            try:
+                payload = json.loads(rendered)
+            except json.JSONDecodeError:
+                message = stderr.getvalue().strip() or rendered.strip() or "Mutation adapter failed."
+                exit_with_cli_error(
+                    parser, json_mode=True, exit_code=code, message=message,
+                    payload=cli_failure_payload("helper_execution_failed", error=message),
+                )
+            if support is not None:
+                payload = _with_package_support(payload, support)
+            if compact_json:
+                print(json.dumps(
+                    _compact_transaction_payload(
+                        payload,
+                        command=compact_command or "transaction",
+                        operation=operation,
+                    ),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ))
+            else:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            raise SystemExit(code)
+    rendered = stdout.getvalue()
+    try:
+        payload = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise ConfigContractError("In-process mutation adapter returned invalid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ConfigContractError("In-process mutation adapter returned a non-object payload.")
     return payload
 
 
@@ -5172,8 +5896,36 @@ def _handle_init(parser, args: argparse.Namespace, *, support: dict) -> None:
         _print_init_summary(payload)
 
 
+def _read_write_stdin_text(parser, args: argparse.Namespace) -> str | None:
+    """Acquire write stdin from bytes before an adapter sees decoded text.
+
+    Windows PowerShell can expose UTF-8 pipe bytes through a text stream using
+    surrogate code points.  Reading the buffer here makes RecallLoom the sole
+    UTF-8 decoder and preserves the existing fail-closed input contract.
+    """
+    if not args.stdin:
+        return None
+    try:
+        return acquire_stdin_text(
+            max_input_bytes=args.max_input_bytes or DEFAULT_STDIN_MAX_INPUT_BYTES
+        )
+    except InputTransportError as exc:
+        exit_with_cli_error(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=exc.message,
+            payload=cli_failure_payload(
+                "invalid_prepared_input",
+                error=exc.message,
+                details=exc.details,
+            ),
+        )
+
+
 def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
     file_key, input_mode = _validate_write_args(parser, args, support=support)
+    mutation_stdin_text = _read_write_stdin_text(parser, args)
     try:
         wrapper_metadata = normalize_wrapper_metadata_json(args.wrapper_metadata_json)
     except WrapperMetadataSecurityError as exc:
@@ -5206,6 +5958,29 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
     )
 
     if args.dry_run:
+        # T050-04A: the dry-run is a REAL preview. The helper runs the
+        # transaction stage sequence (mode=preview) as a subprocess — full
+        # input acquisition/validation, identity lock, strict gate, fresh
+        # in-lock checks, preplan, read-only receipt precheck, and plan seal —
+        # with a transitional authority; nothing is written. On success the
+        # dispatcher's dry-run output projection is unchanged.
+        workspace = find_recallloom_root(args.target)
+        if workspace is None:
+            raise ConfigContractError("Write workspace detached before transaction.")
+        _run_mutation_adapter(
+            parser,
+            adapter=__import__("commit_context_file").run_from_dispatcher,
+            adapter_args=_commit_context_file_preview_args(
+                args,
+                file_key=file_key,
+                write_context=write_context,
+                preflight_payload=preflight_payload,
+            ),
+            operation=OPERATION_MANAGED_WRITE,
+            workspace_root=workspace.project_root,
+            stdin_text=mutation_stdin_text,
+            support=support,
+        )
         payload = {
             "ok": True,
             "schema_version": "1.1",
@@ -5235,10 +6010,13 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
             print(f"Expected workspace revision: {write_context['expected_workspace_revision']}")
         return
 
-    payload = _run_helper_json(
+    workspace = find_recallloom_root(args.target)
+    if workspace is None:
+        raise ConfigContractError("Write workspace detached before transaction.")
+    payload = _run_mutation_adapter(
         parser,
-        helper_name="commit_context_file.py",
-        helper_args=_commit_context_file_args(
+        adapter=__import__("commit_context_file").run_from_dispatcher,
+        adapter_args=_commit_context_file_args(
             parser,
             args,
             file_key=file_key,
@@ -5246,9 +6024,12 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
             preflight_payload=preflight_payload,
             support=support,
         ),
-        json_mode_on_failure=args.json,
+        operation=OPERATION_MANAGED_WRITE,
+        workspace_root=workspace.project_root,
+        stdin_text=mutation_stdin_text,
         support=support,
-        package_support_on_failure=True,
+        compact_json=args.compact_json,
+        compact_command="write",
     )
     payload.update(
         {
@@ -5260,8 +6041,10 @@ def _handle_write(parser, args: argparse.Namespace, *, support: dict) -> None:
             "target_path": write_context["target_path"],
         }
     )
-    if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    if args.json or args.compact_json:
+        _print_transaction_payload(
+            args, payload, command="write", operation=OPERATION_MANAGED_WRITE
+        )
     else:
         print(f"Committed {file_key} to {payload.get('target_path', write_context['target_path'])}")
 
@@ -5345,6 +6128,18 @@ def main() -> None:
         return
 
     if args.command == "append":
+        _enforce_additive_input_mode_matrix(
+            parser,
+            args,
+            support=support,
+            command=COMMAND_APPEND,
+            operation=OPERATION_DAILY_LOG_APPEND,
+            legacy_input_flags={
+                "entry-json": args.entry_json is not None,
+                "entry-file": args.entry_file is not None,
+                "stdin": bool(args.stdin),
+            },
+        )
         preflight_payload = _preflight_payload(parser, args, support=support)
         _enforce_append_preflight_gate(
             parser,
@@ -5358,19 +6153,36 @@ def main() -> None:
             preflight_payload=preflight_payload,
             support=support,
         )
-        if args.json:
-            payload = _run_helper_json(
-                parser,
-                helper_name="append_daily_log_entry.py",
-                helper_args=helper_args,
-                json_mode_on_failure=True,
-                support=support,
-                package_support_on_failure=True,
+        workspace = find_recallloom_root(args.target)
+        if workspace is None:
+            raise ConfigContractError("Append workspace detached before transaction.")
+        payload = _run_mutation_adapter(
+            parser, adapter=__import__("append_daily_log_entry").run_from_dispatcher,
+            adapter_args=[*helper_args, "--json"],
+            operation=OPERATION_DAILY_LOG_APPEND, workspace_root=workspace.project_root,
+            stdin_text=sys.stdin.read() if args.stdin else None,
+            support=support,
+            compact_json=args.compact_json,
+            compact_command=COMMAND_APPEND,
+        )
+        payload["package_support"] = public_package_support_payload(support)
+        if args.json or args.compact_json:
+            _print_transaction_payload(
+                args, payload, command=COMMAND_APPEND, operation=OPERATION_DAILY_LOG_APPEND
             )
-            payload["package_support"] = public_package_support_payload(support)
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
-            _run_helper_passthrough(helper_name="append_daily_log_entry.py", helper_args=helper_args)
+            resolved_date = payload.get("auto_detect", {}).get("resolved_date")
+            target_path = (
+                workspace.storage_root / "daily_logs" / f"{resolved_date}.md"
+                if resolved_date
+                else None
+            )
+            public_target = (
+                public_project_path(target_path, project_root=workspace.project_root)
+                if target_path is not None
+                else None
+            )
+            print(f"Appended daily log entry to {public_target or 'daily log'}")
         return
 
     if args.command == "write":

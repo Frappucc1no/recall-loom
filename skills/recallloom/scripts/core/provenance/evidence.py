@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from _common import (
+from core.continuity.daily_log import (
     DailyLogCursor,
     DailyLogCursorError,
     daily_log_cursor_is_empty_scaffold,
@@ -34,8 +34,10 @@ from core.provenance.inconsistent_review import (
 from core.provenance.store import (
     RECEIPT_STORE_RELATIVE_PATH,
     ReceiptStoreError,
+    ReceiptStoreSnapshot,
     receipt_store_summary,
 )
+from core.provenance import store as provenance_store
 from core.provenance.state import provenance_facts_from_state
 from core.workspace.runtime import load_workspace_state
 
@@ -881,6 +883,7 @@ def bounded_current_helper_evidence_check(
     require_config_guard: bool = False,
     daily_log_cursor: dict[str, object] | None = None,
     actual_daily_log_cursor_evidence: ActualDailyLogCursorEvidence | None = None,
+    receipt_store_snapshot: ReceiptStoreSnapshot | None = None,
 ) -> dict[str, object]:
     """Verify whether current receipt-store evidence can preserve helper_evidenced.
 
@@ -940,6 +943,7 @@ def bounded_current_helper_evidence_check(
             storage_root=storage_root,
             project_root=project_root,
             require_exists=require_receipt_store,
+            snapshot=receipt_store_snapshot,
         )
     except ReceiptStoreError as exc:
         return {
@@ -1531,6 +1535,18 @@ def strict_sidecar_integrity_gate(
             },
         }
 
+    try:
+        receipt_store_snapshot = provenance_store.capture_receipt_store_snapshot(
+            storage_root=storage_root,
+            project_root=project_root,
+        )
+    except ReceiptStoreError as exc:
+        return _strict_gate_block(
+            reason_code=str(exc.details.get("reason_code") or exc.reason_code),
+            evidence=evidence,
+            details={"verified_current_file_keys": []},
+        )
+
     helper_evidence = bounded_current_helper_evidence_check(
         project_root=project_root,
         storage_root=storage_root,
@@ -1541,6 +1557,7 @@ def strict_sidecar_integrity_gate(
         require_config_guard=False,
         daily_log_cursor=actual_daily_log_cursor,
         actual_daily_log_cursor_evidence=actual_daily_log_cursor_evidence,
+        receipt_store_snapshot=receipt_store_snapshot,
     )
     evidence["helper_evidence"] = helper_evidence
     if helper_evidence.get("verified") is not True:
@@ -1563,4 +1580,5 @@ def strict_sidecar_integrity_gate(
             ),
             "receipt_store": helper_evidence.get("receipt_store"),
         },
+        "_receipt_store_snapshot": receipt_store_snapshot,
     }

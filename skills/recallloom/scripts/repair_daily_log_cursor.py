@@ -26,6 +26,7 @@ from core.output.confirmation_material import (
     build_confirmation_material,
     print_confirmation_material,
 )
+from core.workspace.atomic_io import atomic_write_if_unchanged
 
 from _common import (
     ConfigContractError,
@@ -36,7 +37,6 @@ from _common import (
     FILE_KEYS,
     LockBusyError,
     StorageResolutionError,
-    atomic_write_if_unchanged,
     cli_failure_payload,
     enforce_package_support_gate,
     ensure_supported_python_version,

@@ -12,7 +12,7 @@
 
 <p>RecallLoom is a file-based project memory layer for AI collaboration. It stores background, progress, key decisions, and next steps in Markdown / JSON files beside or inside the project, with no database, RAG layer, or background service required; the next session, model, or tool can more easily start from the current state.</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.8.3-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.5.0-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ Most of the time, `continue this project` is enough. Use short triggers when you
 <summary>Version and compatibility</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- package version: `0.4.8.3`
+- package version: `0.5.0`
 - protocol version: `1.0`
 - supported protocol versions:
   - `1.0`

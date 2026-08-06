@@ -12,16 +12,17 @@ from _common import (
     ConfigContractError,
     EnvironmentContractError,
     enforce_package_support_gate,
+    LockBusyError,
     StorageResolutionError,
     ensure_supported_python_version,
     exit_with_cli_error,
     exit_with_failure_contract,
     find_recovery_project_root,
-    load_lock_payload,
     pid_is_alive,
     public_json_payload,
     project_lock_path,
 )
+from core.workspace import runtime as workspace_runtime
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,10 +76,6 @@ def main() -> None:
     try:
         project_root = resolve_project_root(args.path)
         lock_path = project_lock_path(project_root)
-        lock_exists = lock_path.is_file()
-        lock_payload = load_lock_payload(lock_path) if lock_exists else {}
-        lock_pid = lock_payload.get("pid")
-        pid_alive = bool(isinstance(lock_pid, int) and pid_is_alive(lock_pid))
     except (StorageResolutionError, ConfigContractError) as exc:
         exit_with_cli_error(
             parser,
@@ -97,37 +94,104 @@ def main() -> None:
             reason="damaged_sidecar",
         )
 
-    if args.yes and lock_exists and pid_alive and not args.force:
+    # Manual unlock goes through the same internal guard and identity
+    # verification as acquire/reclaim/finalizer (v0.5.0 plan §7.7): hold the
+    # guard first, observe no-follow, and unlink only while the observed
+    # identity+instance token still match. The guard never appears in output.
+    try:
+        with workspace_runtime.workspace_lock_guard(project_root):
+            observation = workspace_runtime.observe_workspace_lock(lock_path)
+            if observation.anomaly is not None:
+                exit_with_failure_contract(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=2,
+                    message=(
+                        "Refusing to inspect or remove the write lock because the lock path "
+                        f"is not a regular file: {lock_path}"
+                    ),
+                    reason="damaged_sidecar",
+                )
+            lock_exists = observation.exists
+            lock_payload = observation.payload if lock_exists else {}
+            lock_pid = lock_payload.get("pid")
+            pid_alive = bool(isinstance(lock_pid, int) and pid_is_alive(lock_pid))
+
+            if args.yes and lock_exists and pid_alive and not args.force:
+                exit_with_failure_contract(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=3,
+                    message=(
+                        "Refusing to remove the write lock because the recorded pid still appears alive. "
+                        "Re-run with --force only if you are sure the lock is stale."
+                    ),
+                    reason="write_lock_busy",
+                    details={
+                        "project_root": str(project_root),
+                        "lock_path": str(lock_path),
+                        "lock_payload": lock_payload,
+                    },
+                )
+
+            removed = False
+            if args.yes and lock_exists:
+                try:
+                    removed = workspace_runtime.remove_workspace_lock_if_unchanged(
+                        lock_path,
+                        expected_identity=observation.identity,
+                        expected_token=lock_payload.get("instance_token"),
+                    )
+                except OSError as exc:
+                    message = f"Filesystem error while removing write lock {lock_path}: {exc}"
+                    exit_with_failure_contract(
+                        parser,
+                        json_mode=args.json,
+                        exit_code=2,
+                        message=message,
+                        reason="damaged_sidecar",
+                    )
+            if args.yes and lock_exists and not removed:
+                # The final identity+token re-check refused the unlink: never
+                # report a false success.
+                exit_with_failure_contract(
+                    parser,
+                    json_mode=args.json,
+                    exit_code=3,
+                    message=(
+                        "Refusing to remove the write lock because it changed while removal "
+                        "was being verified. Re-run to re-inspect the lock before retrying."
+                    ),
+                    reason="write_lock_busy",
+                    details={
+                        "project_root": str(project_root),
+                        "lock_path": str(lock_path),
+                        "lock_payload": lock_payload,
+                    },
+                )
+    except LockBusyError as exc:
+        # Guard unavailable (held by another operation, unsupported backend, or
+        # a guard-identity anomaly): fail closed as lock-busy.
         exit_with_failure_contract(
             parser,
             json_mode=args.json,
             exit_code=3,
-            message=(
-                "Refusing to remove the write lock because the recorded pid still appears alive. "
-                "Re-run with --force only if you are sure the lock is stale."
-            ),
+            message=str(exc),
             reason="write_lock_busy",
             details={
                 "project_root": str(project_root),
                 "lock_path": str(lock_path),
-                "lock_payload": lock_payload,
             },
         )
-
-    removed = False
-    if args.yes and lock_exists:
-        try:
-            lock_path.unlink()
-        except OSError as exc:
-            message = f"Filesystem error while removing write lock {lock_path}: {exc}"
-            exit_with_failure_contract(
-                parser,
-                json_mode=args.json,
-                exit_code=2,
-                message=message,
-                reason="damaged_sidecar",
-            )
-        removed = True
+    except (OSError, UnicodeDecodeError) as exc:
+        message = f"Filesystem error: {exc}"
+        exit_with_failure_contract(
+            parser,
+            json_mode=args.json,
+            exit_code=2,
+            message=message,
+            reason="damaged_sidecar",
+        )
 
     payload = {
         "project_root": str(project_root),

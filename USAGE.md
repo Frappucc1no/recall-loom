@@ -118,6 +118,13 @@ bound semantic-unchanged assertion emitted for the current preflight/record
 plan; a partial hand-written JSON object is rejected. See the recording
 workflow reference before using that lane.
 
+For the three mutation commands only (`append`, `write`, and
+`sync-current-state-after-append`), `--compact-json` emits the
+`recallloom.transaction.compact/1.0` result projection. It is mutually exclusive
+with legacy `--json`; it preserves the command exit code, contains exactly one
+safe next action, and stays below 2048 UTF-8 bytes. Use legacy `--json` when a
+consumer requires the established schema 1.1 payload.
+
 Bridge and archive operations are preview-only in the current public package
 contract. Review their candidate targets, but do not rely on or document an
 apply command such as `bridge --yes` until each surface has its own

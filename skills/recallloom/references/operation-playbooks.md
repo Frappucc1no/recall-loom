@@ -44,6 +44,11 @@ That means:
 - If a dispatched write fails, follow this order: diagnose the failure, fix the cause, obtain fresh dispatcher context, retry the dispatcher operation, then surface or return its blocked failure contract if it still cannot complete.
 - Never hand-edit `STORAGE_ROOT/state.json` or `STORAGE_ROOT/config.json`. This includes `.recallloom/state.json` and `.recallloom/config.json`.
 - For overwrite-style managed files, use dispatcher `write`, which performs the revision-aware internal commit; do not use blind file replacement.
+- `append`, `write`, and `sync-current-state-after-append` may emit the bounded
+  `recallloom.transaction.compact/1.0` result with `--compact-json`. It is
+  mutually exclusive with legacy `--json`, preserves the exit code, contains
+  exactly one safe next action, and is under 2048 UTF-8 bytes. Do not apply it
+  to read, record, repair, bridge, or helper paths.
 
 ## Public Surface Boundary
 

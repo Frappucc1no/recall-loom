@@ -12,7 +12,7 @@
 
 <p>RecallLoom 是给 AI 协作使用的文件化项目记忆层：把背景、进展、关键决策和下一步保存到项目旁边/项目内的 Markdown / JSON 文件里，不需要数据库、RAG 或后台服务。换会话、换模型、换工具，下一次 AI 协作更容易接上当前状态。</p>
 
-[![Version](https://img.shields.io/badge/version-v0.4.8.3-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
+[![Version](https://img.shields.io/badge/version-v0.5.0-111827?style=flat-square)](./skills/recallloom/package-metadata.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-2563eb?style=flat-square&logo=python&logoColor=white)](./skills/recallloom/package-metadata.json)
 [![Installable skill](https://img.shields.io/badge/installable%20skill-recallloom-0f766e?style=flat-square)](./skills/recallloom/SKILL.md)
 [![Sidecar protocol](https://img.shields.io/badge/sidecar_protocol-1.0-0f766e?style=flat-square)](./skills/recallloom/package-metadata.json)
@@ -124,7 +124,7 @@ rl-init
 <summary>版本与兼容性</summary>
 
 <!-- RecallLoom metadata sync start: package-metadata -->
-- 包版本：`0.4.8.3`
+- 包版本：`0.5.0`
 - 协议版本：`1.0`
 - 当前支持的协议版本：
   - `1.0`
